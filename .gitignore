@@ -15,3 +15,4 @@ devlog/
 tests/.tmp-*/
 .claude/
 dist/macos/
+dist/release/
