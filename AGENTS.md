@@ -15,6 +15,11 @@ Bun-native TypeScript with no separate server compile step.
 - `tests/` — flat Bun tests (`tests/*.test.ts`); shared fixtures in
   `tests/helpers/`, broader scenarios in `tests/e2e-style/`.
 - `gui/` — React + Vite dashboard; packaged output is served from `gui/dist`.
+- `app/` — native macOS menu bar companion (Swift + AppKit, no third-party
+  dependencies). `MenuBarCore` is the testable transport/model layer,
+  `MenuBarUI` the AppKit views, `MenuBarApp` the entry point. Its tests are
+  executables, not XCTest bundles — Command Line Tools ships neither a usable
+  XCTest module nor the swift-testing runtime.
 - `docs-site/` — public docs (Astro + Starlight), deployed to GitHub Pages.
 - `structure/` — maintainer invariants and architecture notes; read before
   changing shared subsystems.

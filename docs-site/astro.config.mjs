@@ -117,6 +117,7 @@ export default defineConfig({
             { label: "Model Routing", translations: { ko: "모델 라우팅", "zh-CN": "模型路由", ru: "Маршрутизация моделей", ja: "モデルルーティング" }, slug: "guides/model-routing" },
             { label: "Codex Integration", translations: { ko: "Codex 통합", "zh-CN": "Codex 集成", ru: "Интеграция с Codex", ja: "Codex 連携" }, slug: "guides/codex-integration" },
             { label: "Codex App Model Picker", translations: { ko: "Codex App 모델 선택기", "zh-CN": "Codex App 模型选择器", ru: "Выбор модели в Codex App", ja: "Codex App モデルピッカー" }, slug: "guides/codex-app-models" },
+            { label: "macOS Menu Bar App", translations: { ko: "macOS 메뉴바 앱", "zh-CN": "macOS 菜单栏应用", ru: "Приложение в строке меню macOS", ja: "macOS メニューバーアプリ" }, slug: "guides/macos-menu-bar" },
             { label: "Model Ordering", translations: { ko: "모델 정렬에 관하여", "zh-CN": "模型排序", ru: "Сортировка моделей", ja: "モデルの並び順" }, slug: "guides/model-ordering" },
             { label: "Claude Code", translations: { ko: "Claude Code", "zh-CN": "Claude Code", ru: "Claude Code", ja: "Claude Code" }, slug: "guides/claude-code" },
             { label: "Sidecars: Web Search & Vision", translations: { ko: "사이드카: 웹 검색 & 비전", "zh-CN": "边车：网络搜索与视觉", ru: "Сайдкары: веб-поиск и зрение", ja: "サイドカー: ウェブ検索 & ビジョン" }, slug: "guides/sidecars" },
