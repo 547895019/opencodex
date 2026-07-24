@@ -134,8 +134,10 @@ Your new provider is ready to use immediately. No restart needed.
 ### macOS menu bar app
 
 A native companion for proxy status, usage, and provider quotas without opening the
-dashboard. Download it from the [releases page](https://github.com/lidge-jun/opencodex/releases)
-or build it locally with `bun run build:macos`.
+dashboard. The source lives in [`app/`](./app) (Swift + AppKit, no third-party
+dependencies). Download it from the
+[releases page](https://github.com/lidge-jun/opencodex/releases) or build it locally with
+`bun run build:macos`.
 
 The first launch needs a right-click → Open, because the app is ad-hoc signed rather
 than notarized. See the [macOS Menu Bar App guide](https://lidge-jun.github.io/opencodex/guides/macos-menu-bar/)
