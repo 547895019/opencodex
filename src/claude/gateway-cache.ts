@@ -47,23 +47,68 @@ export function writeGatewayModelCache(baseUrl: string, models: readonly Gateway
 
 /** Fetch the anthropic-flavor /v1/models from the local proxy and write the cache. */
 export async function refreshGatewayModelCacheFromProxy(port: number, timeoutMs = 3_000, configDir?: string): Promise<string | null> {
-  try {
-    // ?ids=cli pins the readable claude-ocx id family deterministically (audit 051
-    // #5): the cache prewrite must not depend on UA sniffing.
-    const res = await fetch(`http://127.0.0.1:${port}/v1/models?limit=1000&ids=cli`, {
-      headers: { "anthropic-version": "2023-06-01" },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!res.ok) return null;
-    const body = await res.json() as { data?: unknown };
+  // ?ids=cli pins the readable claude-ocx id family deterministically (audit 051
+  // #5): the cache prewrite must not depend on UA sniffing.
+  const url = `http://127.0.0.1:${port}/v1/models?limit=1000&ids=cli`;
+  const toRows = (body: { data?: unknown }): GatewayModelRow[] | null => {
     if (!Array.isArray(body.data)) return null;
-    const models: GatewayModelRow[] = body.data
+    return body.data
       .filter(m => typeof m.id === "string" && (m.id as string).length > 0)
       .map(m => ({
         id: m.id as string,
         display_name: typeof m.display_name === "string" ? m.display_name : undefined,
       }));
-    return writeGatewayModelCache(`http://127.0.0.1:${port}`, models, configDir);
+  };
+
+  // Bun's native fetch to localhost is flaky on larger responses (/v1/models hangs
+  // ~4/5 even with HTTP_PROXY unset and a clean no_proxy — devlog WSL env), so retry
+  // once before falling back to curl, which reliably bypasses forward proxies via
+  // --noproxy '*' and reads the endpoint in milliseconds. The fetch path stays
+  // primary so the unit test's globalThis.fetch mock still observes `ids=cli`.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: { "anthropic-version": "2023-06-01" },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (res.ok) {
+        const rows = toRows(await res.json() as { data?: unknown });
+        if (rows && rows.length > 0) return writeGatewayModelCache(`http://127.0.0.1:${port}`, rows, configDir);
+      }
+    } catch {
+      // fall through to next attempt / curl fallback
+    }
+  }
+
+  const curlRows = fetchModelRowsViaCurl(port);
+  if (curlRows && curlRows.length > 0) return writeGatewayModelCache(`http://127.0.0.1:${port}`, curlRows, configDir);
+  return null;
+}
+
+/**
+ * curl-based fallback for the gateway-model fetch. Bun's fetch is flaky on the
+ * localhost /v1/models response (see refreshGatewayModelCacheFromProxy); curl
+ * with --noproxy '*' always bypasses HTTP_PROXY/HTTPS_PROXY and reads the
+ * endpoint reliably. Returns null if curl is missing or the response is bad.
+ */
+function fetchModelRowsViaCurl(port: number, timeoutSec = 5): GatewayModelRow[] | null {
+  try {
+    const url = `http://127.0.0.1:${port}/v1/models?limit=1000&ids=cli`;
+    const proc = Bun.spawnSync([
+      "curl", "-s", "--noproxy", "*", "-m", String(timeoutSec),
+      "-H", "anthropic-version: 2023-06-01", url,
+    ], { stdout: "pipe", stderr: "ignore" });
+    if (proc.exitCode !== 0) return null;
+    const stdout = proc.stdout?.toString() ?? "";
+    if (!stdout) return null;
+    const body = JSON.parse(stdout) as { data?: unknown };
+    if (!Array.isArray(body.data)) return null;
+    return body.data
+      .filter(m => typeof m.id === "string" && (m.id as string).length > 0)
+      .map(m => ({
+        id: m.id as string,
+        display_name: typeof m.display_name === "string" ? m.display_name : undefined,
+      }));
   } catch {
     return null;
   }

@@ -120,21 +120,40 @@ export function buildClaudeEnv(config: OcxConfig, port: number, base: ClaudeLaun
  * (no [1m] marking, conservative).
  */
 export async function fetchClaudeContextWindows(config: OcxConfig, port: number, timeoutMs = 3_000): Promise<Record<string, number>> {
-  try {
-    const headers = new Headers();
-    const token = process.env.OPENCODEX_API_AUTH_TOKEN || config.apiKeys?.[0]?.key;
-    if (token) headers.set("x-opencodex-api-key", token);
-    const res = await fetch(`http://127.0.0.1:${port}/api/claude-code`, {
-      headers,
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!res.ok) return {};
-    const body = await res.json() as { contextWindows?: Record<string, number> };
-    return body.contextWindows && typeof body.contextWindows === "object" ? body.contextWindows : {};
-  } catch {
-    console.error("⚠ 모델 컨텍스트 정보를 불러오지 못했습니다 — 1M 자동 표시는 이번 실행에서 생략됩니다.");
-    return {};
+  const token = process.env.OPENCODEX_API_AUTH_TOKEN || config.apiKeys?.[0]?.key;
+  const headers = new Headers();
+  if (token) headers.set("x-opencodex-api-key", token);
+  const url = `http://127.0.0.1:${port}/api/claude-code`;
+  const parseBody = (body: unknown): Record<string, number> => {
+    const b = body as { contextWindows?: Record<string, number> };
+    return b.contextWindows && typeof b.contextWindows === "object" ? b.contextWindows : {};
+  };
+
+  // Bun's fetch to localhost is flaky on larger responses (see gateway-cache.ts);
+  // retry once then fall back to curl with --noproxy '*', which reads the endpoint
+  // reliably. Failure → {} (no [1m] marking, conservative).
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
+      if (res.ok) return parseBody(await res.json());
+    } catch {
+      // fall through
+    }
   }
+  try {
+    const args = ["curl", "-s", "--noproxy", "*", "-m", "5"];
+    if (token) { args.push("-H", `x-opencodex-api-key: ${token}`); }
+    args.push(url);
+    const proc = Bun.spawnSync(args, { stdout: "pipe", stderr: "ignore" });
+    if (proc.exitCode === 0 && proc.stdout) {
+      const stdout = proc.stdout.toString();
+      if (stdout) return parseBody(JSON.parse(stdout));
+    }
+  } catch {
+    // fall through to warning
+  }
+  console.error("⚠ 모델 컨텍스트 정보를 불러오지 못했습니다 — 1M 자동 표시는 이번 실행에서 생략됩니다.");
+  return {};
 }
 
 async function ensureProxyForClaude(): Promise<number | null> {
