@@ -372,3 +372,127 @@ CDP output은 `method url initiator`를 남기되 request/response body, email, 
 | OAuth poll | OAuth waiting 후 tab hidden | 2초 status poll 유지 |
 
 IN: `#providers` quota/account reads, client-resource 공유 사용, 위 polling gates와 회귀 테스트. OUT: `/oauth/status`, key pool, usage, selected-models의 통합·삭제, 폴링 주기 재설계, 서버 `/accounts` fan-out(WP5), API body 계약 변경.
+
+## 감사 반영 (A, 2026-07-31) — 4 blocker
+
+리뷰어가 FAIL을 냈고 네 건 모두 소스에서 재확인했다. 위 본문은 원안 기록으로 남기고,
+실제 구현은 이 절의 수정안을 따른다.
+
+### B1 — `-7`의 인과 모델이 틀렸다
+
+원안은 "provider별 응답이 `accountSets` object를 새로 만들어 셸 effect가 다시 돈다"고
+썼다. 그런데 [Providers.tsx:132](/Users/jun/Developer/new/700_projects/opencodex/gui/src/pages/Providers.tsx:132)의
+`quotaRefreshKey`는 object가 아니라 `provider:activeAccountId`를 정렬해 이어붙인
+**문자열**이고, effect 의존성도 그 문자열이다
+([ProviderWorkspaceShell.tsx:242](/Users/jun/Developer/new/700_projects/opencodex/gui/src/components/provider-workspace/ProviderWorkspaceShell.tsx:242)).
+quota enrichment는 `activeAccountId`를 바꾸지 않으므로 값이 같고, effect는 다시 돌지
+않는다. E3의 quota 8회는 v2.7.43 서빙본의 런타임 관측이지 현재 트리의 호출 지점 수가
+아니다.
+
+수정: `38 - 7 - 6 = 25`를 목표로 삼지 않는다. B 단계 착수 전에 initiator stack까지
+저장하는 CDP 재측정을 먼저 하고, 그 수를 기준으로 감축 목표를 다시 쓴다. revision
+전환 자체는 유지한다 — 파생 identity를 없애는 것은 명시적 mutation만 무효화하게 만드는
+정리로서 여전히 옳고, 다만 "−7"을 근거로 팔지 않는다.
+
+### B2 — `&quota=1` 통합은 이 유닛이 고치려는 바로 그 증상을 만든다 (가장 무거움)
+
+base read를 지우면 안 된다. 지금 코드가 두 번 읽는 이유가 주석에 그대로 있다:
+[useProviderAccountPools.ts:87-95](/Users/jun/Developer/new/700_projects/opencodex/gui/src/hooks/useProviderAccountPools.ts:87)는
+싼 로컬 read로 계정 전환/재인증/삭제 컨트롤을 **먼저 그리고**, enrichment 실패는 이미
+그려진 row를 건드리지 않는다. 서버도 같은 계약을 명시한다:
+`?quota=1`이 없으면 로컬 목록을 즉시 돌려주고, 있으면
+`fetchProviderAccountQuotas()`를 기다린다
+([oauth-account-routes.ts:201-209](/Users/jun/Developer/new/700_projects/opencodex/src/server/management/oauth-account-routes.ts:201)).
+
+즉 원안의 통합은 Anthropic usage가 느리거나 타임아웃일 때 계정 컨트롤이 **아예 안 뜨고**
+provider가 error로 표시되게 만든다. 로딩을 보이게 하려고 시작한 작업이 로딩을 더 오래
+가리는 결과가 된다.
+
+수정: WP4에서 `-6`을 취하지 않는다. base-then-enrich 점진 페인트를 보존한다. 요청 수를
+줄이려면 서버가 로컬 row를 먼저 흘려보내는 재설계(WP5의 `/accounts` single-flight와
+SWR)가 선행되어야 하고, 그건 이 WP의 범위가 아니다.
+
+### B3 — visibility gate가 restart 재접속을 죽인다
+
+원안은 "모든 `pollMs`를 gate"라고 쓰면서 update poll은 예외라고 적었는데, 그 poll이 바로
+`useKeyedClientResource(..., { pollMs: 1500 })`이다
+([use-dashboard-data.ts:391](/Users/jun/Developer/new/700_projects/opencodex/gui/src/pages/use-dashboard-data.ts:391)).
+공용 gate는 이걸 같이 멈춘다. 업데이트 후 재시작을 기다리는 동안 탭이 숨겨지면 완료를
+놓친다.
+
+수정: gate를 opt-out 가능한 리소스 옵션(`pauseWhenHidden`, 기본 true)으로 만들고 update
+poll에 `false`를 준다. hidden 상태에서 restart 완료를 감지하는 테스트를 함께 넣는다.
+
+### B4 — 제안한 테스트 파일이 러너에서 못 돈다
+
+`Bun.file("gui/src/...")`는 GUI 러너의 cwd가 `gui/`라서 `gui/gui/src/...`로 풀린다
+(CI는 `cd gui && bun test tests`). 기존 GUI 테스트 관례는
+`Bun.file(new URL("../src/...", import.meta.url))`이다
+([dashboard-contracts.test.ts:24](/Users/jun/Developer/new/700_projects/opencodex/gui/tests/dashboard-contracts.test.ts:24)).
+
+수정: `new URL(..., import.meta.url)`로 바꾼다. 더 중요하게, 소스 문자열 단정은 대부분
+버린다. WP3에서 이미 배운 것이 그대로 적용된다 — 문자열 계약 테스트는 표면이 어댑터를
+쓰는지까지만 보고 런타임 결함 네 건을 모두 놓쳤다. 보존 트리거는 mock mutation을 돌려
+`?refresh=1`이 실제로 한 번 나가는지로 검증하고, 느린 quota probe에서도 계정 컨트롤이
+그려지는지(B2의 회귀 방지)를 테스트로 고정한다.
+
+### 비차단이지만 반영할 것
+
+- **공유 key는 peer-safe하지 않다.** cold in-flight는 첫 subscriber만 시작하지만
+  ([client-resource.ts:227](/Users/jun/Developer/new/700_projects/opencodex/gui/src/client-resource.ts:227)),
+  deps 변경이 `refresh()`를 부르고 `refresh()`는 공유 controller를 abort한다
+  ([:292](/Users/jun/Developer/new/700_projects/opencodex/gui/src/client-resource.ts:292)).
+  지금은 consumer가 하나라 드러나지 않는다. "두 surface가 안전하게 공유한다"고 주장하지
+  않고, 한 subscriber가 다른 쪽 in-flight 중에 무효화하는 테스트 없이는 확장하지 않는다.
+- **예외 표가 불완전하다.** Providers OAuth 대기 루프
+  ([use-providers-oauth.ts:88](/Users/jun/Developer/new/700_projects/opencodex/gui/src/pages/use-providers-oauth.ts:88)),
+  Storage 정리 완료 루프([Storage.tsx:858](/Users/jun/Developer/new/700_projects/opencodex/gui/src/pages/Storage.tsx:858)),
+  Codex quota-fill 재시도([useCodexAccountPool.ts:266](/Users/jun/Developer/new/700_projects/opencodex/gui/src/hooks/useCodexAccountPool.ts:266)),
+  WP3에서 추가한 startup stale 재조회
+  ([use-dashboard-data.ts:201](/Users/jun/Developer/new/700_projects/opencodex/gui/src/pages/use-dashboard-data.ts:201))를
+  명시적 예외로 적는다.
+- **앵커가 낡았다.** WP3가 같은 파일들의 줄을 옮겼다. 본문의 줄 번호는 구조 참조로만 읽고,
+  구현 시 실제 위치를 다시 확인한다. 구조 자체는 전부 그대로 있음을 A에서 확인했다.
+
+### 수정된 WP4 범위
+
+1. CDP 재측정으로 현재 콜드 요청 지도를 다시 만든다(initiator 포함). 감축 목표는 그 수에서 다시 쓴다.
+2. 파생 `quotaRefreshKey` → monotonic revision. `switchAccount`의 `fetchProviderQuotas(true)`는 같은 변경에서 revision에 연결한다.
+3. 셸 quota fetch를 고정 key 리소스로 옮긴다(단일 consumer 전제, peer-safe 주장 없음).
+4. `pauseWhenHidden` 옵션 도입 + update poll 예외. 위 4개 루프도 예외로 명시.
+5. `&quota=1` 통합은 **취소**. base-then-enrich 보존. 요청 감축은 WP5의 서버측 작업으로 넘긴다.
+6. 테스트는 행동 기반으로 쓴다: mock mutation의 force 요청, hidden→visible 1회, 느린 quota probe에서 컨트롤 렌더.
+
+### 감사 2라운드 반영 (blockers=0, GO-WITH-FIXES)
+
+`pauseWhenHidden`은 공용 store가 소유하는 것이 맞다 — interval이 거기 하나뿐이다
+([client-resource.ts:107](/Users/jun/Developer/new/700_projects/opencodex/gui/src/client-resource.ts:107)).
+구현 제약 네 가지를 못 박는다.
+
+- 옵션을 subscriber 단위로 저장한다(`{ pollMs, pauseWhenHidden }`). 고정 key store는
+  서로 다른 옵션의 subscriber가 섞일 수 있으므로 store 하나에 값 하나로 두면 안 된다.
+- hidden tick에서는 `pauseWhenHidden: false` subscriber가 하나라도 있으면 그 tick을
+  실행하고, 없으면 건너뛴다.
+- `visibilitychange` 리스너는 store 레벨에 하나만 달고 polling store와 함께 정리한다.
+  visible 복귀 시의 재검증은 `replaceInflight: false`로 조용히 보낸다.
+- raw 루프는 이 옵션 바깥이다. 아래 네 경로는 "`pauseWhenHidden`으로 제어된다"고 쓰지
+  않고 각각 독립적으로 분류·테스트한다.
+
+`useDataSurface`가 리소스 옵션을 그대로 넘기므로
+([data-surface.ts:141](/Users/jun/Developer/new/700_projects/opencodex/gui/src/data-surface.ts:141))
+그쪽 옵션 타입도 함께 넓힌다.
+
+과잉 수정 하나를 되돌린다. WP3에서 추가한 startup stale 재조회는 poll tick이 아니라
+`refresh()`를 직접 부른다([use-dashboard-data.ts:201](/Users/jun/Developer/new/700_projects/opencodex/gui/src/pages/use-dashboard-data.ts:201)).
+tick gate를 우회하고 abort 의미를 갖는 경로이므로 "visibility 예외"로 묶지 말고 따로
+분류해 따로 테스트한다. 나머지 세 경로(OAuth 대기, Storage 정리, Codex quota-fill)도
+같은 기준으로 각각 적는다.
+
+`quota=1` 미지원 provider의 enrichment를 건너뛰는 미세 감축은 가능하지만, 그 판정이
+서버 소유다([quota.ts:295](/Users/jun/Developer/new/700_projects/opencodex/src/providers/quota.ts:295)).
+GUI에 하드코딩하면 계약이 두 곳에 생기므로 취하지 않는다.
+
+**측정 체크포인트.** CDP 재측정과 그 수로 다시 쓴 수용 기준이 기록되기 전에는 요청 감축
+결과를 주장하지 않는다. 측정은 구현의 첫 단계로 두되, 감축 수치를 기준으로 삼기 전에
+정지·재감사 지점을 둔다. 행동 보존 작업(revision 전환, 고정 key, visibility 옵션)은
+측정과 무관하게 지금 명세대로 진행한다.
