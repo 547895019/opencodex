@@ -37,7 +37,7 @@ import {
   UnsupportedOAuthProviderError,
 } from "../../oauth";
 import { buildWebSearchTool, planWebSearch, runWithWebSearch, shouldResolveOpenAiWebSearchSidecar } from "../../web-search";
-import { describeImagesInPlace, planVisionSidecar, shouldResolveOpenAiVisionSidecar, stripImagesInPlace } from "../../vision";
+import { describeImagesInPlace, messagesHaveImage, planVisionSidecar, shouldResolveOpenAiVisionSidecar, stripImagesInPlace } from "../../vision";
 import { createAdapterEventQueue, preflightAdapterEvents } from "../../adapters/run-turn-queue";
 import {
   applyCodexAuthContextToProvider,
@@ -107,6 +107,8 @@ import type { EffectiveSubagentRoster, SpawnAgentSurface } from "../../codex/cat
 import { buildToolBridgeMaps, collabSurface, injectDeveloperMessage, multiAgentGuidanceText } from "./collaboration";
 import { hasUnreadableEncryptedAgentTask, looksLikeBackendCiphertext, sanitizeEncryptedContentInPlace } from "./encrypted-payload";
 import { fetchWithHeaderTimeout, providerFetch, safeHostLabel } from "./fetch-helpers";
+import { isImageUnsupported400 } from "../image-unsupported-400";
+import { markModelNoVision } from "../vision-mark";
 import { guardTerminalEventStream } from "./terminal-guard";
 
 /**
@@ -1549,6 +1551,7 @@ export async function handleResponses(
     let imageTierBias = 0;
     let imageRetryAttempted = false;
     let oauth401ReplayAttempted = false;
+    let visionMarkAttempted = false;
     const rebuildAndRefetch = async (
       recovery: AttemptRecoveryKind,
     ): Promise<Response | { failed: Response }> => {
@@ -1650,6 +1653,28 @@ export async function handleResponses(
         imageTierBias = 1;
         try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
         const result = await rebuildAndRefetch("image-413");
+        if ("failed" in result) return result.failed;
+        upstreamResponse = result;
+        continue recovery;
+      }
+      // Reactive vision marking: the routed model 400'd on an image-unsupported error. One-shot:
+      // persist the model into providers[name].noVisionModels (set-and-forget, so the user never
+      // hand-edits config), strip images in place, then rebuild + refetch. The describe path lands
+      // on request #2 — the model is now persisted noVision, so the pre-emptive planVisionSidecar
+      // path fires next time (describe if a sidecar is configured, else strip). Strip-only here
+      // because the sidecar was NOT resolved at first-fetch time for a not-yet-noVision model.
+      if (
+        !visionMarkAttempted
+        && upstreamResponse.status === 400
+        && messagesHaveImage(parsed)
+        && !modelInList(route.provider.noVisionModels, route.modelId)
+        && await isImageUnsupported400(upstreamResponse, options.abortSignal)
+      ) {
+        visionMarkAttempted = true;
+        markModelNoVision(config, route, route.modelId);
+        stripImagesInPlace(parsed);
+        try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
+        const result = await rebuildAndRefetch("vision-mark-400");
         if ("failed" in result) return result.failed;
         upstreamResponse = result;
         continue recovery;
