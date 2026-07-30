@@ -39,7 +39,7 @@ interface SettingsData {
     diagnosticStale: boolean;
   };
 }
-type SidecarBackend = "openai" | "anthropic" | "routed";
+type SidecarBackend = "openai" | "anthropic" | "routed" | "ollama";
 interface SidecarSetting { backend?: SidecarBackend; model: string }
 interface SidecarData { webSearch: SidecarSetting; vision: SidecarSetting }
 interface SidecarPatch {
@@ -138,7 +138,7 @@ function mergeSidecarSetting(
 
 function sidecarModelOptions(models: ModelInfo[]) {
   return models
-    .filter(model => model.provider === "openai" || model.provider === "anthropic")
+    .filter(model => model.provider === "openai" || model.provider === "anthropic" || model.provider === "ollama")
     .map(model => ({ value: model.id, label: `${model.provider}/${model.id}` }));
 }
 
@@ -158,6 +158,18 @@ function sidecarBackendForModel(models: ModelInfo[], modelId: string): SidecarBa
   const provider = models.find(model => model.id === modelId)?.provider;
   if (provider === "anthropic") return "anthropic";
   if (provider === "openai") return "openai";
+  return "routed";
+}
+
+/**
+ * Web-search backend per selected model. Ollama is a first-class web-search backend (its own REST
+ * search endpoint), unlike vision where ollama models fall through to the generic "routed" describer.
+ */
+function webSearchBackendForModel(models: ModelInfo[], modelId: string): SidecarBackend {
+  const provider = models.find(model => model.id === modelId)?.provider;
+  if (provider === "anthropic") return "anthropic";
+  if (provider === "openai") return "openai";
+  if (provider === "ollama") return "ollama";
   return "routed";
 }
 
@@ -1073,7 +1085,7 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
     <Select
       value={sidecar?.webSearch.model ?? "gpt-5.6-luna"}
       options={sidecarModels}
-      onChange={model => { void saveSidecar({ webSearch: { model, backend: sidecarBackendForModel(models, model) } }); }}
+      onChange={model => { void saveSidecar({ webSearch: { model, backend: webSearchBackendForModel(models, model) } }); }}
       disabled={!sidecar || sidecarSaving}
       label={t("dash.sidecarModel")}
     />

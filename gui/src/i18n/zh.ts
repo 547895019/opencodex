@@ -157,6 +157,7 @@ export const zh: Record<TKey, string> = {
   "dash.backendOpenAI": "OpenAI",
   "dash.backendAnthropic": "Anthropic",
   "dash.backendRouted": "路由",
+  "dash.backendOllama": "Ollama",
   "dash.sidecarSaved": "附属设置已保存。将在下一个请求时生效。",
   "dash.sidecarSaveFailed": "保存附属设置失败。",
   "dash.injectionLabel": "子代理委托",

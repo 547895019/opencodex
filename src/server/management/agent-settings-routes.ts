@@ -370,10 +370,10 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       if (!isPlainObject(section)) return jsonResponse({ error: `${field} must be an object or null` }, 400);
       const backendOk = field === "visionSidecar"
         ? section.backend === "openai" || section.backend === "anthropic" || section.backend === "routed"
-        : section.backend === "openai" || section.backend === "anthropic";
+        : section.backend === "openai" || section.backend === "anthropic" || section.backend === "ollama";
       if (section.backend !== undefined && section.backend !== null && !backendOk) {
         return jsonResponse({
-          error: `${field}.backend must be ${field === "visionSidecar" ? "openai, anthropic, routed, or null" : "openai, anthropic, or null"}`,
+          error: `${field}.backend must be ${field === "visionSidecar" ? "openai, anthropic, routed, or null" : "openai, anthropic, ollama, or null"}`,
         }, 400);
       }
       if (section.model !== undefined && typeof section.model !== "string") {
@@ -388,14 +388,15 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
         delete next[field];
         continue;
       }
-      const requested = section as { backend?: "openai" | "anthropic" | "routed" | null; model?: string };
+      const requested = section as { backend?: "openai" | "anthropic" | "ollama" | "routed" | null; model?: string };
       // Per-field concrete types avoid the union-keyed write (which would require assigning to the
       // intersection of both sidecar backend unions). Validation above already admits "routed" only
       // for visionSidecar, so each branch's backend cast is sound.
       if (field === "visionSidecar") {
         const override = { ...(next.visionSidecar ?? {}) };
         if (requested.backend === null) delete override.backend;
-        else if (requested.backend !== undefined) override.backend = requested.backend;
+        // visionSidecar never admits "ollama"/"routed" mixups (validation above rejects them); narrow the cast.
+        else if (requested.backend !== undefined) override.backend = requested.backend as "openai" | "anthropic" | "routed";
         if (requested.model === "") delete override.model;
         else if (requested.model !== undefined) override.model = requested.model;
         if (Object.keys(override).length > 0) next.visionSidecar = override;
@@ -403,8 +404,8 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       } else {
         const override = { ...(next.webSearchSidecar ?? {}) };
         if (requested.backend === null) delete override.backend;
-        // webSearchSidecar never admits "routed" (validation above rejects it); narrow the cast.
-        else if (requested.backend !== undefined) override.backend = requested.backend as "openai" | "anthropic";
+        // webSearchSidecar admits openai/anthropic/ollama (validation above rejects "routed"); narrow the cast.
+        else if (requested.backend !== undefined) override.backend = requested.backend as "openai" | "anthropic" | "ollama";
         if (requested.model === "") delete override.model;
         else if (requested.model !== undefined) override.model = requested.model;
         if (Object.keys(override).length > 0) next.webSearchSidecar = override;

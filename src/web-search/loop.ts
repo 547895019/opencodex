@@ -4,6 +4,7 @@ import { namespacedToolName } from "../types";
 import { bridgeToResponsesSSE } from "../bridge";
 import { runWebSearch, type SidecarOutcome, type SidecarOutcomeRecorder, type SidecarSettings } from "./executor";
 import { runAnthropicWebSearch } from "./anthropic-executor";
+import { runOllamaWebSearch } from "./ollama-executor";
 import { clearableDeadline } from "../lib/abort";
 import { redactSecretString } from "../lib/redact";
 import { readBoundedResponseBody } from "../lib/bounded-body";
@@ -165,11 +166,13 @@ export interface WebSearchLoopDeps {
   parsed: OcxParsedRequest;
   adapter: ProviderAdapter;
   /** Which executor runs searches. Defaults to "openai" so existing callers keep the ChatGPT path (audit F4). */
-  backend?: "openai" | "anthropic";
-  /** Required for the openai backend; unused (and typically undefined) for the anthropic backend. */
+  backend?: "openai" | "anthropic" | "ollama";
+  /** Required for the openai backend; unused (and typically undefined) for the anthropic/ollama backend. */
   forwardProvider?: OcxProviderConfig;
   /** Required for the anthropic backend: the stored-OAuth provider that runs web_search_20250305. */
   anthropicSidecar?: { providerName: string; provider: OcxProviderConfig };
+  /** Required for the ollama backend: the routed ollama provider that runs web_search + summarize. */
+  ollamaSidecar?: { providerName: string; provider: OcxProviderConfig };
   hostedTool: Record<string, unknown>;
   selectedForwardHeaders: Headers;
   settings: SidecarSettings;
@@ -206,6 +209,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
   const { parsed, selectedForwardHeaders, forwardProvider, hostedTool, settings, maxSearches, abortSignal, recordSidecarOutcome } = deps;
   const backend = deps.backend ?? "openai";
   const anthropicSidecar = deps.anthropicSidecar;
+  const ollamaSidecar = deps.ollamaSidecar;
   // Mutable: 429 key-failover (deps.on429) can swap in a rebuilt adapter mid-loop.
   let adapter = deps.adapter;
 
@@ -433,7 +437,9 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
         try {
           outcome = backend === "anthropic" && anthropicSidecar
             ? await runAnthropicWebSearch(query, anthropicSidecar.providerName, anthropicSidecar.provider, settings, signal)
-            : await runWebSearch(query, hostedTool, forwardProvider!, selectedForwardHeaders, settings, signal, recordSidecarOutcome);
+            : backend === "ollama" && ollamaSidecar
+              ? await runOllamaWebSearch(query, ollamaSidecar.providerName, ollamaSidecar.provider, settings, signal)
+              : await runWebSearch(query, hostedTool, forwardProvider!, selectedForwardHeaders, settings, signal, recordSidecarOutcome);
           if (signal.aborted) throw new LoopError(499, "client closed request during web-search");
         } catch (e) {
           if (e instanceof LoopError) throw e;

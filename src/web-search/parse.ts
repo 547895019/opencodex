@@ -62,7 +62,7 @@ function cleanTitle(prefix: string): string {
   return title;
 }
 
-function extractTrailingSources(text: string): { text: string; sources: WebSearchSource[] } {
+export function extractTrailingSources(text: string): { text: string; sources: WebSearchSource[] } {
   const lines = text.split("\n");
   // Find the LAST line that is a "Sources:" header (markdown prefixes allowed).
   let headerIdx = -1;
@@ -217,4 +217,53 @@ export async function parseSidecarSSE(response: Response): Promise<WebSearchResu
   const finalText = textSources.length > 0 ? body : (typeof text === "string" ? text : "");
   if (!finalText.trim() && acc.error) return { text: "", sources, error: acc.error };
   return { text: finalText, sources };
+}
+
+/**
+ * Fold an OpenAI chat-completions SSE stream (ollama summarize step) into a WebSearchResult. Only the
+ * assistant text is needed — sources come from the separate /api/experimental/web_search call in the
+ * executor, not the stream — so `sources` is returned empty and the executor merges its own. Tolerant
+ * of the `data: {choices:[{delta:{content}}]}` / `data: [DONE]` shape; never throws.
+ */
+export async function parseOllamaChatSSE(res: Response): Promise<WebSearchResult> {
+  if (!res.body) return { text: "", sources: [] };
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let text = "";
+  let error: string | null = null;
+
+  const handle = (payload: string): void => {
+    if (!payload || payload === "[DONE]") return;
+    let data: Record<string, unknown>;
+    try { data = JSON.parse(payload) as Record<string, unknown>; } catch { return; }
+    const choices = data.choices;
+    if (Array.isArray(choices) && choices.length > 0) {
+      const delta = (choices[0] as Record<string, unknown> | undefined)?.delta as Record<string, unknown> | undefined;
+      if (delta && typeof delta.content === "string") text += delta.content;
+    }
+    // Some OpenAI-compatible servers surface a top-level error object on failure.
+    const err = data.error as { message?: string } | undefined;
+    if (err && typeof err.message === "string") error = err.message;
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (line.startsWith("data: ")) handle(line.slice(6).trim());
+        else if (line.startsWith("data:")) handle(line.slice(5).trim());
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const trimmed = text.trim();
+  if (!trimmed) return { text: "", sources: [], error: error ?? "ollama sidecar produced no answer" };
+  return { text: trimmed, sources: [] };
 }

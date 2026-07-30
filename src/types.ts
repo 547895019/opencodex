@@ -412,7 +412,7 @@ export interface OcxClaudeCodeConfig {
    */
   injectAgents?: boolean;
   /** Claude-originated web-search override. Unset fields inherit the global sidecar settings. */
-  webSearchSidecar?: { backend?: "openai" | "anthropic"; model?: string };
+  webSearchSidecar?: { backend?: "openai" | "anthropic" | "ollama"; model?: string };
   /** Claude-originated vision override. Unset fields inherit the global sidecar settings. */
   visionSidecar?: { backend?: "openai" | "anthropic" | "routed"; model?: string };
 }
@@ -686,11 +686,17 @@ export interface OcxWebSearchSidecarConfig {
   /**
    * Which backend actually runs the server-side search. "openai" replays the hosted web_search via
    * the ChatGPT forward provider (gpt-mini sidecar); "anthropic" runs web_search_20250305 on a Claude
-   * model authenticated by the STORED anthropic OAuth credential. Unset resolves to "anthropic" when a
-   * usable anthropic OAuth credential exists, else "openai".
+   * model authenticated by the STORED anthropic OAuth credential; "ollama" calls the Ollama web-search
+   * REST endpoint (local daemon /api/experimental/web_search keyless, or hosted ollama.com/api/web_search
+   * with a bearer API key) and summarizes the results via the routed ollama `model`. Unset resolves to
+   * "anthropic" when a usable anthropic OAuth credential exists, else "openai".
    */
-  backend?: "openai" | "anthropic";
-  /** Sidecar model that runs the real server-side web_search (must be a native ChatGPT model). */
+  backend?: "openai" | "anthropic" | "ollama";
+  /**
+   * Sidecar model. For "openai"/"anthropic" this is the native ChatGPT/Claude model that runs the
+   * server-side web_search. For "ollama" this is the routed ollama model id (e.g. "glm-5.2:cloud")
+   * that summarizes the search results.
+   */
   model?: string;
   /** Reasoning effort for the sidecar — "minimal" (non-thinking) keeps it fast/cheap. */
   reasoning?: string;

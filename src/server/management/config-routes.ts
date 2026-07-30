@@ -295,8 +295,8 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
       vision?: { model?: unknown; backend?: unknown; maxDescriptionsPerTurn?: unknown };
     };
     if (body.webSearch && body.webSearch.backend !== undefined && body.webSearch.backend !== null
-      && body.webSearch.backend !== "openai" && body.webSearch.backend !== "anthropic") {
-      return jsonResponse({ error: "webSearch.backend must be openai, anthropic, or null" }, 400);
+      && body.webSearch.backend !== "openai" && body.webSearch.backend !== "anthropic" && body.webSearch.backend !== "ollama") {
+      return jsonResponse({ error: "webSearch.backend must be openai, anthropic, ollama, or null" }, 400);
     }
     if (body.vision && body.vision.backend !== undefined
       && body.vision.backend !== null && body.vision.backend !== "openai" && body.vision.backend !== "anthropic"
@@ -316,7 +316,7 @@ export async function handleConfigRoutes(ctx: ManagementContext): Promise<Respon
         else config.webSearchSidecar.model = body.webSearch.model;
       }
       if (body.webSearch.backend === null) delete config.webSearchSidecar.backend;
-      else if (body.webSearch.backend === "openai" || body.webSearch.backend === "anthropic") {
+      else if (body.webSearch.backend === "openai" || body.webSearch.backend === "anthropic" || body.webSearch.backend === "ollama") {
         config.webSearchSidecar.backend = body.webSearch.backend;
       }
       if (typeof body.webSearch.reasoning === "string") config.webSearchSidecar.reasoning = body.webSearch.reasoning;

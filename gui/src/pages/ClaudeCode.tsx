@@ -346,8 +346,10 @@ export default function ClaudeCode({ apiBase }: { apiBase: string }) {
                   { value: "openai", label: t("dash.backendOpenAI") },
                   { value: "anthropic", label: t("dash.backendAnthropic") },
                   // "routed" describes images via any configured provider model; only the vision
-                  // sidecar supports it (web_search still needs a native server-side search tool).
+                  // sidecar supports it. "ollama" runs web search via the ollama REST endpoint +
+                  // summarize; only the web-search sidecar supports it.
                   ...(key === "visionSidecar" ? [{ value: "routed", label: t("dash.backendRouted") }] : []),
+                  ...(key === "webSearchSidecar" ? [{ value: "ollama", label: t("dash.backendOllama") }] : []),
                 ]}
                 onChange={value => setState({
                   ...state,

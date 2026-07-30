@@ -157,6 +157,7 @@ export const ko: Record<TKey, string> = {
   "dash.backendOpenAI": "OpenAI",
   "dash.backendAnthropic": "Anthropic",
   "dash.backendRouted": "라우티드",
+  "dash.backendOllama": "Ollama",
   "dash.sidecarSaved": "사이드카 설정이 저장됐습니다. 다음 요청부터 적용됩니다.",
   "dash.sidecarSaveFailed": "사이드카 설정 저장에 실패했습니다.",
   "dash.injectionLabel": "서브에이전트 위임",

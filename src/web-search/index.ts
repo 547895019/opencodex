@@ -8,6 +8,7 @@ import { DEFAULT_STALL_TIMEOUT_SEC } from "../stall-timeout";
 export { runWithWebSearch } from "./loop";
 export { buildWebSearchTool, extractHostedWebSearch, WEB_SEARCH_TOOL_NAME } from "./synthetic-tool";
 export { runAnthropicWebSearch, parseAnthropicSidecarSSE } from "./anthropic-executor";
+export { runOllamaWebSearch } from "./ollama-executor";
 
 const DEFAULT_SIDECAR_MODEL = "gpt-5.6-luna";
 // Default Claude model for the anthropic-backed sidecar (used when cfg.model is unset).
@@ -26,6 +27,19 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_ROUTED_MODEL_STALL_TIMEOUT_MS = 200_000;
 const MAX_ROUTED_MODEL_STALL_TIMEOUT_MS = 2_147_483_647;
 const STALL_MARGIN_SEC = 30;
+
+/**
+ * Strip a leading "provider/" prefix from a model id the GUI stored. The Dashboard model dropdown
+ * stores the BARE model id (e.g. "glm-5.2:cloud"), but subagentModels and manual config may carry the
+ * "ollama/" prefix; ollama wants the bare native name. Returns undefined for empty input.
+ */
+function stripProviderPrefix(model: string | undefined): string | undefined {
+  if (!model) return undefined;
+  const trimmed = model.trim();
+  if (!trimmed) return undefined;
+  const slash = trimmed.indexOf("/");
+  return slash >= 0 ? trimmed.slice(slash + 1) : trimmed;
+}
 
 /**
  * Resolve the config-file-only routed-model raw-byte inactivity budget. Runtime config loading is
@@ -77,6 +91,24 @@ export interface AnthropicSidecarProvider {
 }
 
 /**
+ * A configured ollama provider resolved for the web-search sidecar. Unlike the openai/anthropic
+ * backends, ollama has no model-internal search tool — the sidecar calls the standalone web_search
+ * REST endpoint and then summarizes via a chat/responses completion on the SAME provider. So we need
+ * the provider's baseUrl/adapter/apiKey, and the native model id comes from `cfg.model` (the GUI
+ * stores the bare model id; no routeModel lookup is needed, mirroring the anthropic backend).
+ *
+ * Both `openai-chat` (→ /chat/completions) and `openai-responses` (→ /responses) adapters are
+ * accepted: the ollama daemon's OpenAI-compatible surface speaks either, and users may run their main
+ * model through the responses adapter. The executor branches the summarize wire format on adapter.
+ * Ollama needs no credential for local web_search — the daemon signs requests to ollama cloud
+ * internally — so "usable" just means "present, not disabled, and an OpenAI-compatible adapter".
+ */
+export interface OllamaSidecarProvider {
+  providerName: string;
+  provider: OcxProviderConfig;
+}
+
+/**
  * First enabled anthropic-adapter OAuth provider whose ACTIVE account holds a usable credential — the
  * only path that can run web_search_20250305 without a ChatGPT forward provider. Presence is decided by
  * getAccountSet + the active account's `needsReauth` marker (audit F1: getCredential alone can pick a
@@ -94,24 +126,60 @@ export function findAnthropicSidecarProvider(config: OcxConfig): AnthropicSideca
 }
 
 /**
+ * Find the ollama provider for the sidecar by scanning config.providers (NOT routeModel): the GUI
+ * stores the BARE model id, so routeModel would route `glm-5.2:cloud` to the default provider
+ * (often "openai") — wrong. Instead we identify the ollama provider directly, by config key "ollama"
+ * (the registry default id) or by an ollama host root (the local daemon on :11434, or ollama.com).
+ * The web_search endpoint lives at the daemon's host root, so the baseUrl host is the principled
+ * discriminator. Only OpenAI-compatible adapters qualify, since the executor summarizes via
+ * /chat/completions or /responses.
+ */
+export function findOllamaSidecarProvider(config: OcxConfig): OllamaSidecarProvider | undefined {
+  for (const [name, prov] of Object.entries(config.providers)) {
+    if (prov.disabled === true) continue;
+    if (prov.adapter !== "openai-chat" && prov.adapter !== "openai-responses") continue;
+    // Identify the ollama provider: by the conventional registry key, or by an ollama host root
+    // (local daemon on :11434, or ollama.com / *.ollama.com). Strip a trailing /v1 before parsing.
+    let host = "";
+    try {
+      const stripped = (prov.baseUrl ?? "").replace(/\/v1\/?$/, "").replace(/\/+$/, "");
+      host = stripped ? new URL(stripped).host.toLowerCase() : "";
+    } catch {
+      host = "";
+    }
+    const isOllamaHost =
+      host === "ollama.com" ||
+      host.endsWith(".ollama.com") ||
+      host === "localhost:11434" ||
+      host === "127.0.0.1:11434";
+    if (name === "ollama" || isOllamaHost) return { providerName: name, provider: prov };
+  }
+  return undefined;
+}
+
+/**
  * Precedence: explicit config wins; unset defaults to "openai" (ChatGPT forward path). The
  * anthropic backend (web_search_20250305) is only used when explicitly configured — auto-selecting
  * it from credential availability caused the sidecar to send incompatible models (e.g. gpt-5.6-luna)
- * to the Anthropic API.
+ * to the Anthropic API. The ollama backend is likewise opt-in only.
  */
 export function resolveSidecarBackend(
-  explicit: "openai" | "anthropic" | undefined,
-): "openai" | "anthropic" {
-  return explicit === "anthropic" ? "anthropic" : "openai";
+  explicit: "openai" | "anthropic" | "ollama" | undefined,
+): "openai" | "anthropic" | "ollama" {
+  if (explicit === "anthropic") return "anthropic";
+  if (explicit === "ollama") return "ollama";
+  return "openai";
 }
 
 export interface SidecarPlan {
-  /** Which executor runs the search. Anthropic does not require a forward provider. */
-  backend: "openai" | "anthropic";
-  /** Present for the openai backend (ChatGPT forward path); undefined for anthropic. */
+  /** Which executor runs the search. Anthropic/Ollama do not require a forward provider. */
+  backend: "openai" | "anthropic" | "ollama";
+  /** Present for the openai backend (ChatGPT forward path); undefined for anthropic/ollama. */
   forwardSidecar?: ResolvedOpenAiForwardSidecar;
-  /** Present for the anthropic backend (stored-OAuth /v1/messages path); undefined for openai. */
+  /** Present for the anthropic backend (stored-OAuth /v1/messages path); undefined for openai/ollama. */
   anthropicSidecar?: AnthropicSidecarProvider;
+  /** Present for the ollama backend (local/hosted web_search + summarize); undefined for openai/anthropic. */
+  ollamaSidecar?: OllamaSidecarProvider;
   hostedTool: Record<string, unknown>;
   settings: SidecarSettings;
   maxSearches: number;
@@ -176,6 +244,29 @@ export function planWebSearch(
       anthropicSidecar,
       hostedTool: parsed._webSearch,
       settings: { model: cfg.model ?? DEFAULT_ANTHROPIC_SIDECAR_MODEL, reasoning, timeoutMs, describeImages },
+      maxSearches,
+      routedModelStallTimeoutMs,
+      stallTimeoutSec,
+    };
+  }
+
+  // Ollama backend: calls the ollama web_search REST endpoint (local daemon keyless, or hosted
+  // ollama.com with a bearer API key) and summarizes the results via the SAME ollama provider. The
+  // model is mandatory — there is no sensible default ollama model, so fail closed without one
+  // (mirrors the vision routed backend). The provider is found by scanning config.providers
+  // (findOllamaSidecarProvider), NOT routeModel: the GUI stores the BARE model id, so routeModel
+  // would mis-route it to the default provider. cfg.model is sent to ollama verbatim as the native
+  // model id (any "ollama/" prefix is stripped defensively).
+  if (backend === "ollama") {
+    const ollamaSidecar = findOllamaSidecarProvider(config);
+    if (!ollamaSidecar) return undefined;
+    const nativeModelId = stripProviderPrefix(cfg.model);
+    if (!nativeModelId) return undefined;
+    return {
+      backend: "ollama",
+      ollamaSidecar,
+      hostedTool: parsed._webSearch,
+      settings: { model: nativeModelId, reasoning, timeoutMs, describeImages },
       maxSearches,
       routedModelStallTimeoutMs,
       stallTimeoutSec,
