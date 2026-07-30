@@ -317,3 +317,77 @@ console.assert(Math.abs(inputCenter - toggleCenter) === 0, `${inputCenter} != ${
 **IN**: `CodexPoolStrategySetting`, `AccountPoolStrategyControls`, `CodexAutoSwitchSetting`, shared `Switch`의 필요한 event/ARIA props, 각 표의 설정 row markup/CSS, 0px center-line 검증, release-lag를 명시하는 user-facing release note.
 
 **OUT**: 새 spacing/control token, `gui/dist` 직접 수정, 수치 stepper 재설계, provider form의 submit model 변경, account/list/modal card 재디자인, WP2 loader contract 구현, WP7의 모델별 control 제거, npm publish 또는 실제 release. 사용자 화면의 v2.7.43 padding은 source patch만으로 배포되지 않는다.
+
+## 감사 반영 (A, 2026-07-31) — blocker 1건 + 축소
+
+리뷰어가 FAIL을 냈다. 소스에서 전부 확인했고, 아래가 구현의 정본이다. 위 본문은 원안 기록.
+
+### B1 (blocker) — 한 줄 desc는 문구 하나를 조용히 버린다
+
+원안의 canonical row는 `.desc` 하나만 두고 "둘이 다르면 하나를 고르라"고 했다. 그런데 지금
+화면에는 **서로 다른 말을 하는 두 문구**가 동시에 나온다.
+
+| 키 | 한국어 | 렌더 위치 |
+|----|--------|-----------|
+| `accountPool.strategyDesc` | 새 세션이 풀에서 계정을 고르는 방식입니다. | [CodexPoolStrategySetting.tsx:196](/Users/jun/Developer/new/700_projects/opencodex/gui/src/components/CodexPoolStrategySetting.tsx:196) |
+| `accountPool.strategyHint` | 새 세션에만 적용됩니다. 기존 스레드는 계정 어피니티를 유지합니다. | [AccountPoolStrategyControls.tsx:73](/Users/jun/Developer/new/700_projects/opencodex/gui/src/components/AccountPoolStrategyControls.tsx:73) |
+
+앞은 이 설정이 **무엇을 하는지**, 뒤는 **적용 범위와 기존 스레드가 어떻게 되는지**다. 뒤쪽이
+사라지면 "지금 열려 있는 스레드도 즉시 바뀌나?"라는 질문에 화면이 답하지 못한다. 사용자
+스크린샷에도 두 줄이 같이 찍혀 있다.
+
+수정: 두 문구를 **모두** 유지한다. canonical row는 `.desc`를 여러 개 받을 수 있고, 어피니티
+고지는 두 번째 `.desc` 줄로 남긴다. 어느 쪽도 버리지 않는다.
+
+### B2 — `.setting-row`는 앱 전역 지배 패턴이 아니다
+
+JSX 사용처가 8곳이고 전부 `claude-code-sections.tsx`와 `claude-code-settings.tsx` 두 파일이다.
+좋은 기준 구현이긴 하지만 "앱 전역 전환"의 근거는 아니다. 원안의 광범위한 전환 표는 취소한다.
+
+수정: WP6 범위를 **account-pool과 auto-switch 카드로 한정**한다. 나머지 페이지는 별도 인벤토리로
+남기고 이번에 건드리지 않는다. 최소 변경을 선호하는 사용자 방향과도 맞는다.
+
+### B3 — auto-switch 처방이 자기모순이었다
+
+표는 canonical row로 전환하라고 하는데 실제 diff는 slot만 추가하고 바깥 `.card.card-row`를
+그대로 둔다([CodexAutoSwitchSetting.tsx:48](/Users/jun/Developer/new/700_projects/opencodex/gui/src/components/CodexAutoSwitchSetting.tsx:48)).
+
+수정: **slot만** 한다. 정렬 문제는 slot으로 해결되고 침습이 훨씬 적다. 바깥 구조는 유지한다.
+
+### 정렬 방식 확정
+
+리뷰어 확인대로 바깥 `align-items: flex-end`를 **그대로 두고**, 20px `Switch`를 32px slot 안에
+넣어 input wrap과 center를 맞춘다. 모바일 override([styles.css:1810](/Users/jun/Developer/new/700_projects/opencodex/gui/src/styles.css:1810))도
+같은 bottom 정렬을 유지하므로 slot 기하를 되돌리지 않는다. `align-items`를 center로 바꾸는
+원안보다 부작용이 적다.
+
+### 함께 고칠 테스트
+
+- [account-pool-strategy.test.tsx:180,196](/Users/jun/Developer/new/700_projects/opencodex/gui/tests/account-pool-strategy.test.tsx:180) — 옛 `field-label`/`sr-only` 계약을 단정한다.
+- [codex-auto-switch-controller.test.tsx:192](/Users/jun/Developer/new/700_projects/opencodex/gui/tests/codex-auto-switch-controller.test.tsx:192) — `button.toggle` 선택자. `button.switch` + slot으로 바꾸되 pointer-before-blur 경쟁 케이스는 보존한다.
+- Anthropic 쪽은 이 컴포넌트를 마운트하는 테스트가 아예 없다. 공용 컴포넌트를 바꾸므로 행동 테스트를 새로 추가한다.
+- 0px center-line DOM 검증을 추가한다(반올림 전 CSS pixel 값으로).
+
+### 낡은 앵커
+
+canonical CSS는 1830이 아니라 [styles.css:1928](/Users/jun/Developer/new/700_projects/opencodex/gui/src/styles.css:1928),
+account-pool padding은 1284가 아니라 [styles.css:1385](/Users/jun/Developer/new/700_projects/opencodex/gui/src/styles.css:1385)다.
+release-lag 진단 자체는 맞다. 참고로 반응형 블록에는 `.setting-copy`라는 옛 별칭이 남아 있는데
+([styles.css:1803](/Users/jun/Developer/new/700_projects/opencodex/gui/src/styles.css:1803)) 현재 JSX는
+`.setting-label`을 쓴다. 이번에 정리하지 않고 그대로 둔다(범위 밖).
+
+### 감사 2라운드 (blockers=0)
+
+`.setting-copy`를 "낡은 별칭"으로 본 것은 내 오판이었다. Claude와 dashboard 섹션에서 여전히
+살아 있는 클래스라 정리 대상이 아니다. 범위 밖으로 두는 결론은 같지만 이유가 다르다.
+
+두 `.desc` 줄이 UI 형태로도 맞다는 확인을 받았다. 설명과 적용 범위는 label column에 같이
+있는 것이 자연스럽고, 별도 notice나 select 인라인 텍스트로 빼면 compact한 row에 위계와
+소음만 추가된다. 기존 Claude 설정도 이미 여러 desc를 지원한다
+([claude-code-sections.tsx](/Users/jun/Developer/new/700_projects/opencodex/gui/src/pages/claude-code-sections.tsx:128)).
+
+32px slot 관련 구현 제약 하나: **slot은 `{enabled}` 조건 바깥에 렌더한다.** 임계값 input이
+사라져도 slot이 남아야 switch 위치가 흔들리지 않는다.
+
+Anthropic 행동 테스트는 "마운트된다"가 아니라 **두 desc 줄이 공용 컴포넌트를 통해 실제로
+렌더되는지**를 단정한다. B1의 내용 손실이 한쪽 caller에서만 되살아나는 것을 막는다.
