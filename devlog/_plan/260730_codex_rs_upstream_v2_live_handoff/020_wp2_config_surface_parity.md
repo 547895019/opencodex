@@ -312,3 +312,138 @@ writing a second one.
 
 The `\u` fallback is the branch most likely to ship dead: no realistic instruction text
 contains a control character, so only a deliberate fixture will drive it.
+
+---
+
+# P-phase re-verification (2026-07-31, execution cycle)
+
+Stale check against `dev` HEAD after WP1 landed (`d751aed51`). The translation helpers
+WP1 added shifted line numbers but did not move any anchor this doc names:
+`getAgentsMaxThreads` is still the right insertion neighbor (now lines 132-142),
+`editAgentsMaxThreads` is at ~272, and the three upstream keys were re-verified in the
+staleness audit (`005`) — `agents.enabled` (`config_toml.rs:686`, `Option<bool>`,
+default true), `agents.max_depth` (`config_toml.rs:693`, `Option<i32>`, V1-only per
+upstream's own comment), `subagent_developer_instructions`
+(`feature_configs.rs:100`, `Option<String>`, under `#[serde(deny_unknown_fields)]`).
+
+Three amendments, all from the execution-cycle staleness audit (`005`), each accepted.
+
+## Amendment A — Diff 5 (types.ts mirrors) is REMOVED
+
+`005` finding 1: these keys live in the native `config.toml`, and the management route
+already reads native state directly (`agent-settings-routes.ts:107`). Adding
+`agentsEnabled` / `subagentDeveloperInstructions` to `OcxConfig` would create a second
+source of truth for one value, with sync bugs as the only possible outcome. WP3 reads
+native state through this phase's readers; nothing mirrors into OpenCodex's own config.
+`src/types.ts` is OUT of this phase's change map.
+
+## Amendment B — the inline form needs a string-aware editor, not regex
+
+`005` finding 2: the existing inline handling (`features.ts` `/^\s*multi_agent_v2\s*=\s*\{([^}]*)\}/m`)
+terminates at the first `}` inside the body, so an instruction value containing `}` —
+or any TOML escape worth having — corrupts the parse. The plan's "reuse the
+`setMaxConcurrentThreads` inline mechanism" does not survive contact with free-form
+text.
+
+Final shape for B:
+
+1. **Reader** `getSubagentDeveloperInstructions` scans the inline line with string
+   awareness: locate `multi_agent_v2 = {`, walk to the matching `}` while skipping
+   TOML basic strings (a `"` toggles in-string, `\` skips the next character), then
+   extract the `subagent_developer_instructions` assignment from the body the same way
+   and DECODE the escapes (`\\`, `\"`, `\n`, `\r`, `\t`, `\b`, `\f`, `\uXXXX`).
+   The dedicated-table form is read with the existing `tomlTableBody` plus the same
+   string-aware extraction, since the value may itself contain `#`.
+2. **Writer** `setSubagentDeveloperInstructions`:
+   - dedicated-table form: `editScalarInTable` with `encodeTomlBasicString`.
+   - inline form: string-aware scan to the matching `}` (as above), then replace or
+     insert the single-line assignment inside the braces, leaving every other byte
+     untouched. Single-line basic strings are always legal inline, so no promotion to
+     a dedicated table is ever required.
+   - bare boolean form: upgrade in place to an inline table, mirroring
+     `setMaxConcurrentThreads`'s existing boolean upgrade, carrying the new key.
+3. A small shared private scanner (find matching `}` skipping strings; find key span
+   within a body skipping strings) backs both reader and writer — one implementation,
+   not two divergent ones.
+
+## Amendment C — the helper refactor is bounded
+
+The doc says to extract `editScalarInTable` "from the existing `editAgentsMaxThreads`".
+That is scoped: write `editScalarInTable` as a NEW general helper shaped by that
+function's logic, and leave `editAgentsMaxThreads` itself untouched — WP1 just landed
+behavior pinned by 51 tests, and re-deriving it through the new helper is unscoped
+risk for zero user-visible gain. All new helpers stay module-private (`005` finding 3:
+only `setMaxConcurrentThreads` is exported today); only the six public readers/writers
+are exported.
+
+## Added accept criteria
+
+11. No field is added to `OcxConfig`; `rg agentsEnabled|subagentDeveloperInstructions
+    src/types.ts` stays empty.
+12. An instruction value containing both `}` and `,` round-trips through the INLINE
+    form without disturbing sibling keys — the case the regex approach provably
+    corrupts.
+13. An instruction value containing `#` round-trips without becoming a comment.
+
+### Added activation scenarios
+
+| Path | Trigger | Observable |
+|---|---|---|
+| string-aware `}` scan | inline form + value containing `}` | sibling keys after the value intact |
+| escape decoder | stored `\\n` / `\\u0001` | reader returns the real characters |
+| `#` inside value | value `keep # not comment` | written line intact on re-read |
+
+---
+
+# A-phase fold-back, execution cycle (verdict GO-WITH-FIXES, 2 High blockers)
+
+Independent terra review. Both blockers accepted and folded; verdict qualifies as
+near-pass under AUDIT-LOOP-01 because both are concrete amendments below, leaving no
+residual.
+
+## Blocker 1 (accepted) — the scanner must handle TOML literal strings
+
+Amendment B's scanner skipped only basic strings (`"..."`). A hand-written valid value
+like `subagent_developer_instructions = 'keep } literal'` would make the scan treat the
+`}` inside the literal as the table close, corrupting a subsequent write. Our writer
+always EMITS basic strings, but the reader/editor must survive user-authored TOML.
+
+Final scanner contract for B:
+
+- State machine over the inline body recognizes BOTH string kinds: basic `"..."` (an
+  unescaped `"` closes; `\` skips the next character) and literal `'...'` (the next `'`
+  closes; backslash is NOT special).
+- Everything else (numbers, booleans, dates) contains no structural characters, so
+  `}`, `,`, and `#` are only meaningful outside any string.
+- The decoder mirrors this: basic strings unescape; literal strings are verbatim.
+- Tests: inline literal-string values containing `}`, `,`, `#`, and `"` round-trip.
+
+## Blocker 2 (accepted) — `max_depth` parity is the signed-i32 contract
+
+Upstream type is `Option<i32>` (`config_toml.rs:693`) with no minimum; resolution only
+defaults it (`mod.rs:3734-3738`) and runtime compares `depth > max_depth` directly
+(`agent/registry.rs:76-77`) with no clamp. So:
+
+- Writer validation is exactly `Number.isInteger(value) && value >= -2_147_483_648 &&
+  value <= 2_147_483_647`. Writing `2147483648` would produce a config upstream cannot
+  deserialize — a hard parse failure for the user's Codex, the worst failure class in
+  this file.
+- Reader grammar accepts signed decimals (`-?\d+`), not the `\d+` copied from
+  `max_threads` — a copied reader would wrongly reject valid negatives.
+- Tests: `-1`, `0`, both bounds accepted and round-tripped; `2147483648`,
+  `-2147483649`, and non-integers rejected by the writer without touching bytes.
+
+A negative `max_depth` effectively disables V1 child spawning upstream (any positive
+next depth exceeds it) while V2 ignores the key entirely — the writer comment must say
+this is a valid, meaningful configuration, not an error.
+
+## Verified during this round (no code change needed)
+
+- Upstream precedence confirmed exactly: V2 enabled wins first (`mod.rs:1521-1523`);
+  `agents.enabled = false` only matters with V2 off (`:1524-1527`), where it disables
+  V1/default. The Diff-1 doc comment's phrasing stands.
+- Anchor drift recorded: `editAgentsMaxThreads` is at `src/codex/features.ts:268`,
+  `applyConfigEditsAtomically` at `:417`, `setMaxConcurrentThreads` at `:207` (post-WP1).
+- No `agentsEnabled`/`subagentDeveloperInstructions` references exist anywhere in
+  `src/` or `gui/src/` — Amendment A's removal has no downstream collision.
+- Bun 1.3.14 `\t` decode bug re-confirmed; byte-level assertions stand.
