@@ -3,6 +3,7 @@ import type { OcxConfig, OcxContentPart, OcxMessage, OcxParsedRequest, OcxProvid
 import { modelInList } from "../types";
 import { describeImage, type DescribeOutcome, type VisionSettings } from "./describe";
 import { describeImageAnthropic } from "./anthropic-describe";
+import { describeImageRouted } from "./routed-describe";
 import type { CodexAuthContext } from "../codex/auth-context";
 import { getAccountSet } from "../oauth/store";
 import type { ResolvedOpenAiForwardSidecar } from "../providers/openai-sidecar";
@@ -111,10 +112,10 @@ export function findAnthropicVisionProvider(config: OcxConfig): AnthropicVisionP
 }
 
 export function resolveVisionBackend(
-  explicit: "openai" | "anthropic" | undefined,
+  explicit: "openai" | "anthropic" | "routed" | undefined,
   anthropicSidecar: AnthropicVisionProvider | undefined,
-): "openai" | "anthropic" {
-  if (explicit === "openai" || explicit === "anthropic") return explicit;
+): "openai" | "anthropic" | "routed" {
+  if (explicit === "openai" || explicit === "anthropic" || explicit === "routed") return explicit;
   return anthropicSidecar ? "anthropic" : "openai";
 }
 
@@ -141,9 +142,11 @@ export function shouldResolveOpenAiVisionSidecar(
 }
 
 export interface VisionPlan {
-  backend: "openai" | "anthropic";
+  backend: "openai" | "anthropic" | "routed";
   forwardSidecar?: ResolvedOpenAiForwardSidecar;
   anthropicSidecar?: AnthropicVisionProvider;
+  /** For `backend:"routed"`: the routed model id to describe images through (cfg.model). */
+  routedModel?: string;
   settings: VisionSettings;
   maxDescriptionsPerTurn: number;
 }
@@ -168,6 +171,17 @@ export function planVisionSidecar(
   const anthropicSidecar = findAnthropicVisionProvider(config);
   const backend = resolveVisionBackend(cfg.backend, anthropicSidecar);
   const maxDescriptionsPerTurn = resolveMaxDescriptionsPerTurn(cfg.maxDescriptionsPerTurn);
+
+  if (backend === "routed") {
+    const routedModel = cfg.model;
+    if (!routedModel) return undefined; // no sensible default routed model — fail closed (caller strips)
+    return {
+      backend: "routed",
+      routedModel,
+      settings: { model: routedModel, timeoutMs: cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS },
+      maxDescriptionsPerTurn,
+    };
+  }
 
   if (backend === "anthropic") {
     if (!anthropicSidecar) return undefined;
@@ -240,7 +254,20 @@ async function executeDescription(
   selectedForwardHeaders: Headers,
   abortSignal?: AbortSignal,
   recordSidecarOutcome?: SidecarOutcomeRecorder,
+  config?: OcxConfig,
 ): Promise<DescribeOutcome> {
+  if (plan.backend === "routed") {
+    if (!plan.routedModel || !config) return { text: "", error: "routed vision sidecar is unavailable" };
+    return describeImageRouted(
+      job.imageUrl,
+      job.detail,
+      job.contextText,
+      plan.routedModel,
+      config,
+      plan.settings,
+      abortSignal,
+    );
+  }
   if (plan.backend === "anthropic") {
     const sidecar = plan.anthropicSidecar;
     if (!sidecar) return { text: "", error: "anthropic vision sidecar is unavailable" };
@@ -279,6 +306,7 @@ export async function describeImagesInPlace(
   selectedForwardHeaders: Headers,
   abortSignal?: AbortSignal,
   recordSidecarOutcome?: SidecarOutcomeRecorder,
+  config?: OcxConfig,
 ): Promise<void> {
   // 1. Gather every image part across messages, each with its own message's text as context.
   const jobs: ImageJob[] = [];
@@ -334,7 +362,7 @@ export async function describeImagesInPlace(
     executions.push(async () => {
       let outcome: DescribeOutcome;
       try {
-        outcome = await executeDescription(job, plan, selectedForwardHeaders, abortSignal, recordSidecarOutcome);
+        outcome = await executeDescription(job, plan, selectedForwardHeaders, abortSignal, recordSidecarOutcome, config);
       } catch (error) {
         outcome = { text: "", error: error instanceof Error ? error.message : String(error) };
       }

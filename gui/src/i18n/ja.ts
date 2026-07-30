@@ -161,6 +161,7 @@ export const ja: Record<TKey, string> = {
   "dash.backendAuto": "自動",
   "dash.backendOpenAI": "OpenAI",
   "dash.backendAnthropic": "Anthropic",
+  "dash.backendRouted": "ルーテッド",
   "dash.sidecarSaved": "サイドカー設定を保存しました。次回リクエスト時に適用されます。",
   "dash.sidecarSaveFailed": "サイドカー設定の保存に失敗しました。",
   "dash.injectionLabel": "サブエージェント委任",

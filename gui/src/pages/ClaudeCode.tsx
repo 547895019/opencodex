@@ -345,6 +345,9 @@ export default function ClaudeCode({ apiBase }: { apiBase: string }) {
                   { value: "auto", label: t("dash.backendAuto") },
                   { value: "openai", label: t("dash.backendOpenAI") },
                   { value: "anthropic", label: t("dash.backendAnthropic") },
+                  // "routed" describes images via any configured provider model; only the vision
+                  // sidecar supports it (web_search still needs a native server-side search tool).
+                  ...(key === "visionSidecar" ? [{ value: "routed", label: t("dash.backendRouted") }] : []),
                 ]}
                 onChange={value => setState({
                   ...state,

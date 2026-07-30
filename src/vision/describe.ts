@@ -25,7 +25,7 @@ const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
  * Remote https URLs are passed through — the ChatGPT backend fetches them, not this proxy (so there's
  * no SSRF surface here). Returns an error string when the URL must be rejected, else null.
  */
-function validateImageUrl(url: string): string | null {
+export function validateImageUrl(url: string): string | null {
   if (url.startsWith("data:")) {
     const m = /^data:([^;,]+?)(;base64)?,(.*)$/s.exec(url);
     if (!m) return "malformed data URL";

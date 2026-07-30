@@ -368,9 +368,13 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
       const section = body[field];
       if (section === undefined || section === null) continue;
       if (!isPlainObject(section)) return jsonResponse({ error: `${field} must be an object or null` }, 400);
-      if (section.backend !== undefined && section.backend !== null
-        && section.backend !== "openai" && section.backend !== "anthropic") {
-        return jsonResponse({ error: `${field}.backend must be openai, anthropic, or null` }, 400);
+      const backendOk = field === "visionSidecar"
+        ? section.backend === "openai" || section.backend === "anthropic" || section.backend === "routed"
+        : section.backend === "openai" || section.backend === "anthropic";
+      if (section.backend !== undefined && section.backend !== null && !backendOk) {
+        return jsonResponse({
+          error: `${field}.backend must be ${field === "visionSidecar" ? "openai, anthropic, routed, or null" : "openai, anthropic, or null"}`,
+        }, 400);
       }
       if (section.model !== undefined && typeof section.model !== "string") {
         return jsonResponse({ error: `${field}.model must be a string` }, 400);
@@ -384,14 +388,28 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
         delete next[field];
         continue;
       }
-      const requested = section as { backend?: "openai" | "anthropic" | null; model?: string };
-      const override: NonNullable<OcxClaudeCodeConfig[typeof field]> = { ...next[field] };
-      if (requested.backend === null) delete override.backend;
-      else if (requested.backend !== undefined) override.backend = requested.backend;
-      if (requested.model === "") delete override.model;
-      else if (requested.model !== undefined) override.model = requested.model;
-      if (Object.keys(override).length > 0) next[field] = override;
-      else delete next[field];
+      const requested = section as { backend?: "openai" | "anthropic" | "routed" | null; model?: string };
+      // Per-field concrete types avoid the union-keyed write (which would require assigning to the
+      // intersection of both sidecar backend unions). Validation above already admits "routed" only
+      // for visionSidecar, so each branch's backend cast is sound.
+      if (field === "visionSidecar") {
+        const override = { ...(next.visionSidecar ?? {}) };
+        if (requested.backend === null) delete override.backend;
+        else if (requested.backend !== undefined) override.backend = requested.backend;
+        if (requested.model === "") delete override.model;
+        else if (requested.model !== undefined) override.model = requested.model;
+        if (Object.keys(override).length > 0) next.visionSidecar = override;
+        else delete next.visionSidecar;
+      } else {
+        const override = { ...(next.webSearchSidecar ?? {}) };
+        if (requested.backend === null) delete override.backend;
+        // webSearchSidecar never admits "routed" (validation above rejects it); narrow the cast.
+        else if (requested.backend !== undefined) override.backend = requested.backend as "openai" | "anthropic";
+        if (requested.model === "") delete override.model;
+        else if (requested.model !== undefined) override.model = requested.model;
+        if (Object.keys(override).length > 0) next.webSearchSidecar = override;
+        else delete next.webSearchSidecar;
+      }
     }
     if (body.enabled !== undefined) {
       if (typeof body.enabled !== "boolean") return jsonResponse({ error: "enabled must be a boolean" }, 400);

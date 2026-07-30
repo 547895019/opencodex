@@ -414,7 +414,7 @@ export interface OcxClaudeCodeConfig {
   /** Claude-originated web-search override. Unset fields inherit the global sidecar settings. */
   webSearchSidecar?: { backend?: "openai" | "anthropic"; model?: string };
   /** Claude-originated vision override. Unset fields inherit the global sidecar settings. */
-  visionSidecar?: { backend?: "openai" | "anthropic"; model?: string };
+  visionSidecar?: { backend?: "openai" | "anthropic" | "routed"; model?: string };
 }
 
 /** 사용자가 대시보드에서 직접 추가한 커스텀 모델 정의. */
@@ -665,9 +665,14 @@ export interface OcxSearchConfig {
 export interface OcxVisionSidecarConfig {
   /** Master switch. Default: enabled when the selected backend has a usable credential. */
   enabled?: boolean;
-  /** Description backend. Unset prefers a usable stored Anthropic OAuth credential, else OpenAI. */
-  backend?: "openai" | "anthropic";
-  /** Vision model that describes images. */
+  /**
+   * Description backend. Unset prefers a usable stored Anthropic OAuth credential, else OpenAI.
+   * "routed" sends the describe request through the normal routing pipeline to any configured
+   * provider/model (the `model` field is the routed model id, e.g. "gemini-2.5-flash"); no ChatGPT
+   * login or Anthropic OAuth required — the provider's own auth is used.
+   */
+  backend?: "openai" | "anthropic" | "routed";
+  /** Vision model that describes images. For "routed" this is the routed model id. */
   model?: string;
   /** Max description cache misses admitted in one main-model turn. Zero disables description calls. */
   maxDescriptionsPerTurn?: number;

@@ -308,6 +308,32 @@ describe("Anthropic vision planning and management config", () => {
       expect(invalidWebBackend?.status).toBe(400);
       expect(config.webSearchSidecar).toEqual({ reasoning: "high" });
       expect(config.visionSidecar).toEqual({ maxDescriptionsPerTurn: 4 });
+
+      // backend:"routed" is accepted for vision (any routed model may describe images) but
+      // NOT for web search (which needs a native server-side web_search tool).
+      const routedVision = await handleManagementAPI(
+        new Request("http://localhost/api/sidecar-settings", {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ vision: { backend: "routed", model: "routed/llava" } }),
+        }),
+        new URL("http://localhost/api/sidecar-settings"),
+        config,
+      );
+      expect(routedVision?.status).toBe(200);
+      expect(config.visionSidecar?.backend).toBe("routed");
+      expect(config.visionSidecar?.model).toBe("routed/llava");
+
+      const routedWebSearch = await handleManagementAPI(
+        new Request("http://localhost/api/sidecar-settings", {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ webSearch: { backend: "routed" } }),
+        }),
+        new URL("http://localhost/api/sidecar-settings"),
+        config,
+      );
+      expect(routedWebSearch?.status).toBe(400);
     } finally {
       if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previousHome;

@@ -150,6 +150,7 @@ export const de = {
   "dash.backendAuto": "Automatisch",
   "dash.backendOpenAI": "OpenAI",
   "dash.backendAnthropic": "Anthropic",
+  "dash.backendRouted": "Routed",
   "dash.sidecarSaved": "Sidecar-Einstellungen gespeichert. Angewendet bei der nächsten Anfrage.",
   "dash.sidecarSaveFailed": "Sidecar-Einstellungen konnten nicht gespeichert werden.",
   "dash.injectionLabel": "Sub-Agent-Delegation",

@@ -981,7 +981,7 @@ export async function handleResponses(
   const visionPlan = planVisionSidecar(config, route.provider, route.modelId, parsed, openAiSidecar);
   const recordSidecarOutcome = openAiSidecar?.recordOutcome;
   if (visionPlan) {
-    await describeImagesInPlace(parsed, visionPlan, openAiSidecar?.headers ?? selectedForwardHeaders, options.abortSignal, recordSidecarOutcome);
+    await describeImagesInPlace(parsed, visionPlan, openAiSidecar?.headers ?? selectedForwardHeaders, options.abortSignal, recordSidecarOutcome, config);
   } else if (modelInList(route.provider.noVisionModels, route.modelId)) {
     // Sidecar-covered model but NO plan (no forward provider / missing forwarded auth / sidecar
     // disabled): fail closed — never forward raw images to a text-only upstream.

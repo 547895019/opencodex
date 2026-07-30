@@ -161,6 +161,7 @@ export const ru: Record<TKey, string> = {
   "dash.backendAuto": "Авто",
   "dash.backendOpenAI": "OpenAI",
   "dash.backendAnthropic": "Anthropic",
+  "dash.backendRouted": "Маршрутизируемый",
   "dash.sidecarSaved": "Настройки сайдкара сохранены. Вступят в силу со следующего запроса.",
   "dash.sidecarSaveFailed": "Не удалось сохранить настройки сайдкара.",
   "dash.injectionLabel": "Делегирование подагентам",

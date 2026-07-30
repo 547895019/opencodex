@@ -26,7 +26,7 @@ function dashboardHashForSection(section: DashboardSection): string {
 interface HealthData { status: string; version: string; uptime: number }
 // StartupHealthStatus imported from startup-health-ui.
 interface ProviderInfo { name: string; adapter: string; baseUrl: string; defaultModel?: string; hasApiKey: boolean }
-interface ModelInfo { id: string; provider: string; owned_by?: string }
+interface ModelInfo { id: string; provider: string; owned_by?: string; inputModalities?: string[] }
 interface SettingsData {
   codexAutoStart: boolean;
   port: number;
@@ -39,7 +39,7 @@ interface SettingsData {
     diagnosticStale: boolean;
   };
 }
-type SidecarBackend = "openai" | "anthropic";
+type SidecarBackend = "openai" | "anthropic" | "routed";
 interface SidecarSetting { backend?: SidecarBackend; model: string }
 interface SidecarData { webSearch: SidecarSetting; vision: SidecarSetting }
 interface SidecarPatch {
@@ -142,8 +142,23 @@ function sidecarModelOptions(models: ModelInfo[]) {
     .map(model => ({ value: model.id, label: `${model.provider}/${model.id}` }));
 }
 
+/**
+ * Vision sidecar model list: the OpenAI/Anthropic backends plus any routed model that declares
+ * image input (`inputModalities` contains "image"). Routed text-only models are excluded so users
+ * don't pick a describer that can only fail-soft to the strip marker.
+ */
+function visionModelOptions(models: ModelInfo[]) {
+  return models
+    .filter(model => model.provider === "openai" || model.provider === "anthropic"
+      || (model.inputModalities ?? []).includes("image"))
+    .map(model => ({ value: model.id, label: `${model.provider}/${model.id}` }));
+}
+
 function sidecarBackendForModel(models: ModelInfo[], modelId: string): SidecarBackend {
-  return models.find(model => model.id === modelId)?.provider === "anthropic" ? "anthropic" : "openai";
+  const provider = models.find(model => model.id === modelId)?.provider;
+  if (provider === "anthropic") return "anthropic";
+  if (provider === "openai") return "openai";
+  return "routed";
 }
 
 /**
@@ -511,6 +526,7 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
     return out;
   }, [grouped, modelQuery]);
   const sidecarModels = useMemo(() => sidecarModelOptions(models), [models]);
+  const visionModels = useMemo(() => visionModelOptions(models), [models]);
 
   if (error) {
     return (
@@ -1070,7 +1086,7 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
     <div className="font-semibold">{t("dash.visionSidecar")}</div>
     <Select
       value={sidecar?.vision.model ?? "gpt-5.6-luna"}
-      options={sidecarModels}
+      options={visionModels}
       onChange={model => { void saveSidecar({ vision: { model, backend: sidecarBackendForModel(models, model) } }); }}
       disabled={!sidecar || sidecarSaving}
       label={t("dash.sidecarModel")}

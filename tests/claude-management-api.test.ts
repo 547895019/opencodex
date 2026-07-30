@@ -235,6 +235,17 @@ test("Claude sidecar overrides round-trip, partially update, clear, and reject u
       expect(response.status).toBe(400);
       expect(loadConfig().claudeCode).toEqual(beforeInvalid);
     }
+
+    // visionSidecar accepts backend:"routed" (any routed model may describe images);
+    // webSearchSidecar rejects it (needs a native server-side web_search tool).
+    response = await put({ visionSidecar: { backend: "routed", model: "routed/llava" } });
+    expect(response.status).toBe(200);
+    expect(loadConfig().claudeCode?.visionSidecar).toEqual({ backend: "routed", model: "routed/llava" });
+
+    const beforeWebRouted = loadConfig().claudeCode;
+    response = await put({ webSearchSidecar: { backend: "routed" } });
+    expect(response.status).toBe(400);
+    expect(loadConfig().claudeCode).toEqual(beforeWebRouted);
   } finally {
     server.stop(true);
   }
