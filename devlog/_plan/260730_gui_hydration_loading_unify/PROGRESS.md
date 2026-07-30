@@ -127,3 +127,69 @@ ocx service stop && ocx service start
 - **모듈 캐시가 테스트 격리를 깬다.** 리소스 캐시가 모듈 레벨이라 앞선 케이스의 응답이
   다음 케이스의 콜드 마운트를 만족시켰다. 6개 테스트 파일에
   `clearClientResourceStoresForTests()`를 넣었다.
+
+### 감사에서 걸린 것 (4건, 전부 수정됨)
+
+소스 문자열을 검사하는 계약 테스트는 표면이 어댑터를 쓰는지까지만 본다. 마운트해서
+돌려보면 런타임 결함이 따로 나왔다.
+
+| 심각도 | 결함 | 원인 | 수정 |
+|--------|------|------|------|
+| High | Grok의 저장이 방금 켠 스위치를 되돌렸다 | draft를 비우면 이전 스냅샷으로 폴백 | 확정된 선택을 `setClientResourceData`로 먼저 발행한 뒤 draft 해제 |
+| High | 로그가 지속 장애를 영구히 숨겼다 | 한 번 성공하면 이후 실패를 침묵 처리 | 연속 3회 실패 시 상시 notice + 재시도, 성공하면 해제 |
+| Medium | API 키 화면에 live region이 두 개 | 키·모델이 동시에 재검증 | 키가 말하는 동안 모델 상태가 양보 |
+| Medium | StrictMode에서 요청이 두 번 | 마이크로태스크는 취소되지 않는다 | 4곳에 identity 가드 |
+
+회귀 테스트 4개를 붙였다: 저장만 했을 때 스위치가 유지되는지, 3회 실패 후 stale 고지가
+뜨고 성공하면 사라지는지, stale 프로브가 빠른 재조회를 요청하는지(단위 + 계약).
+
+### 원래 증상의 진짜 원인
+
+"할당량 새로고침을 눌러야 로딩된다"의 기전을 B 단계에서 찾았다. `/api/startup-health`는
+30초 캐시에서 즉시 답하고 실제 프로브는 백그라운드에서 푼다. 그래서 콜드 응답은 보수적인
+임시값인데, 대시보드는 status만 꺼내 쓰고 "아직 확정 전"이라는 사실을 버렸다. 다음 30초
+틱까지 임시값이 그대로 남았고, 그 사이 칩을 리마운트시키는 아무 동작(새로고침 클릭, 탭
+이동)이 진짜 값을 불러오는 것처럼 보였다.
+
+프로브가 `stale`을 함께 실어 보내고, 대시보드는 서버가 아직 작업 중이라고 말하는 동안
+약 2초 뒤 다시 묻는다. stale 응답은 확정값처럼 캐시하지 않는다. 하드 에러는 일반 폴에
+맡긴다 — 2초 안에 스스로 낫지 않으니 빠른 재조회는 죽은 엔드포인트를 두드리는 셈이다.
+
+### 카탈로그 enum 사고 (#759)
+
+WP3 중에 로컬 symlink 본이 `~/.codex/opencodex-catalog.json`을 쓰면서 zenmux 모델에
+`input_modalities: [..., "video"]`를 넣었다. Codex는 이 필드를 `text|image|audio` 닫힌
+enum으로 파싱하므로 **카탈로그 전체**를 거부했고, Codex 앱은 플러그인·앱·MCP가 0개인
+"Unable to load apps" 상태가 됐다. 모델 하나의 메타데이터가 전부를 내린 것이다.
+
+프로바이더 필터에서 `"video"`를 빼고, 모든 엔트리가 지나는 단일 지점
+(`ensureStrictCatalogFields`)에서 enum으로 정규화한다. 남는 게 없으면 `["text"]`로
+떨어뜨린다 — modality가 아예 없는 엔트리는 text-only보다 나쁘다. 사용자 카탈로그는
+제자리 복구했다(백업 `~/.codex/opencodex-catalog.json.bak-video-repair`).
+
+내부적으로 `"video"`는 정당하다: xAI 비디오 브리지(`images.videoBridgeEnabled`)와
+vision-sidecar modality 배관이 비디오를 다룬다. 결함은 그 값이 Codex가 읽는 카탈로그
+파일로 새어 나가는 것뿐이라, `catalog-vision-sidecar-modalities.test.ts`의 내부 비디오
+추론은 그대로 둔다(12 pass).
+
+### 게이트 (커밋된 트리 기준)
+
+`bun run typecheck` clean, `gui lint` 0 error, `privacy:scan` passed,
+`gui build` clean, GUI 스위트 418 pass.
+
+GUI 스위트의 1 fail은 이 작업이 아니다. 다른 세션이 워크트리에서
+`dash.syncCodexSubagentDefaultsHint` 문구를 고쳤고 단정문이 옛 문구를 기대한다.
+`HEAD:gui/src/i18n/en.ts`에는 단정된 문구가 그대로 있다.
+
+루트 `bun run test`는 완주 시간을 못 재고 남겼다. 다른 세션들의 루트 스위트가 동시에
+네 개 돌고 있었고, `scripts/test.ts`가 바로 이 경합을 문서화한다(약 210초 런이 26분).
+이번 사이클의 `src/` 변경은 `catalog-input-modality-enum.test.ts`(5 pass)와
+`catalog-vision-sidecar-modalities.test.ts`(12 pass)를 직접 돌려 덮었다.
+
+### 병행 세션과의 파일 공유
+
+`gui/src/pages/use-dashboard-data.ts`가 두 세션의 변경을 동시에 담게 됐다. 스테이징을
+파일 단위로 쪼개(내 hunk만 blob으로 만들어 `update-index`) 커밋 후보 트리가 단독으로
+`tsc -b`를 통과하는지 확인했다. 그 사이 다른 세션이 PR 5건을 머지하면서 내 워크트리
+변경까지 `91fc79c93`에 함께 커밋했다. 결과물은 HEAD에 온전히 들어갔고 게이트도
+초록이라, 커밋 경계만 의도와 다르다.
