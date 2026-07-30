@@ -1,6 +1,8 @@
 # 000 — devlog publication feasibility: plan and STOP
 
-Status: **UNBLOCKED. Roadmap complete, conversion not yet executed.**
+Status: **EXECUTED on local `dev`. Nothing pushed.** WP1–WP4 all closed; the conversion
+landed as `2435b1149`, with `f6ce1d5bd` and `bc2f9502e` as the two follow-ups the privacy
+gate demanded once devlog came into scope. Execution evidence is in `030`.
 
 The first pass stopped at WP2 with a NEEDS_HUMAN on two security documents. The user asked
 why they could not simply be moved to scratch, and answering that question overturned the
@@ -8,7 +10,8 @@ verdict: those two documents describe fixes that are already on public `main`, s
 never blockers. The real blockers are two different units, and `003` records both the
 correction and the excision decision.
 
-`.gitmodules`, `.gitignore`, and the devlog gitlink remain untouched — WP3 executes them.
+`.gitmodules` is gone, `.gitignore` carries path rules instead of a blanket `devlog/`, and
+the gitlink is replaced by 1618 ordinary blobs.
 
 ## What was asked
 
@@ -69,14 +72,18 @@ Publishing remains possible, but not as a bulk `git add`. It needs a curation pa
 5. `tests/repo-hygiene.test.ts` rewrite: it asserts devlog is the only gitlink with no
    tracked files, so it fails the moment the conversion lands.
 
-## Work-phase map (WP1 done, WP2 stopped, WP3-WP4 not started)
+## Work-phase map (final)
 
 | WP | Doc | Slice | Status |
 |----|-----|-------|--------|
 | 1 | `001`, `002` | Research: reference inventory + publication scan definition | done |
-| 2 | `002` | Publication scan | **STOPPED — NEEDS_HUMAN** |
-| 3 | — | Conversion (gitlink removal, tracking, un-ignore) | not started |
-| 4 | — | Rule enforcement + scan coverage | not started |
+| 2 | `003`, `004` | Publication scan, then re-adjudication that overturned the stop | done |
+| 3 | `010`, `030` | Conversion (gitlink removal, tracking, un-ignore, scan coverage) | done |
+| 4 | `020`, `030` | Rule enforcement + hygiene tripwire | done |
+
+The first version of this table recorded WP2 as `STOPPED — NEEDS_HUMAN`. That verdict was
+overturned in `003`, not waived: the two documents it flagged describe fixes that are
+already ancestors of public `main`.
 
 ## The good news, unchanged
 
