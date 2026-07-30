@@ -482,3 +482,134 @@ this section.
       same guidance they get today.
 - [ ] No new required config key. `experimentalRealtimeWsBaseUrl` is additive and unset by
       default, mirroring upstream's `experimental_*` naming so its status is obvious.
+
+---
+
+# P-phase re-verification (2026-07-31, execution cycle)
+
+Stale check against the tree after WP1-WP3 (`b7ba91ca9`). Every anchor resolves:
+builder at `src/server/live.ts:204` (three-argument form), sole production caller at
+`:545`, `LIVE_SIDEBAND_API_ROOT` at `:56`, `OcxConfig` at `src/types.ts:514`, and the
+only test at `tests/server-live.test.ts:554` with five three-argument call sites. No
+uncommitted changes on any target file. The `005` staleness audit independently
+confirmed both provider gates (`openai-tiers.ts:32`, `openai-sidecar.ts:117`) and the
+upstream override key name (`experimental_realtime_ws_base_url`, `config_toml.rs:380`).
+
+Two amendments.
+
+## Amendment A — `intent=quicksilver` stays, and this phase stops claiming byte-parity
+
+`005` finding: upstream appends only `call_id` to the realtime-query join
+(`methods.rs:806`, `:987`); OpenCodex also sends `intent=quicksilver`. The reachability
+argument that neutralized the HOST question does not apply here: the realtime-query URL
+is live against real OpenAI infrastructure for every canonical voice user, so this
+parameter is genuinely user-visible, and this phase has no way to verify a live join.
+
+Decision: **keep `intent=quicksilver`.** The risk is asymmetric — removing a working
+parameter could break voice for every user, while keeping it costs a documented
+deviation. Consequences:
+
+- This phase's parity claim is scoped to the host, override precedence, and query
+  EXCLUSION (provider query parameters never leak). It is not byte-for-byte URL parity
+  with upstream, and no text in this phase may claim that.
+- Dropping the parameter is future work gated on a live smoke test against the real
+  service, which is out of scope here.
+
+## Amendment B — the trailing-slash admission case gets an explicit test
+
+`005` finding: the keyed gate trims trailing slashes (`baseUrl.replace(/\/+$/, "")`),
+so `https://api.openai.com/v1//` is admitted and today's builder would produce a
+doubled `/v1//v1`-class path. After this phase the normalizer makes the whole class
+unreachable, but the onboarding checklist's byte-identity proof must include a
+trailing-slash keyed base, not only the canonical one, so the fix is observed rather
+than inferred.
+
+Added activation scenario:
+
+| Path | Trigger | Observable |
+|---|---|---|
+| trailing-slash admission | keyed base `https://api.openai.com/v1//` | constructed URL is byte-identical to the canonical-base result |
+
+## Scope note: the override lives in OcxConfig, not native config.toml
+
+Upstream's `experimental_realtime_ws_base_url` is a native key consumed by the native
+binary. OpenCodex's sideband join is built by the PROXY (`src/server/live.ts`), so the
+native key would not affect this code path; the override is therefore an additive,
+optional `OcxConfig` field. Reading the native key as a second source is a possible
+later addition and is explicitly a non-goal here — one knob, one place, documented in
+the field comment.
+
+---
+
+# A-phase fold-back, execution cycle (verdict GO-WITH-FIXES, 3 High blockers)
+
+Independent terra review (Hegel). All three accepted and folded; near-pass with zero
+residual.
+
+## Blocker 1 (accepted) — runtime schema validation for the new field
+
+The `OcxConfig` zod schema is `.passthrough()` (`src/config.ts:668`, `:699`), so
+`{ "experimentalRealtimeWsBaseUrl": true }` would flow through and crash
+`overrideBaseUrl?.trim()`. B adds `experimentalRealtimeWsBaseUrl:
+z.string().optional().catch(undefined)` to the schema (a non-string value degrades to
+unset, which then takes the canonical path), with tests for non-string, blank,
+malformed, and valid inputs.
+
+## Blocker 2 (accepted) — endpoint-form overrides are recognized before forcing `/v1`
+
+Upstream does not treat the override as a bare root: it normalizes recognized
+`/realtime` and `/live` endpoint paths (`methods.rs:994`). The planned normalizer would
+turn `https://example.test/v1/realtime` into `.../v1/realtime/v1/realtime?...` — an
+upstream-valid override silently broken. `normalizeSidebandRoot` gains one preceding
+step, and the input contract stays "root OR recognized endpoint form":
+
+```ts
+// Endpoint-form overrides (what upstream accepts): strip the terminal endpoint
+// segments so the root can be re-derived. Only the exact recognized shapes are
+// stripped; anything else is treated as a root as before.
+const path = parsed.pathname
+  .replace(/\/+$/, "")
+  .replace(/\/realtime(?:\/calls\/[^/]+)?$/, "")
+  .replace(/\/live\/[^/]+$/, "")
+  .replace(/\/v1$/, "");
+parsed.pathname = `${path}/v1`;
+```
+
+Matrix additions: `https://example.test/v1/realtime` → `https://example.test/v1`;
+`https://example.test/v1/realtime/calls/abc` → `https://example.test/v1`;
+`https://example.test/v1/live/abc` → `https://example.test/v1`;
+`https://example.test/v10` → `https://example.test/v10/v1` (a non-`/v1` root is used
+verbatim with `/v1` appended — the contract is "root requiring v1", now stated in the
+field comment).
+
+## Blocker 3 (accepted) — the override's credential destination is bounded
+
+The override controls where the RESOLVED relay headers — including the real OpenAI /
+ChatGPT bearer — and the user's audio are sent (`live.ts:419`, `:543`, used at
+`src/server/index.ts:723`). Permitting `http` → `ws` to an arbitrary remote host would
+ship a plaintext credential-exfiltration path one config edit away. This is the
+user's own config and key, but the same argument upstream makes for shipping only an
+`experimental_` dev knob does not require us to make misuse silent.
+
+Final validation, applied inside `normalizeSidebandRoot` before any of the path logic:
+
+1. Scheme must be `https`/`wss`, OR `http`/`ws` with a loopback host
+   (`localhost`, `*.localhost`, `127.0.0.0/8`, `[::1]`) — the local-development case
+   the knob exists for. Anything else fails closed to the canonical root.
+2. URL userinfo (`user:pass@host`) is rejected → canonical root. Credentials do not
+   belong in this field, and `URL#toString()` would otherwise forward them verbatim.
+
+Both failures are silent-by-design (fail closed, consistent with the malformed-input
+fallback) and both get dedicated tests, including a security regression asserting a
+remote `http://` override never reaches the builder output.
+
+## Verified during this round
+
+- Byte-identity holds for both admitted provider shapes before/after (forward backend
+  shape and keyed `https://api.openai.com/v1` both already produce the canonical root —
+  `live.ts:210`, `:223`), plus the promised `.../v1//` trailing-slash case.
+- Upstream itself does not strip an existing query on the override (`methods.rs:923`);
+  our query-stripping is a deliberate, documented deviation limited to that point.
+- Management API exposure is correctly absent: `GET /api/config` is an allowlisted DTO
+  and `PUT /api/config` is disabled (`config-routes.ts:69`, `:73`). The field is
+  configured by editing the ocx config file, appropriate for an `experimental_*` knob.
