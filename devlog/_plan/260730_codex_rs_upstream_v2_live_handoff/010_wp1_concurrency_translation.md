@@ -345,3 +345,411 @@ Criteria 1-6 above stand, plus:
 
 The `backendChanges` guard is now the highest-risk branch in this phase: without it the
 change introduces a *new* off-by-one on idempotent calls while fixing the original one.
+
+---
+
+# P-phase re-verification (2026-07-31, execution cycle)
+
+Stale check against `dev` HEAD `8759e34de`. Every line reference in this doc still
+resolves:
+
+| Doc claim | Current tree | Status |
+|---|---|---|
+| `getLogicalMaxThreads` at `src/codex/features.ts:317` | 316-321 | valid |
+| `transitionMultiAgentV2` starts at line 392 | 392 | valid |
+| body read at 398-440 | matches verbatim, incl. both postconditions | valid |
+| `getMaxConcurrentThreads` ends near 158 | 147-158 | valid |
+| `tests/codex-v2-gate.test.ts` exists | 591 lines | valid |
+
+No amendment needed to Diffs 1-2 or to the `backendChanges` guard. Two amendments
+below are required, both discovered by reading callers the earlier cycle did not trace.
+
+## Amendment A — the RangeError cannot be thrown where Diff 3 puts it
+
+Blocker 5 adds a throwing range guard to both helpers, and Diff 3 (as amended)
+computes `discoveredLimit` at line 406 — **before** the `try {` at line 407. A
+`RangeError` raised there escapes `transitionMultiAgentV2` as an uncaught exception
+instead of becoming the documented `{ ok: false, error }` result, bypassing the
+rollback contract this function exists to provide.
+
+A stored value large enough to trip the guard is reachable: `getMaxConcurrentThreads`
+validates with `Number.isFinite(value) && value >= 1`, not `Number.isInteger`, so a
+20-digit `max_concurrent_threads_per_session` parses to `1e20` and passes.
+
+Resolution — two-layer API:
+
+1. The helpers keep the throwing guard. They are the canonical translation and the
+   throw is what criterion 10 asserts.
+2. `transitionMultiAgentV2` **pre-validates** the discovered limit and returns a normal
+   error result before touching any bytes, in the same style as the existing
+   `options.threadLimit` check at line 396 and `transitionConfigError` at line 403.
+   Nothing has been written at that point, so rollback-safety is structural.
+3. `getLogicalMaxThreads` is a read path reached from `GET /api/v2` and `ocx v2 status`
+   and must never throw. When the stored value is outside the translatable range it
+   returns the raw stored number untranslated: at 1e20 the ±1 is already below the
+   float's precision, so translating is meaningless while crashing a status endpoint is
+   not.
+
+`transitionMultiAgentV2`, replacing line 406 (final form for this phase):
+
+```ts
+  const beforeEnabled = isMultiAgentV2Enabled(path);
+  const backendChanges = enabled !== beforeEnabled;
+  const discoveredLimit = getLogicalMaxThreads(path);
+  // A discovered value crosses the root-slot boundary exactly once, and only when the
+  // backend actually changes; a caller-supplied options.threadLimit is already in the
+  // destination backend's units and is never translated. Validate before the try block
+  // so an out-of-range stored value is a normal error result rather than a throw that
+  // escapes the rollback contract.
+  if (options.threadLimit === undefined && backendChanges && discoveredLimit !== null
+      && !isTranslatableThreadLimit(discoveredLimit)) {
+    return { ok: false, error: `stored thread limit out of translatable range: ${discoveredLimit}` };
+  }
+  const threadLimit = options.threadLimit ?? (
+    discoveredLimit === null || !backendChanges
+      ? discoveredLimit
+      : enabled
+        ? v1ChildLimitToV2TotalLimit(discoveredLimit)
+        : v2TotalLimitToV1ChildLimit(discoveredLimit)
+  );
+```
+
+with the predicate exported alongside the helpers:
+
+```ts
+export function isTranslatableThreadLimit(limit: number): boolean {
+  return Number.isInteger(limit) && limit >= 1 && limit <= MAX_TRANSLATABLE_THREAD_LIMIT;
+}
+```
+
+## Amendment B — six existing tests assert the defect and must move with the fix
+
+The earlier cycle's change map said "MODIFY `tests/codex-v2-gate.test.ts` — add tests".
+Adding is not sufficient: the current suite pins the *untranslated* behavior, so the
+fix turns it red. These are behavior updates, not test weakening, and each one is the
+defect being corrected:
+
+| Test (line) | Current assertion | Post-fix assertion | Why |
+|---|---|---|---|
+| `off -> on carries the active legacy value` (218) | legacy 100 → v2 100 | → v2 **101** | the defect itself |
+| `on -> off carries the active v2 value` (228) | v2 64 → legacy 64 | → legacy **63** | the defect itself |
+| `migration carries the active limit comment` (237) | 100 → 100 → 100 | 100 → **101** → 100 | round trip stays identity |
+| `target-only ...` `equal` case (259) | legacy 64 + v2 64 → 64 | → **65** | legacy key is active, so it translates |
+| management API `mode-only switches` (318) | 100 both directions | v1→v2 **101**, v2→v1 back to **100** | same defect through the HTTP surface |
+| `same-state repair` (245) / `disabled` case (264) | 32 / 100 unchanged | unchanged | `backendChanges` false — these are the guard's regression witnesses |
+
+The `target-only` case (256) needs no change and is worth keeping for a non-obvious
+reason: V2 storage `32` under a disabled feature round-trips through
+`v2TotalLimitToV1ChildLimit` (31) and back through `v1ChildLimitToV2TotalLimit` (32),
+so the two translations cancel and the stored V2 value is preserved exactly. That is
+the correct outcome and it silently proves both helpers agree on the boundary.
+
+## Caller impact (traced this cycle)
+
+`getLogicalMaxThreads` has four non-test callers:
+
+- [`src/cli/v2.ts:86`](/Users/jun/Developer/new/700_projects/opencodex/src/cli/v2.ts:86) — status display only.
+- [`src/cli/v2.ts:100`](/Users/jun/Developer/new/700_projects/opencodex/src/cli/v2.ts:100) — passes an explicit `threadLimit`, never translated.
+- [`src/server/management/agent-settings-routes.ts:112`](/Users/jun/Developer/new/700_projects/opencodex/src/server/management/agent-settings-routes.ts:112) and `:169` — `GET`/`PUT` response payload.
+
+No caller does arithmetic on the value, so the semantic change ("the limit in the
+units of the currently active backend") propagates without further edits. The GUI reads
+`maxConcurrentThreadsPerSession` for display in `gui/src/pages/Models.tsx` and needs no
+change.
+
+## Verification gate for this cycle
+
+`bun run typecheck` plus `bun test tests/codex-v2-gate.test.ts`, with criteria 1-10
+asserted and the three activation-scenario tables driven directly.
+
+---
+
+# A-phase fold-back, execution cycle (reviewer verdict FAIL, 3 High blockers)
+
+An independent terra-high reviewer failed the plan above. All three blockers reproduce
+against the tree at HEAD `2435b1149`. This section is the final form for every hunk it
+touches and supersedes Diff 1, Diff 2, and Amendment A/B where they disagree.
+
+## Blocker 1 (accepted) — Diff 2 still calls throwing helpers, so read paths can throw
+
+Amendment A said `getLogicalMaxThreads` "must never throw" but left Diff 2 unamended,
+and Diff 2 calls the guarded helpers directly. `getMaxConcurrentThreads` validates with
+`Number.isFinite(value) && value >= 1` (features.ts:156), not `Number.isInteger`, so a
+20-digit stored value parses to `1e20` and passes the reader. Under Diff 2 as written
+that value reaches `v2TotalLimitToV1ChildLimit` and throws `RangeError` out of
+`ocx v2 status` (src/cli/v2.ts:86) and `GET /api/v2`
+(src/server/management/agent-settings-routes.ts:112) — a crashed status surface caused
+by the very guard meant to make translation safe.
+
+FINAL form of `getLogicalMaxThreads`, replacing Diff 2:
+
+```ts
+export function getLogicalMaxThreads(configPath?: string): number | null {
+  if (isMultiAgentV2Enabled(configPath)) {
+    const v2 = getMaxConcurrentThreads(configPath);
+    if (v2 !== null) return v2;
+    const legacy = getAgentsMaxThreads(configPath);
+    if (legacy === null) return null;
+    // Read paths never throw: an out-of-range stored value is reported raw. At that
+    // magnitude the ±1 root slot is already below float precision, so translating is
+    // meaningless while crashing `ocx v2 status` / GET /api/v2 is not.
+    return isTranslatableV1ChildLimit(legacy) ? v1ChildLimitToV2TotalLimit(legacy) : legacy;
+  }
+  const legacy = getAgentsMaxThreads(configPath);
+  if (legacy !== null) return legacy;
+  const v2 = getMaxConcurrentThreads(configPath);
+  if (v2 === null) return null;
+  return isTranslatableV2TotalLimit(v2) ? v2TotalLimitToV1ChildLimit(v2) : v2;
+}
+```
+
+New criterion 11: an out-of-range stored value returns raw from both read paths and does
+not throw, asserted through `ocx v2 status` and the management `GET` — not only through
+the helper.
+
+## Blocker 2 (accepted) — one shared maximum breaks the round trip at the boundary
+
+A single `MAX_TRANSLATABLE_THREAD_LIMIT` is self-contradictory: V1 child `1_000_000` is
+in range and migrates to V2 total `1_000_001`, which the same predicate then rejects, so
+a config this code just wrote cannot migrate back. The maxima must be directional,
+because the two units differ by exactly the root slot.
+
+FINAL form of Diff 1:
+
+```ts
+/** Largest V1 child limit we translate. Well below Number.MAX_SAFE_INTEGER and far
+ *  above any real concurrency setting; upstream's usize saturates, ours would silently
+ *  lose precision. */
+const MAX_TRANSLATABLE_V1_CHILD_LIMIT = 1_000_000;
+/** The V2 side is one larger by construction: it counts the root agent's own slot, so
+ *  the image of the maximum V1 value must itself be translatable back. */
+const MAX_TRANSLATABLE_V2_TOTAL_LIMIT = MAX_TRANSLATABLE_V1_CHILD_LIMIT + 1;
+
+export function isTranslatableV1ChildLimit(limit: number): boolean {
+  return Number.isInteger(limit) && limit >= 1 && limit <= MAX_TRANSLATABLE_V1_CHILD_LIMIT;
+}
+
+export function isTranslatableV2TotalLimit(limit: number): boolean {
+  return Number.isInteger(limit) && limit >= 1 && limit <= MAX_TRANSLATABLE_V2_TOTAL_LIMIT;
+}
+
+/**
+ * Upstream counts the root agent inside the V2 thread limit but not inside the legacy
+ * `[agents]` limit (codex-rs core/src/config/mod.rs resolve_multi_agent_v2_config applies
+ * saturating_add(1) to the [agents] value; the inverse saturating_sub(1) appears at
+ * mod.rs:1555). These helpers keep our migrations on the same side of that boundary.
+ */
+export function v1ChildLimitToV2TotalLimit(childLimit: number): number {
+  if (!isTranslatableV1ChildLimit(childLimit)) {
+    throw new RangeError(`v1 child limit out of translatable range: ${childLimit}`);
+  }
+  return childLimit + 1;
+}
+
+/**
+ * Inverse of `v1ChildLimitToV2TotalLimit`. A V2 total of 1 means "root only, no
+ * children", which has no representable legacy child count >= 1, so it clamps to 1
+ * rather than writing 0 and tripping upstream's `>= 1` validation.
+ */
+export function v2TotalLimitToV1ChildLimit(totalLimit: number): number {
+  if (!isTranslatableV2TotalLimit(totalLimit)) {
+    throw new RangeError(`v2 total limit out of translatable range: ${totalLimit}`);
+  }
+  return Math.max(1, totalLimit - 1);
+}
+```
+
+`transitionMultiAgentV2`'s pre-validation from Amendment A becomes direction-aware:
+
+```ts
+  const translatable = enabled ? isTranslatableV1ChildLimit : isTranslatableV2TotalLimit;
+  if (options.threadLimit === undefined && backendChanges && discoveredLimit !== null
+      && !translatable(discoveredLimit)) {
+    return { ok: false, error: `stored thread limit out of translatable range: ${discoveredLimit}` };
+  }
+```
+
+Criterion 10 is restated: `1_000_000 → 1_000_001 → 1_000_000` round-trips, and
+`1_000_001` as a *V1 child* limit is rejected while the same number as a *V2 total* is
+accepted. The single-maximum version of criterion 10 is withdrawn.
+
+## Blocker 3 (accepted) — Amendment B's table was short by two tests
+
+Two further existing tests pin the pre-fix numbers. Both verified by reading them:
+
+| Test | Line | Current | Post-fix | Reason |
+|---|---|---|---|---|
+| `boolean/inline migration preserves feature and limit comments...` | 205 | `getMaxConcurrentThreads(prefixOnly)).toBe(100)` | `101` | legacy 100 is the source, backend changes |
+| `mode v2/v1 preserves the same logical limit` | 464 | `getLogicalMaxThreads(path)).toBe(100)` | `101` | `mode v2` from legacy 100 |
+| same test, after `off` | 469 | `toBe(77)` | `76` | V2 total 77 disables to child 76 |
+| same test, after `mode v1` | 475 | `toBe(77)` | `76` | same translation |
+| same test, after `threads 77` | 466 | `toBe(77)` | `77` unchanged | explicit caller value, never translated |
+| same test, after `on` | 472 | `toBe(77)` | `77` unchanged | child 76 re-enables to total 77 |
+
+That test's title also needs correcting: "preserves the same logical limit" is precisely
+what the fix stops doing across a backend change. Rename it to
+`mode v2/v1 translates the limit across the root-slot boundary`.
+
+The reviewer confirmed no other `tests/*.test.ts` calls the four affected helpers, and
+that `tests/codex-inject*.test.ts` only preserves literal config text.
+
+## Reviewer findings accepted without a code change
+
+- Upstream direction and fallback order confirmed independently: V2-native key first,
+  then `[agents]` via `.or_else(...saturating_add(1))` at upstream
+  `codex-rs/core/src/config/mod.rs:2674`, with the inverse `saturating_sub(1)` at
+  `:1555`. The plan's direction is correct.
+- The clamp is compatible with the postcondition at features.ts:438 — a V2 total of 1
+  disables to `threadLimit === 1`, which is both what gets written (:435) and what the
+  assertion compares.
+- The "target-only needs no change" claim is true; the two translations cancel.
+- Doc drift corrected: HEAD is `2435b1149` (the P-phase table said `8759e34de`, which
+  the user's devlog-publication commit superseded mid-cycle); the
+  `options.threadLimit` guard is at line 397, not 396.
+- The GUI is not purely display-only — `gui/src/pages/Models.tsx` compares and re-sends
+  the active-backend value — but since it round-trips the same units it stays coherent.
+  No GUI change in this phase.
+
+VERDICT of record: FAIL → all three blockers folded above → re-audit before B.
+
+---
+
+# A-phase fold-back, execution cycle round 2 (verdict FAIL, 2 High blockers)
+
+Second audit round, same reviewer. Both blockers reproduce. This section is the final
+form of the transition design and supersedes every earlier statement of how
+`transitionMultiAgentV2` derives `threadLimit`.
+
+## Review synthesis (REVIEW-SYNTHESIS-01)
+
+Two consecutive rounds ended with "your assertion-update table is incomplete" (round 1:
+2 tests missing; round 2: 2 more assertions missing). Root cause: enumerating red
+assertions by *reading* the test file is unreliable — every reader, human or model,
+misses entries. Change of method, not another enumeration attempt: the tables below are
+kept as a **checklist**, and the authoritative list of changed assertions is produced
+empirically in B — run `bun test tests/codex-v2-gate.test.ts` after the source change,
+collect every failure, fix each, and record the actual enumerated list in the D summary.
+
+## Blocker 1 (accepted) — the raw fallback loses unit provenance
+
+Round-2's `getLogicalMaxThreads` returns an out-of-range value raw, in whatever units
+the source storage used. Round-2's transition then re-derived the source predicate from
+the *destination* direction, so a V2-enabled config holding only
+`[agents] max_threads = 1_000_001`, disabled, passed the V2 predicate and was converted
+to `1_000_000` — a silent mutation of a value that never needed to move.
+
+The real defect is older: the transition asks a *display* function
+(`getLogicalMaxThreads`) for a *migration* input, and display semantics ("report the
+effective limit in active-backend units, never throw") are the wrong contract for
+migration ("know exactly which storage the value came from").
+
+FINAL design — the transition derives the source value with explicit provenance and
+never calls `getLogicalMaxThreads`:
+
+```ts
+type ThreadLimitUnits = "v1-child" | "v2-total";
+
+/** Which storage the active limit lives in, in that storage's native units. The
+ *  active backend's own key wins; the other backend's key is the fallback and keeps
+ *  ITS units. Never translates and never throws. */
+function discoverStoredThreadLimit(configPath?: string): { value: number; units: ThreadLimitUnits } | null {
+  if (isMultiAgentV2Enabled(configPath)) {
+    const v2 = getMaxConcurrentThreads(configPath);
+    if (v2 !== null) return { value: v2, units: "v2-total" };
+    const legacy = getAgentsMaxThreads(configPath);
+    return legacy === null ? null : { value: legacy, units: "v1-child" };
+  }
+  const legacy = getAgentsMaxThreads(configPath);
+  if (legacy !== null) return { value: legacy, units: "v1-child" };
+  const v2 = getMaxConcurrentThreads(configPath);
+  return v2 === null ? null : { value: v2, units: "v2-total" };
+}
+```
+
+`transitionMultiAgentV2`, replacing line 406 (`const threadLimit = ...`) entirely and
+keeping everything else byte-identical:
+
+```ts
+  const beforeEnabled = isMultiAgentV2Enabled(path);
+  // A caller-supplied limit is already in the DESTINATION backend's units and is never
+  // translated. A discovered limit carries the units of the storage it was read from
+  // and crosses the root-slot boundary only when those units differ from the
+  // destination's — which subsumes the old "backend actually changed" condition and
+  // also handles same-state storage migrations (legacy-only under V2, V2-only under
+  // V1) that are genuine moves even though the feature flag does not flip.
+  const discovered = discoverStoredThreadLimit(path);
+  const destinationUnits: ThreadLimitUnits = enabled ? "v2-total" : "v1-child";
+  let threadLimit = options.threadLimit ?? discovered?.value ?? null;
+  if (options.threadLimit === undefined && discovered !== null && discovered.units !== destinationUnits) {
+    const translatable = discovered.units === "v1-child" ? isTranslatableV1ChildLimit : isTranslatableV2TotalLimit;
+    if (!translatable(discovered.value)) {
+      return { ok: false, error: `stored thread limit out of translatable range: ${discovered.value}` };
+    }
+    threadLimit = discovered.units === "v1-child"
+      ? v1ChildLimitToV2TotalLimit(discovered.value)
+      : v2TotalLimitToV1ChildLimit(discovered.value);
+  }
+```
+
+Case table, each independently verified by walking the code:
+
+| State before call | Call | Source units | Dest units | Result |
+|---|---|---|---|---|
+| legacy 3, V2 off | enable | v1-child | v2-total | translate → 4 |
+| v2 total 4, V2 on | disable | v2-total | v1-child | translate → 3 |
+| v2 total 32, V2 off (target-only) | enable | v2-total | v2-total | no translation → 32 (same observable as the old round-trip cancellation, but direct) |
+| v2 total 32 + legacy 100, V2 on (repair) | enable | v2-total (own key wins) | v2-total | no translation → 32, legacy dropped |
+| legacy 64 + v2 64, V2 off (equal) | enable | v1-child (own key wins) | v2-total | translate → 65 |
+| legacy 1_000_001, V2 on | disable | v1-child | v1-child | **no translation → 1_000_001 preserved, no error** (reviewer's fixture) |
+| v2 total 1e20, V2 on | disable | v2-total | v1-child | pre-validation fails → `{ ok: false }`, bytes untouched; escape hatch: explicit `options.threadLimit` |
+| legacy 100, V2 off | disable | v1-child | v1-child | no translation → 100 |
+| neither key | either | null | — | threadLimit stays null |
+
+The reviewer's suggested "reject raw-untranslatable" outcome improves on this: the
+legacy-only 1_000_001 case is not an error at all — nothing crosses the boundary, so
+nothing is rejected, and the config is left in a valid state that means the same thing.
+Rejection is reserved for values that genuinely cannot cross.
+
+Both postconditions (lines ~428, ~438) stay unmodified and honest: `threadLimit` is
+always in destination units by construction.
+
+New criteria:
+
+12. V2-enabled + legacy-only `1_000_001` + disable → `{ ok: true }`, the value survives
+    in `[agents]` untranslated. The subsequent automatic re-enable is REJECTED —
+    `{ ok: false, error }` with config bytes unchanged — because `1_000_001` exceeds
+    `MAX_TRANSLATABLE_V1_CHILD_LIMIT` and the storage-translation it would need cannot
+    be done safely. Recovery is the documented escape hatch: an explicit
+    destination-unit `options.threadLimit`. (Amended in A round 3: the original draft
+    claimed an identity round trip, which is impossible under the directional guard —
+    the re-enable leg genuinely needs a translation the guard correctly refuses.)
+13. V2 total `1e20` + disable → `{ ok: false, error }` with config bytes unchanged;
+    retrying with an explicit destination-unit `options.threadLimit` succeeds (the
+    documented escape hatch).
+
+## Blocker 2 (accepted) — two more management-API assertions pin pre-fix numbers
+
+Verified at `tests/codex-v2-gate.test.ts:364` and `:368`: after
+`{ multiAgentMode: "v2", maxConcurrentThreadsPerSession: 77 }` stores V2 total 77, the
+`{ multiAgentMode: "default", enabled: false }` PUT has no explicit limit, so the
+discovered V2 total 77 translates to V1 child **76**, and both that PUT's response and
+the following GET must expect 76. Added to the checklist below.
+
+## Consolidated assertion-update checklist (checklist, NOT claimed exhaustive)
+
+| Location | Pre-fix | Post-fix | Basis |
+|---|---|---|---|
+| `off -> on carries the active legacy value` | 100 → v2 100 | → 101 | defect |
+| `on -> off carries the active v2 value` | v2 64 → 64 | → 63 | defect |
+| `migration carries the active limit comment` | 100 → 100 → 100 | 100 → 101 → 100 | round trip identity |
+| `boolean/inline migration...` (:205) | 100 | 101 | defect |
+| `target-only...` `equal` case | → 64 | → 65 | legacy source translates |
+| `mode v2/v1...` (:464) | 100 | 101 | mode change |
+| same test (:469, :475) | 77 | 76 | explicit 77 disables to 76 |
+| same test (:466, :472) | 77 | 77 | explicit value / re-enable of 76 |
+| management `mode-only switches` | 100 both ways | 101 then 100 | defect |
+| management :364, :368 | 77 | 76 | round-2 blocker |
+
+The test at ~443 is renamed to `mode v2/v1 translates the limit across the root-slot
+boundary`. In B, run the suite and append any failure not in this table to the D
+summary's enumerated list.
