@@ -143,15 +143,14 @@ function sidecarModelOptions(models: ModelInfo[]) {
 }
 
 /**
- * Vision sidecar model list: the OpenAI/Anthropic backends plus any routed model that declares
- * image input (`inputModalities` contains "image"). Routed text-only models are excluded so users
- * don't pick a describer that can only fail-soft to the strip marker.
+ * Vision sidecar model list: ALL models, unfiltered. The catalog's `inputModalities` is unreliable
+ * for routed providers — ollama's OpenAI-compatible /v1/models exposes no modalities, and
+ * `noVisionModels` forces "image" into a model's modalities for the Codex client-gate bypass
+ * (which leaks text-only models into this list). Rather than guess, surface every model and let the
+ * user pick the describer; a text-only choice fails soft to the strip marker, which is recoverable.
  */
 function visionModelOptions(models: ModelInfo[]) {
-  return models
-    .filter(model => model.provider === "openai" || model.provider === "anthropic"
-      || (model.inputModalities ?? []).includes("image"))
-    .map(model => ({ value: model.id, label: `${model.provider}/${model.id}` }));
+  return models.map(model => ({ value: model.id, label: `${model.provider}/${model.id}` }));
 }
 
 function sidecarBackendForModel(models: ModelInfo[], modelId: string): SidecarBackend {
