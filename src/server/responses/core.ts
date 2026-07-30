@@ -827,6 +827,31 @@ export async function handleResponses(
       logCtx.requestedEffort = `${logCtx.requestedEffort ?? "max"}->${clamped}`;
     }
   }
+  // Routed-model effort translation (openai-responses path): non-native providers
+  // (e.g. Ollama /v1/responses) reject effort tiers they don't expose (xhigh/ultra).
+  // The openai-chat/google adapters clamp via mapReasoningEffort, but the responses
+  // adapter is a verbatim passthrough, so routed models received the caller's effort
+  // unclamped and 400'd. Apply the provider effort map + smart nearest-ladder clamp
+  // so unsupported tiers map to the closest supported wire value (xhigh -> max on a
+  // [low,medium,high,max] ladder). Native ChatGPT forward is handled by the clamp
+  // above and stays verbatim; models with no declared ladder pass through unchanged.
+  {
+    const requestedModelId = logCtx.requestedModel ?? route.modelId;
+    const { shouldApplyNativeEffortClamp } = await import("../../codex/catalog");
+    if (!shouldApplyNativeEffortClamp(route.providerName, route.provider, requestedModelId)) {
+      const { mapReasoningEffort } = await import("../../reasoning-effort");
+      const requested = parsed.options.reasoning;
+      if (requested) {
+        const mapped = mapReasoningEffort(route.provider, route.modelId, requested, true);
+        if (typeof mapped === "string" && mapped !== requested) {
+          parsed.options.reasoning = mapped;
+          const raw = parsed._rawBody as { reasoning?: { effort?: string } } | undefined;
+          if (raw?.reasoning && typeof raw.reasoning === "object") raw.reasoning.effort = mapped;
+          logCtx.requestedEffort = `${logCtx.requestedEffort ?? requested}->${mapped}`;
+        }
+      }
+    }
+  }
   logCtx.modelSupportsServiceTier = catalogModelSupportsServiceTier(
     route.modelId,
     logCtx.requestedServiceTier ?? logCtx.configuredServiceTier,

@@ -152,7 +152,8 @@ export function applyReasoningLevels(
   // even when the provider ladder stops lower — subagent spawns pass `max` DIRECTLY
   // (no ultra->max client conversion) and codex-rs validates it by catalog membership,
   // so a missing max rung hard-fails spawn_agent effort overrides. The wire stays honest:
-  // routed adapters clamp via clampToSupportedCodexEffort and natives via
+  // routed adapters clamp (chat/google via clampToSupportedCodexEffort, responses
+  // via nearestSupportedCodexEffort) and natives via
   // nativeEffortClamp (max -> the model's real top rung).
   if (!preserveExact && efforts.length > 0) {
     const additions: string[] = [];

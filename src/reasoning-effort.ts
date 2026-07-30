@@ -84,6 +84,13 @@ function requestToCodexEffort(requested: string): string | undefined {
   return CODEX_REASONING_SET.has(requested) ? requested : undefined;
 }
 
+/**
+ * At-or-below clamp (default): snap an unsupported effort down to the highest
+ * supported rung at or below the request; if every supported rung sits above the
+ * request, snap to the lowest supported rung. This is the long-standing contract for
+ * the openai-chat / google adapter paths and MUST stay only-lowering to preserve
+ * documented provider behavior (e.g. Antigravity gemini-3.1-pro medium -> low).
+ */
 function clampToSupportedCodexEffort(requested: string, supported: readonly string[]): string | undefined {
   if (supported.length === 0) return undefined;
   const codex = requestToCodexEffort(requested);
@@ -104,6 +111,38 @@ function clampToSupportedCodexEffort(requested: string, supported: readonly stri
   return best;
 }
 
+/**
+ * Nearest-rung clamp (opt-in): snap an unsupported effort to the closest supported
+ * rung by Codex-ladder rank distance. On an exact tie (the requested tier sits midway
+ * between two adjacent supported rungs, e.g. `xhigh` between `high` and `max`), round
+ * UP to the higher rung to preserve the user's "more reasoning" intent. Used on the
+ * openai-responses routed path, which is a verbatim passthrough and historically
+ * forwarded unsupported tiers (xhigh/ultra) unchanged, causing upstream 400s. Unlike
+ * the effortCap resolver in effort-policy.ts (hard "never raises" ceiling contract),
+ * this is about making an unsupported tier *run* on the upstream, so nearest-with-tie-up
+ * is the right semantics.
+ */
+function nearestSupportedCodexEffort(requested: string, supported: readonly string[]): string | undefined {
+  if (supported.length === 0) return undefined;
+  const codex = requestToCodexEffort(requested);
+  if (!codex) return undefined;
+  if (supported.includes(codex)) return codex;
+
+  const requestedRank = CODEX_REASONING_ORDER.indexOf(codex);
+  let best = supported[0];
+  let bestDist = Math.abs(CODEX_REASONING_ORDER.indexOf(best) - requestedRank);
+  for (const effort of supported) {
+    const rank = CODEX_REASONING_ORDER.indexOf(effort);
+    const dist = Math.abs(rank - requestedRank);
+    // Closer rung wins; on a tie, the HIGHER rung wins (round up to preserve intent).
+    if (dist < bestDist || (dist === bestDist && rank > CODEX_REASONING_ORDER.indexOf(best))) {
+      best = effort;
+      bestDist = dist;
+    }
+  }
+  return best;
+}
+
 export function reasoningEffortMapFor(provider: OcxProviderConfig, modelId: string): Record<string, string> | undefined {
   return modelRecordValue(provider.modelReasoningEffortMap, modelId) ?? provider.reasoningEffortMap;
 }
@@ -111,8 +150,15 @@ export function reasoningEffortMapFor(provider: OcxProviderConfig, modelId: stri
 /**
  * Translate Codex's reasoning label into the provider's real wire value. Prefer identity labels
  * (`xhigh` stays `xhigh`, `max` stays `max`); provider maps are only for real upstream aliases.
+ *
+ * `nearest` selects the fallback clamp used when no explicit wire map claims the effort:
+ *  - false (default, openai-chat/google paths): at-or-below `clampToSupportedCodexEffort`
+ *    (only-lowering, the long-standing contract).
+ *  - true (openai-responses routed path): `nearestSupportedCodexEffort` (nearest rung,
+ *    tie -> higher), so an unsupported tier like `xhigh` maps to the closest supported wire
+ *    value instead of being forwarded verbatim and 400'ing upstream.
  */
-export function mapReasoningEffort(provider: OcxProviderConfig, modelId: string, requested: string | undefined): string | undefined {
+export function mapReasoningEffort(provider: OcxProviderConfig, modelId: string, requested: string | undefined, nearest = false): string | undefined {
   if (!requested) return undefined;
   if (modelInList(provider.noReasoningModels, modelId)) return undefined;
 
@@ -125,7 +171,9 @@ export function mapReasoningEffort(provider: OcxProviderConfig, modelId: string,
   if (wireMap && Object.prototype.hasOwnProperty.call(wireMap, boundary)) return wireMap[boundary];
 
   const supported = configuredReasoningEfforts(provider, modelId);
-  const codexEffort = supported !== undefined ? clampToSupportedCodexEffort(boundary, supported) : requestToCodexEffort(boundary);
+  const codexEffort = supported !== undefined
+    ? (nearest ? nearestSupportedCodexEffort(boundary, supported) : clampToSupportedCodexEffort(boundary, supported))
+    : requestToCodexEffort(boundary);
   if (!codexEffort) return undefined;
 
   // Belt for the odd config where the supported ladder is ultra-only and the clamp lands on it.

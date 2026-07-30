@@ -77,6 +77,45 @@ describe("provider-specific reasoning effort mapping", () => {
     expect(buildBody(provider, "glm-5.2", { reasoning: "max" }).reasoning_effort).toBe("high");
   });
 
+  test("smart clamp snaps an unsupported effort to the nearest supported rung (tie -> higher)", () => {
+    // No explicit wire map -> the fallback clamp decides. `nearest: true` selects the
+    // nearest-rung clamp used on the openai-responses routed path.
+    const ladder = (efforts: string[]): OcxProviderConfig => ({
+      adapter: "openai-chat",
+      baseUrl: "https://example/v1",
+      modelReasoningEfforts: { "glm-5.2": efforts },
+    });
+    const map = (efforts: string[], requested: string) => mapReasoningEffort(ladder(efforts), "glm-5.2", requested, true);
+
+    // xhigh sits midway between high and max -> round UP to max (preserve reasoning intent).
+    expect(map(["low", "medium", "high", "max"], "xhigh")).toBe("max");
+    // medium sits midway between low and high -> round UP to high.
+    expect(map(["low", "high"], "medium")).toBe("high");
+    // No tie: xhigh above a [low,medium,high] ladder -> nearest is high (lower, unchanged).
+    expect(map(["low", "medium", "high"], "xhigh")).toBe("high");
+    // No tie: max above a [low,medium,high] ladder -> high.
+    expect(map(["low", "medium", "high"], "max")).toBe("high");
+    // Requested tier in the supported set -> passthrough, no rewrite.
+    expect(map(["low", "medium", "high", "max"], "high")).toBe("high");
+    expect(map(["low", "medium", "high", "max"], "max")).toBe("max");
+    // ultra is converted to max before clamping; max is supported -> max.
+    expect(map(["low", "medium", "high", "max"], "ultra")).toBe("max");
+    // Requested tier below every supported rung -> lowest supported (unavoidable raise).
+    expect(map(["high", "max"], "low")).toBe("high");
+  });
+
+  test("default clamp stays at-or-below (chat/google path, only-lowering contract)", () => {
+    const ladder = (efforts: string[]): OcxProviderConfig => ({
+      adapter: "openai-chat",
+      baseUrl: "https://example/v1",
+      modelReasoningEfforts: { "glm-5.2": efforts },
+    });
+    // default (nearest: false): xhigh above [low,high] snaps DOWN to high, not up to max.
+    expect(mapReasoningEffort(ladder(["low", "high"]), "glm-5.2", "xhigh")).toBe("high");
+    // medium between low and high snaps DOWN to low (Antigravity gemini-3.1-pro parity).
+    expect(mapReasoningEffort(ladder(["low", "high"]), "glm-5.2", "medium")).toBe("low");
+  });
+
   test("Neuralwatt GLM-5.2 sends direct max and preserves reasoning history", () => {
     const provider: OcxProviderConfig = {
       adapter: "openai-chat",
