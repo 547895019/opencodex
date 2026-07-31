@@ -139,7 +139,10 @@ function mergeSidecarSetting(
 function sidecarModelOptions(models: ModelInfo[]) {
   return models
     .filter(model => model.provider === "openai" || model.provider === "anthropic" || model.provider === "ollama")
-    .map(model => ({ value: model.id, label: `${model.provider}/${model.id}` }));
+    // value is the NAMESPACED id (provider/id) so the saved sidecar.model routes unambiguously
+    // via routeModel — a bare id like "kimi-k2.7-code:cloud" would fall through to the default
+    // provider (openai forward) instead of the user's chosen ollama/anthropic provider.
+    .map(model => ({ value: `${model.provider}/${model.id}`, label: `${model.provider}/${model.id}` }));
 }
 
 /**
@@ -150,11 +153,23 @@ function sidecarModelOptions(models: ModelInfo[]) {
  * user pick the describer; a text-only choice fails soft to the strip marker, which is recoverable.
  */
 function visionModelOptions(models: ModelInfo[]) {
-  return models.map(model => ({ value: model.id, label: `${model.provider}/${model.id}` }));
+  // value is the NAMESPACED id (provider/id) — see sidecarModelOptions for rationale.
+  return models.map(model => ({ value: `${model.provider}/${model.id}`, label: `${model.provider}/${model.id}` }));
+}
+
+/**
+ * Resolve the provider for a sidecar model id. The dropdown value is the namespaced form
+ * `provider/model` (see sidecarModelOptions/visionModelOptions); a bare id saved by an older
+ * build is still resolved via the models lookup for backward compatibility.
+ */
+function sidecarProviderForModelId(models: ModelInfo[], modelId: string): string | undefined {
+  const slash = modelId.indexOf("/");
+  if (slash > 0) return modelId.slice(0, slash);
+  return models.find(model => model.id === modelId)?.provider;
 }
 
 function sidecarBackendForModel(models: ModelInfo[], modelId: string): SidecarBackend {
-  const provider = models.find(model => model.id === modelId)?.provider;
+  const provider = sidecarProviderForModelId(models, modelId);
   if (provider === "anthropic") return "anthropic";
   if (provider === "openai") return "openai";
   return "routed";
@@ -165,7 +180,7 @@ function sidecarBackendForModel(models: ModelInfo[], modelId: string): SidecarBa
  * search endpoint), unlike vision where ollama models fall through to the generic "routed" describer.
  */
 function webSearchBackendForModel(models: ModelInfo[], modelId: string): SidecarBackend {
-  const provider = models.find(model => model.id === modelId)?.provider;
+  const provider = sidecarProviderForModelId(models, modelId);
   if (provider === "anthropic") return "anthropic";
   if (provider === "openai") return "openai";
   if (provider === "ollama") return "ollama";
@@ -1082,7 +1097,7 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
   <div className="dash-sidecar-card__row">
     <div className="font-semibold">{t("dash.webSearchSidecar")}</div>
     <Select
-      value={sidecar?.webSearch.model ?? "gpt-5.6-luna"}
+      value={sidecar?.webSearch.model ?? "openai/gpt-5.6-luna"}
       options={sidecarModels}
       onChange={model => { void saveSidecar({ webSearch: { model, backend: webSearchBackendForModel(models, model) } }); }}
       disabled={!sidecar || sidecarSaving}
@@ -1096,7 +1111,7 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
   <div className="dash-sidecar-card__row">
     <div className="font-semibold">{t("dash.visionSidecar")}</div>
     <Select
-      value={sidecar?.vision.model ?? "gpt-5.6-luna"}
+      value={sidecar?.vision.model ?? "openai/gpt-5.6-luna"}
       options={visionModels}
       onChange={model => { void saveSidecar({ vision: { model, backend: sidecarBackendForModel(models, model) } }); }}
       disabled={!sidecar || sidecarSaving}
