@@ -109,6 +109,9 @@ import { hasUnreadableEncryptedAgentTask, looksLikeBackendCiphertext, sanitizeEn
 import { fetchWithHeaderTimeout, providerFetch, safeHostLabel } from "./fetch-helpers";
 import { isImageUnsupported400 } from "../image-unsupported-400";
 import { markModelNoVision } from "../vision-mark";
+import { isInvalidReasoningEffort400, parseAcceptedReasoningEfforts } from "../effort-unsupported-400";
+import { markModelReasoningEfforts } from "../effort-mark";
+import { configuredReasoningEfforts, mapReasoningEffort } from "../../reasoning-effort";
 import { guardTerminalEventStream } from "./terminal-guard";
 
 /**
@@ -1553,6 +1556,7 @@ export async function handleResponses(
     let imageRetryAttempted = false;
     let oauth401ReplayAttempted = false;
     let visionMarkAttempted = false;
+  let reasoningClampAttempted = false;
     const rebuildAndRefetch = async (
       recovery: AttemptRecoveryKind,
     ): Promise<Response | { failed: Response }> => {
@@ -1679,6 +1683,44 @@ export async function handleResponses(
         if ("failed" in result) return result.failed;
         upstreamResponse = result;
         continue recovery;
+      }
+      // Reactive reasoning-effort clamp: the routed model 400'd on an unsupported effort tier
+      // (e.g. ollama /v1/responses rejecting `xhigh`). Parse the accepted-values list the
+      // upstream itself echoes, persist it as the model's `modelReasoningEfforts` ladder
+      // (set-and-forget, so the user never hand-edits config), re-clamp the in-flight request's
+      // effort to the nearest supported rung, then rebuild + refetch. The pre-fetch effort block
+      // (above) runs once and does NOT re-run on retry, so the in-branch re-clamp is mandatory.
+      // Only auto-learn when NO ladder is currently declared for the model, so an explicit
+      // user-configured ladder is never clobbered. Mirrors the vision-mark branch above.
+      if (
+        !reasoningClampAttempted
+        && upstreamResponse.status === 400
+        && parsed.options.reasoning
+        && configuredReasoningEfforts(route.provider, route.modelId) === undefined
+        && await isInvalidReasoningEffort400(upstreamResponse, options.abortSignal)
+      ) {
+        reasoningClampAttempted = true;
+        let learnedLadder: string[] | undefined;
+        try {
+          const body = await readBoundedResponseBody(upstreamResponse.clone(), { signal: options.abortSignal });
+          if (body.displaySafe && !body.truncated) learnedLadder = parseAcceptedReasoningEfforts(body.text);
+        } catch { /* best-effort parse; fall through to error surface if unreadable */ }
+        if (learnedLadder && learnedLadder.length > 0) {
+          markModelReasoningEfforts(config, route, route.modelId, learnedLadder);
+          const requested = parsed.options.reasoning;
+          const mapped = mapReasoningEffort(route.provider, route.modelId, requested, true);
+          if (typeof mapped === "string" && mapped !== requested) {
+            parsed.options.reasoning = mapped;
+            const raw = parsed._rawBody as { reasoning?: { effort?: string } } | undefined;
+            if (raw?.reasoning && typeof raw.reasoning === "object") raw.reasoning.effort = mapped;
+            logCtx.requestedEffort = `${logCtx.requestedEffort ?? requested}->${mapped}`;
+          }
+          try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
+          const result = await rebuildAndRefetch("reasoning-clamp-400");
+          if ("failed" in result) return result.failed;
+          upstreamResponse = result;
+          continue recovery;
+        }
       }
       break;
     }

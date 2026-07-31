@@ -12,7 +12,8 @@ export type AttemptRecoveryKind =
   | "oauth-401"
   | "key-429"
   | "image-413"
-  | "vision-mark-400";
+  | "vision-mark-400"
+  | "reasoning-clamp-400";
 
 export interface PersistedUsageAttempt {
   ordinal: number;
@@ -115,6 +116,7 @@ const ATTEMPT_RECOVERY_KINDS = new Set<AttemptRecoveryKind>([
   "key-429",
   "image-413",
   "vision-mark-400",
+  "reasoning-clamp-400",
 ]);
 const USAGE_STATUSES = new Set<UsageStatus>([
   "reported",
