@@ -6,11 +6,23 @@ import type { StartupHealthStatus } from "../startup-health-ui";
 
 export type DashboardSection = "overview" | "providers" | "models";
 
+/**
+ * `#dashboard/update` is the sidebar's action deep link. It is not a tab, so it resolves
+ * to Overview (where the maintenance panel lives) and separately asks the dashboard to
+ * open the update dialog.
+ */
+export const DASHBOARD_UPDATE_HASH = "dashboard/update";
+
 export function readDashboardSectionFromHash(): DashboardSection {
   const raw = window.location.hash.replace(/^#\/?/, "");
   if (raw === "dashboard/providers") return "providers";
   if (raw === "dashboard/models") return "models";
   return "overview";
+}
+
+/** True while the location hash is the sidebar update deep link. */
+export function hashRequestsUpdateDialog(): boolean {
+  return window.location.hash.replace(/^#\/?/, "") === DASHBOARD_UPDATE_HASH;
 }
 
 /** Overview is the bare `#dashboard`; the other sections carry a suffix. */
@@ -47,7 +59,7 @@ export interface SidecarPatch {
   webSearch?: { backend?: SidecarBackend | null; model?: string };
   vision?: { backend?: SidecarBackend | null; model?: string };
 }
-export interface ShadowCallData { enabled: boolean; model: string }
+export interface ShadowCallData { enabled: boolean; model: string; sourceModels?: string[] }
 export interface UsageSummary30d { summary: { requests: number; totalTokens: number; coverageRatio: number } }
 export type UpdateChannel = "latest" | "preview";
 export type Installer = "npm" | "bun" | "source";
@@ -60,6 +72,7 @@ export interface SyncResult {
   cacheSynced: boolean;
   message: string;
   warning?: string;
+  nativeSubagentDefaultsWarning?: string;
   staleAppServerHint?: string;
   projectConfigWarnings?: ProjectCodexConfigWarning[];
 }
@@ -151,7 +164,7 @@ export function sidecarBackendForModel(models: ModelInfo[], modelId: string): Si
 }
 
 let lastInputWasKeyboard = false;
-if (typeof window !== "undefined") {
+if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
   window.addEventListener("keydown", () => { lastInputWasKeyboard = true; }, { capture: true, passive: true });
   window.addEventListener("pointerdown", () => { lastInputWasKeyboard = false; }, { capture: true, passive: true });
 }

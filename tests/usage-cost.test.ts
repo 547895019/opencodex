@@ -103,18 +103,35 @@ describe("normalizeCostTokens", () => {
 });
 
 describe("resolveMatchedPrice", () => {
-  // WP7: claude-opus-5 is exposed by three providers but missing from the jawcode
+  // WP7: claude-opus-5 is exposed by three providers but was missing from the jawcode
   // bundle, so it resolved to null and Logs rendered an em dash instead of a cost.
   // The model-level vendor fallback only searches jawcode metadata, never overlays,
-  // so each exposing provider needs its own row.
-  test("claude-opus-5 resolves to the user-derived Opus 4.6 price on every exposing provider", () => {
-    for (const provider of ["anthropic", "cursor", "kiro"]) {
+  // so each exposing provider needed its own row.
+  //
+  // Upstream has since published an `anthropic/claude-opus-5` row at the SAME numbers the
+  // maintainer derived (5 / 25 / 0.5 / 6.25), so that provider is now sourced from jawcode
+  // and reads `verified` instead of `verified-derived`. cursor and kiro have no jawcode row
+  // of their own and still come from the overlay, which is why the overlay must stay.
+  // The price is identical either way — only the provenance moved, and it moved forward.
+  test("claude-opus-5 resolves to the Opus 4.6 price on every exposing provider", () => {
+    const COST4 = { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 };
+
+    const anthropic = resolveMatchedPrice("anthropic", "claude-opus-5");
+    expect(anthropic).toMatchObject({
+      provider: "anthropic",
+      modelId: "claude-opus-5",
+      cost4: COST4,
+      source: "jawcode",
+      status: "verified",
+    });
+
+    for (const provider of ["cursor", "kiro"]) {
       const price = resolveMatchedPrice(provider, "claude-opus-5");
       expect(price).not.toBeNull();
       expect(price).toMatchObject({
         provider,
         modelId: "claude-opus-5",
-        cost4: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+        cost4: COST4,
         source: "expected",
         status: "verified-derived",
       });
@@ -403,6 +420,17 @@ describe("priority (Fast) service tier multiplier", () => {
     expect(base!.priorityMultiplier).toBeUndefined();
   });
 
+  test("P1b. Fast mode applies the current 0.4x price for gpt-5.6-luna", () => {
+    const base = estimateRequestCost({ provider: "openai", model: "gpt-5.6-luna", usageStatus: "reported", usage });
+    const fast = estimateRequestCost({ provider: "openai", model: "gpt-5.6-luna", usageStatus: "reported", usage, serviceTier: "priority" });
+    expect(base).not.toBeNull();
+    expect(fast).not.toBeNull();
+    // Standard: $1 input + $0.60 output = $1.60. Fast: $0.40 + $0.24 = $0.64.
+    expect(base!.cost.total).toBeCloseTo(1.6, 9);
+    expect(fast!.cost.total).toBeCloseTo(0.64, 9);
+    expect(fast!.priorityMultiplier).toBe(0.4);
+  });
+
   test("P2. priority tier applies 2.5x multiplier for gpt-5.5", () => {
     const base = estimateRequestCost({ provider: "openai", model: "gpt-5.5", usageStatus: "reported", usage }, overlays);
     const fast = estimateRequestCost({ provider: "openai", model: "gpt-5.5", usageStatus: "reported", usage, serviceTier: "priority" }, overlays);
@@ -457,18 +485,22 @@ describe("priority (Fast) service tier multiplier", () => {
 
   test("P8. resolvePriorityMultiplier returns correct values", () => {
     expect(resolvePriorityMultiplier("gpt-5.6-sol")).toBe(2);
-    expect(resolvePriorityMultiplier("gpt-5.6-terra")).toBe(2);
-    expect(resolvePriorityMultiplier("gpt-5.6-luna")).toBe(2);
+    expect(resolvePriorityMultiplier("gpt-5.6-terra")).toBe(1.6);
+    expect(resolvePriorityMultiplier("gpt-5.6-luna")).toBe(0.4);
     expect(resolvePriorityMultiplier("gpt-5.5")).toBe(2.5);
+    expect(resolvePriorityMultiplier("gpt-5.4-mini")).toBe(2);
     expect(resolvePriorityMultiplier("gpt-5.4")).toBe(2);
     expect(resolvePriorityMultiplier("gpt-5.3-codex-spark")).toBe(1);
     expect(resolvePriorityMultiplier("unknown-model")).toBe(1);
   });
 
   test("P9. PRIORITY_MULTIPLIERS table has expected entries", () => {
-    expect(Object.keys(PRIORITY_MULTIPLIERS)).toHaveLength(5);
+    expect(Object.keys(PRIORITY_MULTIPLIERS)).toHaveLength(6);
     expect(PRIORITY_MULTIPLIERS["gpt-5.6-sol"]).toBe(2);
+    expect(PRIORITY_MULTIPLIERS["gpt-5.6-terra"]).toBe(1.6);
+    expect(PRIORITY_MULTIPLIERS["gpt-5.6-luna"]).toBe(0.4);
     expect(PRIORITY_MULTIPLIERS["gpt-5.5"]).toBe(2.5);
+    expect(PRIORITY_MULTIPLIERS["gpt-5.4-mini"]).toBe(2);
   });
 
   test("P10. attempt cost with priority tier", () => {

@@ -17,11 +17,79 @@ import {
 export type ProviderAuthKind = "forward" | "oauth" | "key" | "local";
 export type MetadataModelIdNormalize = "case-insensitive";
 
+export type ProviderModelDiscoveryScalar = string | number | boolean;
+
+export type ProviderModelDiscoveryPredicate =
+  | {
+      path: readonly string[];
+      equalsAny: readonly ProviderModelDiscoveryScalar[];
+      caseInsensitive?: boolean;
+    }
+  | {
+      path: readonly string[];
+      /**
+       * A string-valued upstream target uses substring matching; an array-valued target uses
+       * exact element matching. Use `equalsAny` when the string must match in full.
+       */
+      containsAny: readonly ProviderModelDiscoveryScalar[];
+      caseInsensitive?: boolean;
+    }
+  | {
+      path: readonly string[];
+      /** Uses the same string-substring and array-element semantics as `containsAny`. */
+      containsAll: readonly ProviderModelDiscoveryScalar[];
+      caseInsensitive?: boolean;
+    };
+
+export interface ProviderModelDiscoveryFilter {
+  /** Every predicate must match. */
+  allOf?: readonly ProviderModelDiscoveryPredicate[];
+  /** At least one predicate must match. */
+  anyOf?: readonly ProviderModelDiscoveryPredicate[];
+  /** No predicate may match. */
+  noneOf?: readonly ProviderModelDiscoveryPredicate[];
+}
+
+interface ProviderModelDiscoverySharedSpec {
+  /** Query parameters applied to the resolved discovery URL. */
+  query?: Readonly<Record<string, string>>;
+  /** Declarative eligibility rules evaluated against each untrusted model row. */
+  filter?: ProviderModelDiscoveryFilter;
+  /** Optional lower byte ceiling; the process-wide hard ceiling still wins. */
+  maxResponseBytes?: number;
+  /** Optional lower raw-row ceiling; the process-wide hard ceiling still wins. */
+  maxModels?: number;
+}
+
+type ProviderModelDiscoveryLocation =
+  | {
+      /** Registry-owned absolute endpoint. Mutually exclusive with `path`. */
+      url: string;
+      path?: never;
+    }
+  | {
+      /** Resource path relative to baseUrl; query strings and fragments are disallowed. */
+      path: string;
+      url?: never;
+    }
+  | {
+      /** Keep the adapter-derived default discovery endpoint. */
+      url?: never;
+      path?: never;
+    };
+
+/**
+ * Trusted live-model discovery policy. This metadata is registry-only: it must never be copied
+ * into config.json, where a same-named custom provider could otherwise redirect a stored key.
+ */
+export type ProviderModelDiscoverySpec = ProviderModelDiscoverySharedSpec & ProviderModelDiscoveryLocation;
+
 export interface ProviderRegistryEntry {
   id: string;
   label: string;
   adapter: string;
   baseUrl: string;
+  apiKeyTransport?: OcxProviderConfig["apiKeyTransport"];
   authKind: ProviderAuthKind;
   codexAccountMode?: CodexAccountMode;
   /** OAuth preset may explicitly honor a persisted API-key billing mode. */
@@ -34,6 +102,11 @@ export interface ProviderRegistryEntry {
    */
   freeTier?: boolean;
   allowBaseUrlOverride?: boolean;
+  /**
+   * Do not claim an existing same-named key provider whose fixed destination differs from this
+   * preset. Enable for newly promoted ids so an older custom key cannot be silently retargeted.
+   */
+  preserveCustomDestination?: boolean;
   /**
    * Optional endpoint picker for providers with multiple official hosts
    * (e.g. Qwen Cloud token plan vs pay-as-you-go). Requires `allowBaseUrlOverride`
@@ -50,6 +123,7 @@ export interface ProviderRegistryEntry {
   defaultModel?: string;
   models?: string[];
   liveModels?: boolean;
+  modelDiscovery?: ProviderModelDiscoverySpec;
   contextWindow?: number;
   modelContextWindows?: Record<string, number>;
   modelInputModalities?: Record<string, string[]>;
@@ -88,7 +162,7 @@ export interface ProviderRegistryEntry {
 
 export type ProviderConfigSeed = Pick<
   OcxProviderConfig,
-  "adapter" | "baseUrl" | "authMode" | "keyOptional" | "freeTier" | "modelSuffixBracketStrip" | "defaultModel" | "models"
+  "adapter" | "baseUrl" | "apiKeyTransport" | "authMode" | "keyOptional" | "freeTier" | "modelSuffixBracketStrip" | "defaultModel" | "models"
   | "liveModels" | "contextWindow" | "modelContextWindows" | "modelInputModalities"
   | "modelMaxInputTokens" | "defaultMaxOutputTokens" | "modelMaxOutputTokens"
   | "reasoningEfforts" | "modelReasoningEfforts" | "modelDefaultReasoningEfforts" | "reasoningEffortMap" | "modelReasoningEffortMap"
@@ -383,6 +457,12 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     modelContextWindows: cursorModelContextWindows(CURSOR_STATIC_MODELS),
     modelInputModalities: cursorModelInputModalities(CURSOR_STATIC_MODELS),
     modelReasoningEfforts: cursorModelReasoningEfforts(CURSOR_STATIC_MODELS),
+    // Kimi K3 documents `max` as its API default, and its Cursor ladder has no `medium`
+    // rung — so applyReasoningLevels' medium->high->first fallback would settle the catalog
+    // default on `high`, the picker would send `high` explicitly, and the request builder's
+    // no-effort fallback to `kimi-k3-max` would never be reached. Mirrors the other K3
+    // routes (kimi, kimi-code, opencode-go).
+    modelDefaultReasoningEfforts: { "kimi-k3": "max" },
     // Cursor's wire protocol never forwards image parts (request-builder emits an unsupported-
     // content marker), so the vision sidecar covers ALL cursor models regardless of what the
     // upstream model could natively do. Live-discovered models outside the static list fall back
@@ -480,6 +560,12 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     baseUrl: "https://api.kimi.com/coding/v1",
     authKind: "oauth",
     modelSuffixBracketStrip: true,
+    // Kimi Code Plan documents a stable session/task prompt_cache_key as required to improve
+    // cache hit rates.
+    // The chat adapter only forwards a key already on the internal request (Codex's session key,
+    // or the one the Claude /v1/messages inbound derives); the adapter itself never invents one.
+    // Evidence: https://platform.kimi.com/docs/api/chat
+    promptCacheKey: true,
     featured: true,
     oauthId: "kimi",
     jawcodeBundle: "moonshot",
@@ -506,7 +592,7 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     baseUrl: "https://runtime.us-east-1.kiro.dev",
     authKind: "oauth",
     oauthId: "kiro",
-    note: "Import-first: reuses your installed Kiro CLI login — requires kiro-cli installed and signed in (`kiro-cli login`). Experimental third-party harness — see Kiro ToS.",
+    note: "Import-first: reuses your installed and signed-in Kiro CLI session (requires `kiro-cli login`). Add account logs `kiro-cli` out, switches it through a fresh browser login, stores the account by profile ARN, and restores the previous CLI session on cancellation or failure. Experimental third-party harness — see Kiro ToS.",
     models: KIRO_MODELS,
     defaultModel: "kiro-auto",
     // Kiro speaks CodeWhisperer wire, not OpenAI-style GET /models. Keep the static
@@ -1018,6 +1104,8 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     id: "kimi-code", label: "Kimi (coding)", baseUrl: "https://api.kimi.com/coding/v1", adapter: "openai-chat", authKind: "key",
     dashboardUrl: "https://platform.moonshot.cn/console/api-keys", defaultModel: "kimi-k2.7-code",
     modelSuffixBracketStrip: true,
+    // API-key form of the same Kimi Code Plan transport; keep cache affinity identical to OAuth.
+    promptCacheKey: true,
     models: KIMI_CODING_MODELS,
     modelContextWindows: KIMI_CODING_MODEL_CONTEXT_WINDOWS,
     modelInputModalities: KIMI_CODING_MODEL_INPUT_MODALITIES,
@@ -1110,6 +1198,41 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
 
 export function getProviderRegistryEntry(id: string): ProviderRegistryEntry | undefined {
   return PROVIDER_REGISTRY.find(entry => entry.id === id);
+}
+
+function normalizedProviderEndpoint(value: string): string {
+  const trimmed = value.trim();
+  try {
+    const parsed = new URL(trimmed);
+    parsed.pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return trimmed.replace(/\/+$/, "");
+  }
+}
+
+/**
+ * Whether registry transport defaults own this configured row.
+ *
+ * OAuth/forward providers stay pinned because their credentials must never be sent to an
+ * arbitrary same-named host. Existing key presets keep their historical pinning behavior; a new
+ * preset can opt into collision preservation, in which case its fixed endpoint owns only rows
+ * that still match that destination.
+ */
+export function providerMatchesRegistryTransport(
+  id: string,
+  provider: Pick<OcxProviderConfig, "baseUrl" | "adapter"> & Partial<Pick<OcxProviderConfig, "authMode">>,
+): boolean {
+  const entry = getProviderRegistryEntry(id);
+  if (!entry) return false;
+  if (entry.authKind !== "key" || entry.preserveCustomDestination !== true) return true;
+  // The opt-in is intentionally limited to fixed key destinations. Fail closed if a future
+  // registry edit combines it with an override/template despite the registry parity tests.
+  if (entry.allowBaseUrlOverride || /\{[^}]*\}/.test(entry.baseUrl)) return false;
+  if (typeof provider.baseUrl !== "string") return false;
+  if (provider.adapter !== entry.adapter) return false;
+  if (provider.authMode !== undefined && provider.authMode !== "key") return false;
+  return normalizedProviderEndpoint(provider.baseUrl) === normalizedProviderEndpoint(entry.baseUrl);
 }
 
 /**

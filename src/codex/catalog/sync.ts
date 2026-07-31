@@ -35,8 +35,9 @@ import { activeCodexModelsCachePath, applyJawcodeCatalogMetadata, applyMultiAgen
 import type { CatalogModel, MultiAgentMode, RawEntry } from "./parsing";
 import { applyNativeVisibility, disabledNativeSlugs, isUnsupportedOpenAiNativeSlug, nativeOpenAiSlugs, shouldUpgradeToUpstreamEntry, upstreamNativeEntry } from "./metadata";
 import { loadCatalogForSync, resetBundledCatalogCacheForTests } from "./bundled";
+import { isMultiAgentV2Enabled } from "../features";
 import { applyCatalogModelMetadata, applyReasoningLevels, catalogEntryEfforts, clampCatalogModelsToCodexSupport, ensureGpt56ReasoningLevels, ensureUltraReasoningLevel, isGpt56NativeSlug } from "./effort";
-import { filterCatalogVisibleModels, gatherRoutedModels, lastDropWarnSignature } from "./provider-fetch";
+import { clearGatherRoutedModelsInflight, filterCatalogVisibleModels, gatherRoutedModels, lastDropWarnSignature } from "./provider-fetch";
 import { clearLastComboCatalogOmissions, comboCatalogWarningSignatures, comboMasqueradeCollisionWarnings, exactComboCatalogSlugs, openAiApiCollisionWarnings, resolveSlugAliasCollisions, slugAliasCollisionWarnings, warnComboMasqueradeCollisionOnce } from "./aggregation";
 import type { ComboCatalogOmission } from "./aggregation";
 
@@ -49,6 +50,26 @@ export type SubagentRosterExclusionReason =
   | "picker_hidden"
   | "surface_incompatible"
   | "outside_display_limit";
+
+/**
+ * Whether a catalog entry may be offered as a V2 subagent model.
+ *
+ * Upstream (codex-rs 92938d880) requires `multi_agent_version === "v2"` exactly,
+ * because upstream assumes a single backend serves every model. opencodex routes
+ * many providers, so that equality would reject the cross-provider spawns this
+ * proxy exists to enable.
+ *
+ * Decision (option B, devlog 260730_codex_rs_upstream_v2_live_handoff/060): any
+ * model opencodex actually routes is eligible. An entry pinned to a DIFFERENT
+ * multi-agent backend (`v1`) stays excluded, because that pin is a real capability
+ * statement rather than an absence of information. An unpinned entry (null or
+ * absent) is a routed or unpinned-native model and is allowed. The three-way
+ * distinction is the substance; do not flatten it into a truthiness check.
+ */
+export function isEligibleV2SubagentEntry(entry: RawEntry): boolean {
+  const pinned = entry.multi_agent_version;
+  return pinned === "v2" || pinned === null || pinned === undefined;
+}
 
 export interface EffectiveSubagentModel {
   model: string;
@@ -86,7 +107,7 @@ export function effectiveSubagentRoster(
     .map((entry, index) => ({ entry, index }))
     .filter(({ entry }) => typeof entry.slug === "string")
     .filter(({ entry }) => entry.visibility === "list")
-    .filter(({ entry }) => surface !== "v2" || entry.multi_agent_version === "v2")
+    .filter(({ entry }) => surface !== "v2" || isEligibleV2SubagentEntry(entry))
     .sort((left, right) => {
       const leftPriority = typeof left.entry.priority === "number" && Number.isFinite(left.entry.priority)
         ? left.entry.priority : Number.MAX_SAFE_INTEGER;
@@ -110,7 +131,7 @@ export function effectiveSubagentRoster(
     if (entry.visibility !== "list") {
       return [{ configured: model, catalogModel, reason: "picker_hidden" }];
     }
-    if (surface === "v2" && entry.multi_agent_version !== "v2") {
+    if (surface === "v2" && !isEligibleV2SubagentEntry(entry)) {
       return [{ configured: model, catalogModel, reason: "surface_incompatible" }];
     }
     if (!candidates.some(candidate => candidate.model === catalogModel)) {
@@ -284,7 +305,7 @@ export function buildCatalogEntries(
       delete entry.prefer_websockets;
     }
   }
-  return applyMultiAgentMode(out, multiAgentMode);
+  return applyMultiAgentMode(out, multiAgentMode, isMultiAgentV2Enabled());
 }
 
 export function resetCatalogRuntimeStateForTests(): void {
@@ -296,6 +317,7 @@ export function resetCatalogRuntimeStateForTests(): void {
   comboMasqueradeCollisionWarnings.clear();
   clearLastComboCatalogOmissions();
   clearModelCache();
+  clearGatherRoutedModelsInflight();
 }
 
 export function orderForSubagents(goModels: CatalogModel[], featured?: string[]): CatalogModel[] {
@@ -329,9 +351,11 @@ export function mergeCatalogEntriesForSync(
   multiAgentMode: MultiAgentMode = "default",
   exactComboSlugs: ReadonlySet<string> = new Set(),
   hasPhysicalComboProvider = false,
+  includeNativeOpenAi = true,
 ): RawEntry[] {
   const rank = new Map(featured.map((slug, i) => [slug, i] as const));
-  const native = catalogModels
+  const native = includeNativeOpenAi
+    ? catalogModels
     .filter(m => typeof m.slug === "string"
       && !(m.slug as string).includes("/")
       && m.owned_by !== COMBO_NAMESPACE
@@ -367,11 +391,14 @@ export function mergeCatalogEntriesForSync(
       // for subagent max spawns; wire-clamped to the model's real top rung).
       if (!isGpt56NativeSlug(slug)) ensureUltraReasoningLevel(preserved);
       return preserved;
-    });
+    })
+    : [];
 
   // Backfill any native OpenAI slug that the on-disk catalog is missing (e.g. gpt-5.5), so a
   // routed provider exposing the same id can never delete the native OpenAI/Codex base row.
+  // Skip when no enabled canonical openai provider exists (#636) — bare gpt-* would 404.
   const nativeSlugs = new Set(native.flatMap(m => typeof m.slug === "string" ? [m.slug] : []));
+  if (includeNativeOpenAi) {
   for (const slug of nativeOpenAiSlugs()) {
     if (nativeSlugs.has(slug)) continue;
     nativeSlugs.add(slug);
@@ -381,6 +408,7 @@ export function mergeCatalogEntriesForSync(
         ? featured.length + 100
         : 9;
     native.push(deriveEntry(template ? JSON.parse(JSON.stringify(template)) : null, slug, "OpenAI native model (Codex OAuth passthrough).", priority));
+  }
   }
 
   const freshSlugs = new Set(
@@ -451,7 +479,7 @@ export function mergeCatalogEntriesForSync(
   });
   // Native enable/disable (single choke point: bare slugs in `disabledModels`). Runs as the
   // LAST pass so the upstream-upgrade branch above can never clobber a hide flag back to list.
-  return applyMultiAgentMode(applyNativeVisibility(mergedEntries, disabledNative), multiAgentMode);
+  return applyMultiAgentMode(applyNativeVisibility(mergedEntries, disabledNative), multiAgentMode, isMultiAgentV2Enabled());
 }
 
 export async function syncCatalogModels(config: OcxConfig): Promise<{
@@ -497,7 +525,16 @@ export async function syncCatalogModels(config: OcxConfig): Promise<{
   // native AND routed so the advertised flag matches the implemented endpoint (phase 120.4) and a
   // native template can never leak supports_websockets while the flag is off.
   const wsEnabled = websocketsEnabled(config);
-  catalog.models = mergeCatalogEntriesForSync(catalog.models ?? [], goEntries, baseline, featured, wsEnabled, goIds, template, disabledNativeSlugs(config), gatheredProviderNames, multiAgentMode, exactComboSlugs, hasPhysicalComboProvider);
+  const enabledProviders = Object.entries(config.providers ?? {})
+    .filter(([, prov]) => prov.disabled !== true);
+  const hasCanonicalOpenai = enabledProviders.some(([name, prov]) =>
+    name === "openai" && isCanonicalOpenAiForwardProvider(prov),
+  );
+  // #636: when the user only configured non-OpenAI providers (e.g. kimi), do not advertise
+  // bare gpt-* rows that hard-404 via NoEnabledOpenAiProviderError. Keep natives when no
+  // providers are configured yet (fresh install / catalog bootstrap tests).
+  const includeNativeOpenAi = enabledProviders.length === 0 || hasCanonicalOpenai;
+  catalog.models = mergeCatalogEntriesForSync(catalog.models ?? [], goEntries, baseline, featured, wsEnabled, goIds, template, disabledNativeSlugs(config), gatheredProviderNames, multiAgentMode, exactComboSlugs, hasPhysicalComboProvider, includeNativeOpenAi);
   clampCatalogModelsToCodexSupport(catalog.models);
 
   atomicWriteFile(catalogPath, JSON.stringify(catalog, null, 2) + "\n");

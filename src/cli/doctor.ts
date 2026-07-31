@@ -11,9 +11,11 @@ import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { getConfigDir, getConfigPath, readConfigDiagnostics, readPid, readRuntimePort, resolveEnvValue } from "../config";
+import { findLiveProxy } from "../server/proxy-liveness";
 import { gracefulStopHost } from "../lib/process-control";
 import { maskAccountId } from "../lib/privacy";
-import { loadServiceTokenFromFile } from "../lib/service-secrets";
+import { PROXY_ENV_KEYS, proxyEnvPresent } from "../lib/proxy-env";
+import { configuredAdminToken } from "../lib/admin-secrets";
 import { readCodexTokens } from "../codex/auth-collision";
 import { collectOrcaCodexHomeDiagnostic, resolveCodexHomeDir as resolveCodexHomeDirImpl, isWslRuntime, listWslWindowsCodexHomes, wslAutomountRoot, type CodexHomeDeps } from "../codex/home";
 import { findCodexOnPath, isWindowsInteropDir } from "../codex/shim";
@@ -285,17 +287,15 @@ export function collectWslDualInstall(deps: WslDualInstallDeps = {}): WslDualIns
   };
 }
 
-const PROXY_KEYS = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"] as const;
-
 export type ProxyEnvRow = { key: string; present: boolean };
 export type EnvMap = Record<string, string | undefined>;
 
 /** Report only presence/absence of proxy env vars - never the value (it may
  * embed credentials). Checks both upper- and lower-case forms. */
 export function collectProxyEnv(env: EnvMap = process.env): ProxyEnvRow[] {
-  return PROXY_KEYS.map(key => ({
+  return PROXY_ENV_KEYS.map(key => ({
     key,
-    present: !!(env[key]?.trim() || env[key.toLowerCase()]?.trim()),
+    present: proxyEnvPresent(key, env),
   }));
 }
 
@@ -307,11 +307,45 @@ export type ConfiguredProxyDiagnostic = {
   detail: string;
 };
 
-function envReferenceName(value: string): string | null {
+export function envReferenceName(value: string): string | null {
   const braced = value.match(/^\$\{(\w+)\}$/);
   if (braced) return braced[1]!;
   const bare = value.match(/^\$(\w+)$/);
   return bare ? bare[1]! : null;
+}
+
+export type ProviderApiKeyDiagnostic = {
+  provider: string;
+  envName: string;
+  detail: string;
+};
+
+/** Warn when a key-auth provider's apiKey env reference resolves empty in this process. */
+export function collectProviderApiKeyDiagnostics(
+  providers: Record<string, { authMode?: string; apiKey?: string }> = readConfigDiagnostics().config.providers ?? {},
+  env: EnvMap = process.env,
+): ProviderApiKeyDiagnostic[] {
+  const resolveInEnv = (value: string): string | undefined => {
+    const name = envReferenceName(value);
+    if (!name) return value;
+    return env[name];
+  };
+  const rows: ProviderApiKeyDiagnostic[] = [];
+  for (const [provider, config] of Object.entries(providers)) {
+    if (config.authMode !== "key") continue;
+    const raw = typeof config.apiKey === "string" ? config.apiKey.trim() : "";
+    if (!raw) continue;
+    const envName = envReferenceName(raw);
+    if (!envName) continue;
+    const resolved = resolveInEnv(raw);
+    if (resolved?.trim()) continue;
+    rows.push({
+      provider,
+      envName,
+      detail: `provider ${provider}: env reference ${envName} is unset or empty in this process`,
+    });
+  }
+  return rows;
 }
 
 export function collectConfiguredProxy(): ConfiguredProxyDiagnostic {
@@ -571,7 +605,7 @@ export function formatServiceMemoryLines(report: ServiceMemoryReport): string[] 
   const lines: string[] = [];
   lines.push(`  --     doctor process Bun ${Bun.version} (this is NOT the service process)`);
   if (report.status === "unauthorized") {
-    lines.push("  --     proxy reachable but rejected the request — set OPENCODEX_API_AUTH_TOKEN to match the service");
+    lines.push("  --     proxy reachable but rejected the request — set OPENCODEX_ADMIN_AUTH_TOKEN to match the service");
     return lines;
   }
   if (report.status === "unreachable") {
@@ -718,9 +752,21 @@ export async function runDoctor(args: string[] = []): Promise<void> {
     }
   }
 
+  // #618: identity-verified liveness first so pid-file absence does not hide a live service.
+  // Reuse the diagnostics config already loaded above so doctor stays read-only on malformed JSON.
+  const live = await findLiveProxy({
+    configFn: () => ({ port: doctorConfig.port, hostname: doctorConfig.hostname }),
+  });
+  const livePid = live ? live.pid : readPid();
+  const liveRuntime = live
+    ? { pid: live.pid ?? 0, port: live.port, hostname: live.hostname }
+    : (livePid ? readRuntimePort(livePid) : null);
+
   const currentProxyEnv = collectProxyEnv();
   const configuredProxy = collectConfiguredProxy();
-  const runningProxyEnv = collectRunningProxyEnv();
+  const runningProxyEnv = collectRunningProxyEnv({
+    readPidFn: () => (live ? live.pid : readPid()),
+  });
 
   console.log("\nCurrent doctor process proxy env (presence only)");
   for (const row of currentProxyEnv) {
@@ -729,6 +775,16 @@ export async function runDoctor(args: string[] = []): Promise<void> {
 
   console.log("\nConfigured proxy (value hidden)");
   console.log(`  ${configuredProxy.present ? "set    " : "unset  "} ${configuredProxy.key} (${configuredProxy.source}; ${configuredProxy.detail})`);
+
+  const providerApiKeys = collectProviderApiKeyDiagnostics(doctorConfig.providers);
+  console.log("\nProvider API keys (value hidden)");
+  if (providerApiKeys.length === 0) {
+    console.log("  ok     no empty env-referenced provider keys detected in this process");
+  } else {
+    for (const row of providerApiKeys) {
+      console.log(`  !!     ${row.detail}`);
+    }
+  }
 
   console.log("\nRunning proxy process proxy env (presence only)");
   if (runningProxyEnv.status === "not_running") {
@@ -742,21 +798,14 @@ export async function runDoctor(args: string[] = []): Promise<void> {
     }
   }
 
-  // #314: service-process memory/runtime identity via the authed management
-  // endpoint. readPid() FIRST (liveness), then the pid-scoped runtime record —
-  // readRuntimePort alone can serve a stale file pointing at a foreign port.
-  // Hoisted out of the block below: the Hints section reuses the same liveness pair
-  // for the proxy-down restart hint.
-  const livePid = readPid();
-  const liveRuntime = livePid ? readRuntimePort(livePid) : null;
   console.log("\nMemory / runtime");
   {
     const runtime = liveRuntime;
-    if (!runtime) {
+    if (!runtime || !live) {
       console.log(`  --     doctor process Bun ${Bun.version} (this is NOT the service process)`);
       console.log("  --     no running ocx proxy found (no live pid/runtime record)");
     } else {
-      const token = process.env.OPENCODEX_API_AUTH_TOKEN ?? loadServiceTokenFromFile(process.env);
+      const token = configuredAdminToken();
       const report = await fetchServiceMemory(gracefulStopHost(runtime.hostname), runtime.port, token);
       for (const line of formatServiceMemoryLines(report)) console.log(line);
     }
@@ -815,11 +864,14 @@ export async function runDoctor(args: string[] = []): Promise<void> {
   // Hints, not fixes.
   const hints: string[] = [];
   const proxyDown = proxyDownRestartHint({
-    proxyRunning: Boolean(livePid && liveRuntime),
-    port: doctorConfig.port ?? 10100,
+    proxyRunning: Boolean(live),
+    port: live?.port ?? doctorConfig.port ?? 10100,
     serviceViable: startup.serviceViable,
   });
   if (proxyDown) hints.push(proxyDown);
+  for (const row of providerApiKeys) {
+    hints.push(`${row.detail}. Set ${row.envName} in the shell that starts the proxy, or store a literal key in config (value hidden here).`);
+  }
   const anyDrvfs = paths.some(p => detectFsType(p.path, mounts).isDrvfs || detectFsType(p.path, mounts).isMntDrive);
   const noProxy = currentProxyEnv.every(p => !p.present) && !configuredProxy.present;
   if (!startup.rebootSafe) {

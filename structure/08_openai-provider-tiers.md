@@ -3,7 +3,7 @@
 This current contract supersedes the provider-identity and account-selection sections of
 `devlog/_fin/260717_openai_hardening`; that archived unit remains historical evidence for the
 earlier three-tier implementation. The replacement contract and its verification evidence live in
-`devlog/_plan/260717_openai_single_provider_option` until that unit is archived.
+`devlog/_fin/260717_openai_single_provider_option`.
 
 ## Public provider contract
 
@@ -17,6 +17,18 @@ and mode-less configs. It runs the main-plus-added affinity, quota, cooldown, he
 engine. Direct short-circuits that engine before pool state is read or mutated and uses only the
 current caller/main-login bearer. Neither mode may fall through to `openai-apikey`, and the API
 provider may not fall through to Codex-login credentials.
+
+An explicit `Retry-After` or an unclassified quota 429 is account-wide. A reset-derived native-model
+429 is advisory and remains within its confirmed quota group: `gpt-5.3-codex-spark` is separate from
+the shared native group (including GPT-5.6 Terra/Luna). This allows a same-account combo to test an
+independent quota without allowing fallbacks that share the exhausted quota.
+
+`pausedCodexAccountIds` is a persisted Pool eligibility boundary. A paused added account or the
+stable `__main__` alias remains visible for maintenance and quota reads, but is excluded from new
+affinity, quota rotation, cooldown probes, transient failover, and manual activation. In-flight
+requests keep their captured credential. An all-paused pool fails closed.
+The dashboard's bulk pause action refreshes all account quotas and mutates only accounts whose
+plan-relevant window is freshly confirmed at exactly 100%; unknown and failed refreshes are skipped.
 
 ```text
 gpt-5.6-sol                         # openai; Pool or Direct follows the provider option
@@ -44,8 +56,14 @@ cp ~/.opencodex/config.json.pre-openai-tiers-v2.bak ~/.opencodex/config.json
 ```
 
 The historical v1 backup is never overwritten. Restoring the v2 backup intentionally restores the
-shipped v1 shape; the next startup re-migrates to the same marker-2 bytes. A differing pre-existing
-v2 backup blocks migration before save.
+shipped v1 shape; the next startup re-migrates to the same marker-2 bytes.
+
+A pre-existing snapshot that differs from the current config is classified before anything is written
+(`src/config.ts` `classifyOpenAiTierBackup`): a snapshot that parses as a valid pre-migration (v1)
+config is a user-intentional rollback point and blocks migration; a snapshot that is unparseable or
+already tier-v2 is stale and is replaced with a warning. The distinction matters because silently
+discarding a rollback point is destructive, while preserving a stale one would block every later
+migration.
 
 ## Model and wire identity
 
@@ -58,6 +76,19 @@ v2 backup blocks migration before save.
 - `*-pro` selected ids rewrite to the base wire id with `reasoning.mode: "pro"`; request logs,
   usage, model visibility, subagent state, and injection state retain the selected virtual id.
 - Compact preserves provider/selected identity but sends the base model without a reasoning object.
+
+## Account identity and store concurrency
+
+Pool mode needs stable public names and a store that survives concurrent refresh:
+
+- Public selectors are generated per account; the main login's selector is `main`, collision-suffixed
+  if that name is taken, and it maps to the config-only sentinel `@main`, which sits outside the
+  pool-account id grammar (`src/codex/account-namespaces.ts`, `src/codex/account-namespace-match.ts`).
+  Selectors must not collide with provider or combo ids. A user alias is display metadata; routing
+  consults credential identity, never the alias.
+- The credential store is generation-guarded and refresh-locked (`src/codex/account-store.ts`): a
+  refresh persists only if the generation it started from still holds, and a lost race raises a
+  generation-conflict error instead of overwriting the newer credential.
 
 ## Sidecars, management, and UI
 

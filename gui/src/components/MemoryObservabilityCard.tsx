@@ -1,15 +1,14 @@
 import { useEffect, useState } from "react";
 import { formatUptime } from "../formatUptime";
 import { IconActivity } from "../icons";
-import { useI18n, type Locale } from "../i18n/shared";
+import { useI18n, type Locale, type TFn } from "../i18n/shared";
+import { createBoundedFetch, type BoundedFetch } from "../bounded-fetch";
 
 /**
- * Read-only Memory observability card. Polls GET /api/system/memory (the #314 WP3
- * service-process introspection surface) every 5s and renders scalar diagnostics
- * only: no sliders, no restart toggle, no PUT. Observed memory is the largest
- * of RSS, external, and ArrayBuffers so Windows working-set trimming does not
- * hide committed retention; a rising continuation-store total under rising
- * observed memory points at conversation retention.
+ * Memory observability card. Polls GET /api/system/memory (#314 WP3) every 5s
+ * and renders scalar diagnostics. Also hosts the confirm-gated Drain & restart
+ * action (#563): longer 60s drain, then respawn via ensure/service — not the
+ * short /api/stop teardown path.
  */
 
 interface MemorySample {
@@ -33,6 +32,7 @@ interface ResponseState {
 }
 
 interface SystemMemory {
+  pid?: number;
   rss: number;
   heapUsed: number;
   heapTotal: number;
@@ -43,8 +43,13 @@ interface SystemMemory {
   jscHeap: { heapSize: number; heapCapacity: number; objectCount: number } | null;
   /** Absent on older proxies whose /api/system/memory predates the continuation-store metrics. */
   responseState?: ResponseState;
+  /** Absent on older proxies predating the drain-and-restart action (#563). */
+  activeTurnCount?: number;
+  isDraining?: boolean;
   watchdog: { warnThresholdBytes: number; lastWarnAt: number | null; observedBytes?: number; observedMetric?: MemoryMetric; samples: MemorySample[] } | null;
 }
+
+type RestartPhase = "idle" | "draining" | "reconnecting" | "error";
 
 /**
  * Render a byte count with a binary-scaled unit; non-finite/zero inputs render as "0 B".
@@ -118,55 +123,146 @@ function observedGrowthPerHour(samples: MemorySample[]): number | null {
 }
 
 /** One labelled monospace metric cell inside a stat-row. */
-function Stat({ label, value }: { label: string; value: string }) {
+function Stat({ label, value, sub, tone }: { label: string; value: string; sub?: string; tone?: "warn" | "danger" }) {
   return (
     <div className="stat">
       <div className="label">{label}</div>
-      <div className="value mono">{value}</div>
+      <div className={`value mono${tone ? ` value--${tone}` : ""}`}>{value}</div>
+      {sub && <div className="stat-sub mono">{sub}</div>}
     </div>
   );
 }
+
+/**
+ * Headline pressure gauge: observed memory against the watchdog warn threshold.
+ * The scalar cells below answer "what is allocated"; this answers "is that a
+ * problem", which is the only question a glance at this panel should need.
+ */
+function MemoryPressure({
+  observedBytes,
+  thresholdBytes,
+  metric,
+  locale,
+  t,
+}: {
+  observedBytes: number | null;
+  thresholdBytes: number | null;
+  metric: MemoryMetric | null;
+  locale: Locale;
+  t: TFn;
+}) {
+  const ratio =
+    observedBytes !== null && thresholdBytes !== null && thresholdBytes > 0
+      ? observedBytes / thresholdBytes
+      : null;
+  // Warn before the watchdog fires, not at the same instant: 75% is the point
+  // where a still-climbing process is worth looking at.
+  const tone = ratio === null ? "unknown" : ratio >= 1 ? "over" : ratio >= 0.75 ? "warn" : "ok";
+  const pct = ratio === null ? null : Math.round(ratio * 100);
+  return (
+    <div className={`mem-pressure mem-pressure--${tone}`}>
+      <div className="mem-pressure-head">
+        <span className="mem-pressure-label">
+          {t("dash.mem.pressure")}
+          {metric ? <span className="mem-pressure-metric mono">{metric}</span> : null}
+        </span>
+        <span className="mem-pressure-figure mono">
+          {observedBytes === null ? "—" : formatBytes(observedBytes, locale)}
+          {thresholdBytes !== null && (
+            <span className="mem-pressure-limit">
+              {" / "}
+              {formatBytes(thresholdBytes, locale)}
+            </span>
+          )}
+        </span>
+      </div>
+      <div className="mem-pressure-track" role="presentation">
+        <span
+          className="mem-pressure-fill"
+          style={{ ["--mem-scale" as string]: String(ratio === null ? 0 : Math.min(1, Math.max(0.01, ratio))) }}
+        />
+      </div>
+      <div className="mem-pressure-foot">
+        {pct === null ? t("dash.mem.pressureUnknown") : t("dash.mem.pressureOf", { pct })}
+      </div>
+    </div>
+  );
+}
+
+const DRAIN_TIMEOUT_S = 60;
+const RECONNECT_POLL_MS = 1500;
+const RECONNECT_GIVE_UP_MS = 120_000;
 
 export default function MemoryObservabilityCard({ apiBase }: { apiBase: string }) {
   const { locale, t } = useI18n();
   const [data, setData] = useState<SystemMemory | null>(null);
   const [unavailable, setUnavailable] = useState(false);
+  const [restartPhase, setRestartPhase] = useState<RestartPhase>("idle");
+  const [restartError, setRestartError] = useState<string | null>(null);
+  const [noSupervisor, setNoSupervisor] = useState(false);
+  const [supportsRestart, setSupportsRestart] = useState(false);
+  const [restartFromPid, setRestartFromPid] = useState<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch(`${apiBase}/api/startup-health`);
+        if (!res.ok || cancelled) return;
+        const json = await res.json() as { protection?: string };
+        if (!cancelled) setNoSupervisor(json.protection === "none");
+      } catch {
+        /* older proxies / offline — leave warning off */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [apiBase]);
 
   useEffect(() => {
     let cancelled = false;
     let inFlight = false;
-    let activeController: AbortController | null = null;
+    let active: BoundedFetch | null = null;
     const fetchMemory = async () => {
       // Serialize polls: a stalled request must not stack up or let an older
       // payload land after a newer one.
       if (inFlight) return;
       inFlight = true;
-      // Bound each poll so a hung request cannot pin inFlight forever and
-      // starve the unavailable fallback. Prefer AbortSignal.timeout; fall back
-      // to a manual timer when the browser lacks AbortSignal.any/timeout.
-      const controller = new AbortController();
-      activeController = controller;
-      let timeoutId: ReturnType<typeof setTimeout> | undefined;
-      const signal = typeof AbortSignal !== "undefined" && "any" in AbortSignal && "timeout" in AbortSignal
-        ? AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)])
-        : (() => {
-          timeoutId = setTimeout(() => controller.abort(), 10_000);
-          return controller.signal;
-        })();
+      // Bound each poll so a hung request cannot pin inFlight forever.
+      const bounded = createBoundedFetch(10_000);
+      active = bounded;
       try {
-        const res = await fetch(`${apiBase}/api/system/memory`, { signal });
+        const res = await fetch(`${apiBase}/api/system/memory`, { signal: bounded.signal });
         if (!res.ok) throw new Error("memory unavailable");
         const json = await res.json() as SystemMemory;
-        if (!cancelled) {
-          setData(json);
-          setUnavailable(false);
+        if (cancelled) return;
+        setData(json);
+        setUnavailable(false);
+        setSupportsRestart(typeof json.activeTurnCount === "number");
+        if (json.isDraining && restartPhase === "idle") setRestartPhase("draining");
+        // Fast recycle can finish between polls with no observed outage — detect pid change.
+        if (
+          (restartPhase === "draining" || restartPhase === "reconnecting")
+          && restartFromPid != null
+          && typeof json.pid === "number"
+          && json.pid !== restartFromPid
+          && !json.isDraining
+        ) {
+          setRestartPhase("idle");
+          setRestartFromPid(null);
+          setRestartError(null);
         }
       } catch {
         // Old servers (pre-#314) 404 this route; degrade to a quiet unavailable note.
-        if (!cancelled) setUnavailable(true);
+        // During drain/restart the proxy goes away — switch to reconnect polling.
+        if (cancelled) return;
+        if (restartPhase === "draining" || restartPhase === "reconnecting") {
+          setRestartPhase("reconnecting");
+        } else {
+          setUnavailable(true);
+        }
       } finally {
-        if (timeoutId !== undefined) clearTimeout(timeoutId);
-        if (activeController === controller) activeController = null;
+        bounded.clear();
+        if (active === bounded) active = null;
         inFlight = false;
       }
     };
@@ -174,12 +270,101 @@ export default function MemoryObservabilityCard({ apiBase }: { apiBase: string }
     const interval = setInterval(() => void fetchMemory(), 5000);
     return () => {
       cancelled = true;
-      activeController?.abort();
+      active?.controller.abort();
+      active?.clear();
       clearInterval(interval);
     };
-  }, [apiBase]);
+  }, [apiBase, restartPhase, restartFromPid]);
 
-  if (unavailable && !data) {
+  useEffect(() => {
+    if (restartPhase !== "reconnecting") return;
+    let cancelled = false;
+    let inFlight = false;
+    let active: BoundedFetch | null = null;
+    const started = Date.now();
+    const tick = () => {
+      if (inFlight || cancelled) return;
+      inFlight = true;
+      const bounded = createBoundedFetch(5_000);
+      active = bounded;
+      void fetch(`${apiBase}/healthz`, { cache: "no-store", signal: bounded.signal })
+        .then(async (res) => {
+          if (cancelled) return;
+          if (!res.ok) {
+            if (Date.now() - started >= RECONNECT_GIVE_UP_MS) {
+              setRestartPhase("error");
+              setRestartError(t("dash.mem.restartFailed"));
+            }
+            return;
+          }
+          let replaced = restartFromPid == null;
+          if (restartFromPid != null) {
+            try {
+              const health = await res.json() as { pid?: number };
+              replaced = typeof health.pid === "number" && health.pid !== restartFromPid;
+            } catch {
+              replaced = true;
+            }
+          }
+          if (cancelled) return;
+          if (replaced) {
+            setRestartPhase("idle");
+            setRestartFromPid(null);
+            setRestartError(null);
+            return;
+          }
+          if (Date.now() - started >= RECONNECT_GIVE_UP_MS) {
+            setRestartPhase("error");
+            setRestartError(t("dash.mem.restartFailed"));
+          }
+        })
+        .catch(() => {
+          if (cancelled) return;
+          if (Date.now() - started >= RECONNECT_GIVE_UP_MS) {
+            setRestartPhase("error");
+            setRestartError(t("dash.mem.restartFailed"));
+          }
+        })
+        .finally(() => {
+          bounded.clear();
+          if (active === bounded) active = null;
+          inFlight = false;
+        });
+    };
+    tick();
+    const interval = setInterval(tick, RECONNECT_POLL_MS);
+    return () => {
+      cancelled = true;
+      active?.controller.abort();
+      active?.clear();
+      clearInterval(interval);
+    };
+  }, [apiBase, restartPhase, restartFromPid, t]);
+
+  const confirmRestart = () => {
+    const count = data?.activeTurnCount ?? 0;
+    const lines = [
+      t("dash.mem.restartConfirm", { count, seconds: DRAIN_TIMEOUT_S }),
+    ];
+    if (noSupervisor) lines.push(t("dash.mem.restartNoSupervisor"));
+    if (!window.confirm(lines.join("\n\n"))) return;
+    void (async () => {
+      setRestartError(null);
+      setRestartFromPid(typeof data?.pid === "number" ? data.pid : null);
+      setRestartPhase("draining");
+      try {
+        const res = await fetch(`${apiBase}/api/system/restart`, { method: "POST" });
+        if (!res.ok) throw new Error("restart_failed");
+        // Proxy will drain then exit; memory poll will trip reconnecting or pid change.
+      } catch {
+        setRestartPhase("error");
+        setRestartFromPid(null);
+        setRestartError(t("dash.mem.restartFailed"));
+      }
+    })();
+  };
+
+  if (unavailable && !data && restartPhase === "idle") {
     return (
       <div className="panel" style={{ marginBottom: 24 }}>
         <div className="font-semibold" style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -194,23 +379,76 @@ export default function MemoryObservabilityCard({ apiBase }: { apiBase: string }
   const growth = data?.watchdog ? observedGrowthPerHour(data.watchdog.samples) : null;
   const observedBytes = data ? data.observedBytes ?? data.watchdog?.observedBytes ?? observedMemory(data) : null;
   const observedBy = data ? observedMetric(data) : null;
+  // Drift only matters relative to the headroom it eats. Flag it when the current
+  // climb would reach the warn threshold within an hour (danger) or a shift (warn);
+  // a flat or falling process stays neutral no matter how large it already is.
+  const growthTone = ((): "warn" | "danger" | undefined => {
+    const threshold = data?.watchdog?.warnThresholdBytes;
+    if (growth === null || growth <= 0 || observedBytes === null || !threshold) return undefined;
+    const headroom = threshold - observedBytes;
+    if (headroom <= 0) return "danger";
+    const hoursLeft = headroom / growth;
+    if (hoursLeft <= 1) return "danger";
+    if (hoursLeft <= 8) return "warn";
+    return undefined;
+  })();
   // Optional on purpose: a 200 from an older proxy may lack the responseState field.
   const responseState = data?.responseState;
+  const activeTurns = data?.activeTurnCount;
+  const busy = restartPhase === "draining" || restartPhase === "reconnecting";
 
   return (
     <div className="panel" style={{ marginBottom: 24 }}>
-      <div className="font-semibold" style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
-        <IconActivity width={16} height={16} aria-hidden="true" />
-        {t("dash.mem.title")}
+      {/* Title row carries the in-flight count and the restart action: as its own
+          block below the stats it cost ~87px of near-empty panel height. */}
+      <div className="mem-head">
+        <div className="font-semibold mem-head-title">
+          <IconActivity width={16} height={16} aria-hidden="true" />
+          {t("dash.mem.title")}
+        </div>
+        {supportsRestart && (
+          <div className="mem-head-actions">
+            <span className="mem-inflight">
+              <span className="mem-inflight-label">{t("dash.mem.inFlight")}</span>
+              <span className="mem-inflight-value mono">
+                {typeof activeTurns === "number" ? plainNumberFormat(locale).format(activeTurns) : "—"}
+              </span>
+            </span>
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              disabled={busy}
+              onClick={confirmRestart}
+            >
+              {t("dash.mem.restart")}
+            </button>
+          </div>
+        )}
       </div>
 
-      <div className="stat-row">
+      <MemoryPressure
+        observedBytes={observedBytes}
+        thresholdBytes={data?.watchdog?.warnThresholdBytes ?? null}
+        metric={observedBy}
+        locale={locale}
+        t={t}
+      />
+
+      <div className="stat-row mem-stats">
         <Stat label={t("dash.mem.rss")} value={data ? formatBytes(data.rss, locale) : "—"} />
-        <Stat label={t("dash.mem.jsHeap")} value={data ? `${formatBytes(data.heapUsed, locale)} / ${formatBytes(data.heapTotal, locale)}` : "—"} />
+        {/* heapUsed can exceed heapTotal on Bun (external buffers are counted in
+            used but not in the JS-object arena), so a "used / total" label reads
+            as a contradiction. Show the live figure and demote the arena size. */}
+        <Stat
+          label={t("dash.mem.jsHeap")}
+          value={data ? formatBytes(data.heapUsed, locale) : "—"}
+          sub={data ? t("dash.mem.jsHeapArena", { total: formatBytes(data.heapTotal, locale) }) : undefined}
+        />
         <Stat label={t("dash.mem.jscHeap")} value={data?.jscHeap ? formatBytes(data.jscHeap.heapSize, locale) : "—"} />
         <Stat
           label={t("dash.mem.growth")}
-          value={growth === null ? "—" : `${growth >= 0 ? "+" : "-"}${formatBytes(Math.abs(growth), locale)}${t("dash.mem.perHour")}`}
+          value={growth === null ? "—" : `${growth >= 0 ? "+" : "−"}${formatBytes(Math.abs(growth), locale)}${t("dash.mem.perHour")}`}
+          tone={growthTone}
         />
       </div>
 
@@ -249,6 +487,27 @@ export default function MemoryObservabilityCard({ apiBase }: { apiBase: string }
           </div>
         )}
       </details>
+
+      {/* Status line only: it stays out of the layout entirely while idle so the
+          panel does not reserve a row for a message that is usually absent. */}
+      {supportsRestart && (
+        <div className="mem-status" aria-live="polite">
+          {restartPhase === "draining" && (
+            <span className="muted text-control">
+              {t("dash.mem.draining", { count: typeof activeTurns === "number" ? activeTurns : 0 })}
+            </span>
+          )}
+          {restartPhase === "reconnecting" && (
+            <span className="muted text-control">{t("dash.mem.reconnecting")}</span>
+          )}
+          {restartPhase === "error" && restartError && (
+            <span className="text-control" style={{ color: "var(--danger, #c44)" }}>{restartError}</span>
+          )}
+          {noSupervisor && restartPhase === "idle" && (
+            <span className="muted text-control">{t("dash.mem.restartNoSupervisor")}</span>
+          )}
+        </div>
+      )}
     </div>
   );
 }

@@ -6,15 +6,27 @@ import { hashLogConversationQuery, matchesLogConversationId } from "../log-conve
 import { statusCodeInfo } from "../status-codes";
 import { IconX } from "../icons";
 import { modelLabel } from "../model-display";
+import { readSessionListCache, writeSessionListCache } from "../session-list-cache";
+import { useDataSurface } from "../data-surface";
+import { DataSurfaceSkeleton, DataSurfaceStatus } from "../components/data-surface";
 import { EmptyState, Notice } from "../ui";
 import Debug from "./Debug";
 
 import type { LogsTab } from "./logs-tab-keydown";
 import { logsTabKeyDown, readTabFromHash, selectLogsTab } from "./logs-tab-keydown";
+import { speedLabel } from "./logs-speed-label";
+import type { LogSurface, LogSurfaceFilter } from "./logs-surface-filter";
+import { logMatchesSurface } from "./logs-surface-filter";
+
+function logsCacheKey(apiBase: string): string {
+  return `ocx.logs.list.v1:${apiBase}`;
+}
 
 interface UsageBreakdown {
   inputTokens: number;
   outputTokens: number;
+  /** Absolute active-context snapshot after the response (stateful providers such as Kiro). */
+  contextTotalTokens?: number;
   totalTokens?: number;
   cachedInputTokens?: number;
   cacheReadInputTokens?: number;
@@ -93,12 +105,12 @@ interface LogAttempt {
   displayMetrics?: LogDisplayMetrics;
 }
 
-interface LogEntry {
+export interface LogEntry {
   requestId?: string;
   timestamp: number;
   model: string;
   provider: string;
-  surface?: "claude";
+  surface?: LogSurface;
   conversationId?: string;
   requestedEffort?: string;
   effectiveEffort?: string;
@@ -136,6 +148,9 @@ function tokensTitle(log: LogEntry, t: TFn): string | undefined {
   ];
   if (split.read !== undefined) parts.push(`${t("logs.tokens.cacheRead")}=${split.read}`);
   if (split.write !== undefined) parts.push(`${t("logs.tokens.cacheWrite")}=${split.write}`);
+  if (typeof log.usage.contextTotalTokens === "number") {
+    parts.push(`${t("logs.tokens.contextTotal")}=${log.usage.contextTotalTokens}`);
+  }
   if (typeof log.usage.reasoningOutputTokens === "number") parts.push(`${t("logs.tokens.reasoning")}=${log.usage.reasoningOutputTokens}`);
   if (log.usageStatus === "estimated") parts.push(t("logs.tokens.estimatedNote"));
   if (log.usageStatus === "estimated" && split.read === undefined && split.write === undefined) {
@@ -153,6 +168,23 @@ function displayTokenTotal(log: LogEntry): number | undefined {
   return typeof explicitTotal === "number" ? Math.max(explicitTotal, baseTotal) : baseTotal;
 }
 
+/**
+ * Row/detail display total that also honors an absolute context checkpoint.
+ *
+ * Stateful providers (Kiro) report per-attempt usage only, so their per-request total stays
+ * small while the real active context grows. `contextTotalTokens` is that absolute snapshot.
+ *
+ * NEVER SUM THIS ACROSS REQUESTS. A checkpoint is not a per-request delta: adding it up over
+ * a conversation counts the same context once per request and inflates aggregates wildly.
+ * Aggregate rollups must keep using `displayTokenTotal`.
+ */
+function displayContextTokenTotal(log: LogEntry): number | undefined {
+  const base = displayTokenTotal(log);
+  const contextTotal = log.usage?.contextTotalTokens;
+  if (typeof contextTotal !== "number") return base;
+  return Math.max(base ?? 0, contextTotal) || undefined;
+}
+
 /** Cache read/write split; recovers reads from legacy rows that stored read+write combined. */
 function cacheSplit(log: LogEntry): { read?: number; write?: number } {
   const u = log.usage;
@@ -164,12 +196,6 @@ function cacheSplit(log: LogEntry): { read?: number; write?: number } {
       ? Math.max(0, u.cachedInputTokens - write)
       : u.cachedInputTokens;
   return { read, write };
-}
-
-function speedLabel(log: LogEntry): string | undefined {
-  if (log.requestedSpeedLabel) return log.requestedSpeedLabel;
-  if (log.modelSupportsServiceTier && log.configuredSpeedLabel) return log.configuredSpeedLabel;
-  return undefined;
 }
 
 interface ReasoningLogFields {
@@ -220,6 +246,9 @@ function formatEstimatedUsdValue(value: number, localeTag?: string): string {
     maximumFractionDigits: 4,
   }).format(value)}`;
 }
+
+/** Consecutive failed polls before a stale table is called out. Two seconds each, so ~6s. */
+const STALE_POLL_FAILURE_LIMIT = 3;
 
 const METRIC_REASON_KEYS = {
   usage_missing: "logs.detail.reason.usage_missing",
@@ -295,8 +324,9 @@ function summarizeFilteredLogs(entries: LogEntry[]): {
       continue;
     }
     const cost = entry.displayMetrics?.cost;
-    if (cost?.kind === "value" && Number.isFinite(cost.estimate.cost.total) && cost.estimate.cost.total >= 0) {
-      estimatedCostUsd += cost.estimate.cost.total;
+    const total = cost?.kind === "value" ? cost.estimate.cost.total : undefined;
+    if (total !== undefined && Number.isFinite(total) && total >= 0) {
+      estimatedCostUsd += total;
       continue;
     }
     unpricedRequests += 1;
@@ -306,12 +336,10 @@ function summarizeFilteredLogs(entries: LogEntry[]): {
 
 export default function Logs({ apiBase }: { apiBase: string }) {
   const { t, locale } = useI18n();
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const cachedLogs = readSessionListCache<LogEntry[]>(logsCacheKey(apiBase));
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [detail, setDetail] = useState<LogEntry | null>(null);
-  const [surfaceFilter, setSurfaceFilter] = useState<"all" | "claude" | "codex">("all");
+  const [surfaceFilter, setSurfaceFilter] = useState<LogSurfaceFilter>("all");
   const [conversationFilter, setConversationFilter] = useState("");
   const [conversationQueryHash, setConversationQueryHash] = useState<string | undefined>();
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -319,6 +347,9 @@ export default function Logs({ apiBase }: { apiBase: string }) {
   // The hash is the source of truth for the active tab (#logs vs #logs/debug),
   // so refresh/bookmark/back-forward keep the tab choice.
   const [tab, setTab] = useState<LogsTab>(readTabFromHash);
+  // Lazy-mount Debug on first visit, then keep it mounted so switch toggles
+  // and Logs↔Debug hops do not remount (avoids settings/log refetch storms).
+  const [debugMounted, setDebugMounted] = useState(() => readTabFromHash() === "debug");
 
   useEffect(() => {
     const onHash = () => setTab(readTabFromHash());
@@ -326,34 +357,55 @@ export default function Logs({ apiBase }: { apiBase: string }) {
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
+  useEffect(() => {
+    if (tab === "debug") setDebugMounted(true);
+  }, [tab]);
+
   const selectTab = selectLogsTab;
 
-  const fetchLogs = useCallback(async (opts?: { silent?: boolean }) => {
-    const silent = opts?.silent === true;
-    // Silent polls must not clear an existing error or toggle loading — otherwise
-    // failures flicker between the error banner, empty state, and stale table.
-    if (!silent) setLoading(true);
-    try {
-      const res = await fetch(`${apiBase}/api/logs`);
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`.trim());
-      setLogs(await res.json());
-      setError(null);
-    } catch (cause) {
-      if (silent) return;
-      const detail = cause instanceof Error ? cause.message : "";
-      setError(detail ? `${t("logs.loadError")} ${detail}` : t("logs.loadError"));
-    } finally {
-      if (!silent) setLoading(false);
-    }
-  }, [apiBase, t]);
+  const loadLogs = useCallback(async (signal: AbortSignal): Promise<LogEntry[]> => {
+    const res = await fetch(`${apiBase}/api/logs`, { signal });
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`.trim());
+    const next = await res.json() as LogEntry[];
+    writeSessionListCache(logsCacheKey(apiBase), next);
+    return next;
+  }, [apiBase]);
 
-  useEffect(() => {
-    if (tab !== "logs") return;
-    void fetchLogs();
-    if (!autoRefresh) return;
-    const interval = setInterval(() => void fetchLogs({ silent: true }), 2000);
-    return () => clearInterval(interval);
-  }, [autoRefresh, fetchLogs, tab]);
+  // The resource layer owns the request and the 2s poll. It keeps held rows through a quiet
+  // poll on its own, which is what the old silent/non-silent split was hand-rolling — and an
+  // empty successful response is now a real empty result rather than a cold load.
+  const logsResource = useDataSurface<LogEntry[]>(
+    logsCacheKey(apiBase),
+    [apiBase],
+    loadLogs,
+    {
+      isEmpty: rows => rows.length === 0,
+      enabled: tab === "logs",
+      pollMs: autoRefresh ? 2000 : undefined,
+    },
+  );
+  const logsState = logsResource.state;
+  const logs = logsState.data ?? cachedLogs ?? [];
+  const fetchLogs = logsResource.refresh;
+
+  // A single failed tick on a two-second poll is noise, but an outage that never recovers must not
+  // leave the user reading stale rows as if they were current. Count consecutive failures and speak
+  // up once it is clearly not transient.
+  const settledFailure = !logsResource.refreshing && logsState.showError;
+  const settledSuccess = !logsResource.refreshing && !logsState.showError && logsState.data !== undefined;
+  // Derived from the settlement itself, so there is no second copy of this state to keep
+  // in sync and no frame painted with a stale banner. `streak` counts CONSECUTIVE failed
+  // settlements: it is stored keyed by the error identity that produced it, so repeated
+  // renders of the same failure do not inflate the count and a success clears it.
+  const [failureStreak, setFailureStreak] = useState<{ error: unknown; count: number }>(
+    { error: null, count: 0 },
+  );
+  if (settledSuccess && failureStreak.count !== 0) {
+    setFailureStreak({ error: null, count: 0 });
+  } else if (settledFailure && failureStreak.error !== logsState.error) {
+    setFailureStreak(previous => ({ error: logsState.error, count: previous.count + 1 }));
+  }
+  const pollFailing = failureStreak.count >= STALE_POLL_FAILURE_LIMIT;
 
   const detailInfo = detail ? statusCodeInfo(detail.status, locale) : null;
   const conversationQuery = conversationFilter.trim();
@@ -371,8 +423,7 @@ export default function Logs({ apiBase }: { apiBase: string }) {
   }, [conversationQuery]);
 
   const filteredLogs = logs.filter(log => (
-    (surfaceFilter === "all"
-      || (surfaceFilter === "claude" ? log.surface === "claude" : log.surface !== "claude"))
+    logMatchesSurface(log, surfaceFilter)
     && (!conversationQuery || matchesLogConversationId(log.conversationId, conversationQuery, conversationQueryHash))
   ));
   const conversationTotals = conversationQuery ? summarizeFilteredLogs(filteredLogs) : null;
@@ -396,7 +447,7 @@ export default function Logs({ apiBase }: { apiBase: string }) {
       <div className="page-head">
         <h2>{t("nav.logs")}</h2>
         {tab === "logs" && (
-          <label className="muted text-control" style={{ cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6 }}>
+          <label className="muted text-control logs-auto-refresh">
             <input type="checkbox" checked={autoRefresh} onChange={e => setAutoRefresh(e.target.checked)} />
             {t("logs.autoRefresh")}
           </label>
@@ -431,34 +482,43 @@ export default function Logs({ apiBase }: { apiBase: string }) {
         </button>
       </div>
 
-      {tab === "debug" && (
-        <div role="tabpanel" id="logs-panel-debug" aria-labelledby="logs-tab-debug">
-          <Debug apiBase={apiBase} embedded />
+      {debugMounted && (
+        <div
+          role="tabpanel"
+          id="logs-panel-debug"
+          aria-labelledby="logs-tab-debug"
+          hidden={tab !== "debug"}
+        >
+          <Debug apiBase={apiBase} embedded active={tab === "debug"} />
         </div>
       )}
 
-      {tab === "logs" && (
-      <div role="tabpanel" id="logs-panel-logs" aria-labelledby="logs-tab-logs">
+      <div
+        role="tabpanel"
+        id="logs-panel-logs"
+        aria-labelledby="logs-tab-logs"
+        hidden={tab !== "logs"}
+      >
       <p className="page-sub">{t("logs.subtitle")}</p>
 
-      <div className="row" style={{ gap: 8, marginBottom: 12, alignItems: "center", flexWrap: "wrap" }}>
+      <div className="logs-toolbar">
         <span className="muted text-control">{t("logs.filter.surface.label")}</span>
-        <div className="segmented" role="radiogroup" aria-label={t("logs.filter.surface.label")} style={{ display: "inline-flex", borderRadius: "var(--radius-pill)", background: "var(--surface-soft, var(--raised))", padding: 3, gap: 2 }}>
-          {(["all", "claude", "codex"] as const).map(surface => (
+        <div className="segmented logs-segmented" role="radiogroup" aria-label={t("logs.filter.surface.label")}>
+          {(["all", "claude", "codex", "grok"] as const).map(surface => (
             <button
               key={surface}
               type="button"
               role="radio"
               aria-checked={surfaceFilter === surface}
               className={`btn btn-sm${surfaceFilter === surface ? " btn-primary" : " btn-ghost"}`}
-              style={{ borderRadius: "var(--radius-pill)", minWidth: 64, padding: "5px 12px", border: "none", background: surfaceFilter === surface ? undefined : "transparent", color: surfaceFilter === surface ? undefined : "var(--muted)" }}
+              style={{ background: surfaceFilter === surface ? undefined : "transparent", color: surfaceFilter === surface ? undefined : "var(--muted)" }}
               onClick={() => setSurfaceFilter(surface)}
             >
               {t(`logs.filter.surface.${surface}`)}
             </button>
           ))}
         </div>
-        <label className="muted text-control" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+        <label className="muted text-control logs-filter-field">
           {t("logs.filter.conversation.label")}
           <input
             type="search"
@@ -467,7 +527,6 @@ export default function Logs({ apiBase }: { apiBase: string }) {
             onChange={e => setConversationFilter(e.target.value)}
             placeholder={t("logs.filter.conversation.placeholder")}
             aria-label={t("logs.filter.conversation.label")}
-            style={{ minWidth: 220, maxWidth: 360 }}
           />
         </label>
         {conversationQuery && (
@@ -478,7 +537,7 @@ export default function Logs({ apiBase }: { apiBase: string }) {
       </div>
 
       {conversationTotals && (
-        <div style={{ marginBottom: 12 }}>
+        <div className="logs-conversation-totals">
           <Notice tone="ok">
             {t("logs.conversation.totals", {
               requests: conversationTotals.requests,
@@ -499,22 +558,48 @@ export default function Logs({ apiBase }: { apiBase: string }) {
         </div>
       )}
 
-      {error ? (
+      {/*
+        Only a cold failure or a user-initiated retry surfaces here. This tab polls every two
+        seconds, so a transient 5xx would otherwise flash the banner on and off under a table
+        that is still perfectly readable — noise, not information. A quiet poll failure keeps the
+        held rows and waits for the next tick, which is the behaviour the auto-refresh tests pin.
+      */}
+      {logsState.kind === "failed-cold" && (
         <Notice tone="err">
-          {error}{" "}
-          <button type="button" className="btn btn-ghost btn-sm" onClick={() => void fetchLogs()} disabled={loading}>
+          {logsState.error instanceof Error ? `${t("logs.loadError")} ${logsState.error.message}` : t("logs.loadError")}{" "}
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => fetchLogs({ forceLoading: true })} disabled={logsState.refreshing}>
             {t("common.retry")}
           </button>
         </Notice>
-      ) : loading && logs.length === 0 ? (
-        <EmptyState title={t("common.loading")} />
+      )}
+      {/* Progress is reported only for a forced read: a two-second heartbeat that announced
+          itself would talk over the table continuously. */}
+      {logsResource.loading && logs.length > 0 && (
+        <DataSurfaceStatus live={false}>{t("common.loading")}</DataSurfaceStatus>
+      )}
+
+      {/* A run of failed polls is no longer transient: say the rows below are stale rather than
+          letting them read as current. Cleared by the first successful poll. */}
+      {pollFailing && logs.length > 0 && (
+        <Notice tone="err">
+          {t("logs.loadError")}{" "}
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => fetchLogs({ forceLoading: true })} disabled={logsResource.refreshing}>
+            {t("common.retry")}
+          </button>
+        </Notice>
+      )}
+
+      {/* A cold failure must not also render the empty state: "nothing came back" and "there is
+          nothing to show" are different answers, and showing both at once tells the user neither. */}
+      {logsState.kind === "failed-cold" ? null : logsState.showSkeleton && logs.length === 0 ? (
+        <DataSurfaceSkeleton label={t("common.loading")} rows={6} />
       ) : filteredLogs.length === 0 ? (
         <EmptyState title={t("logs.noRequests")} />
       ) : (
         <>
-        <div ref={scrollContainerRef} className="tbl-wrap" style={{ overflowY: "auto", maxHeight: "calc(100vh - 260px)" }}>
+        <div ref={scrollContainerRef} className="tbl-wrap logs-table-wrap">
           <table className="tbl logs-table">
-            <thead style={{ position: "sticky", top: 0, zIndex: 1, background: "var(--surface)" }}>
+            <thead>
              <tr>
                <th>{t("logs.col.time")}</th>
                 <th className="num log-col-tokens">{t("logs.col.tokens")}</th>
@@ -531,7 +616,7 @@ export default function Logs({ apiBase }: { apiBase: string }) {
             <tbody>
               {paddingTop > 0 && (
                 <tr>
-                  <td colSpan={10} style={{ height: paddingTop, padding: 0, border: 0 }} />
+                  <td colSpan={10} className="logs-virtual-spacer" style={{ height: paddingTop }} />
                 </tr>
               )}
               {virtualRows.map(virtualRow => {
@@ -546,11 +631,11 @@ export default function Logs({ apiBase }: { apiBase: string }) {
                  <td className="muted mono">{formatLogTimestamp(log.timestamp, localeTag)}</td>
                   <td className="num mono log-col-tokens" title={tokensTitle(log, t)}>
                     {(() => {
-                      const tokenTotal = displayTokenTotal(log);
+                      const tokenTotal = displayContextTokenTotal(log);
                       const { read, write } = cacheSplit(log);
                       return tokenTotal !== undefined
                         ? (
-                            <span style={{ display: "inline-flex", flexDirection: "column", alignItems: "flex-end", gap: 2 }}>
+                            <span className="logs-stack-end">
                               <span>{log.usageStatus === "estimated" ? "~" : ""}{formatTokens(tokenTotal, locale)}</span>
                               {(read !== undefined && read > 0) && (
                                 <span className="muted text-caption leading-tight">
@@ -579,14 +664,17 @@ export default function Logs({ apiBase }: { apiBase: string }) {
                     {formatEstimatedUsd(log.displayMetrics?.cost, localeTag)}
                   </td>
                  <td className="mono log-col-model" title={modelTitle(log)}>
-                   <span style={{ display: "inline-flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                   <span className="logs-model-cell">
                     <span>{modelLabel(log.resolvedModel ?? log.model)}</span>
-                      {log.surface === "claude" && <span className="badge badge-accent">{t("logs.badge.claude")}</span>}
+                      {(log.surface === "claude" || log.surface === "claude-desktop") && (
+                        <span className="badge badge-accent">{t("logs.badge.claude")}</span>
+                      )}
+                      {log.surface === "grok" && <span className="badge badge-accent">{t("logs.badge.grok")}</span>}
                       {speedLabel(log) && <span className="badge badge-amber">{speedLabel(log)}</span>}
                     </span>
                   </td>
                   <td className="mono log-reasoning-cell" title={reasoningWire}>
-                    <span style={{ display: "inline-flex", flexDirection: "column", alignItems: "flex-start", gap: 2 }}>
+                    <span className="logs-stack-start">
                       <span>{effortLabel(log)}</span>
                       {reasoningWire && <span className="muted text-caption leading-tight">{reasoningWire}</span>}
                     </span>
@@ -612,7 +700,7 @@ export default function Logs({ apiBase }: { apiBase: string }) {
               })}
               {paddingBottom > 0 && (
                 <tr>
-                  <td colSpan={10} style={{ height: paddingBottom, padding: 0, border: 0 }} />
+                  <td colSpan={10} className="logs-virtual-spacer" style={{ height: paddingBottom }} />
                 </tr>
               )}
             </tbody>
@@ -636,7 +724,6 @@ export default function Logs({ apiBase }: { apiBase: string }) {
         />
       )}
       </div>
-      )}
     </>
   );
 }
@@ -691,7 +778,7 @@ function LogDetailDialog({
         <div className="modal-head">
           <h3 id="log-detail-title">
             <span className="mono" style={{ color: statusColor(detail.status) }}>{detail.status}</span>
-            {detailInfo && <span style={{ marginLeft: 8 }}>{detailInfo.label}</span>}
+            {detailInfo && <span className="logs-detail-info">{detailInfo.label}</span>}
           </h3>
           <button type="button" className="btn btn-ghost btn-sm" onClick={onClose} aria-label={t("common.cancel")}><IconX /></button>
         </div>
@@ -850,7 +937,13 @@ function LogDetailDialog({
             <span className="muted">{t("logs.tokens.cacheRead")}</span><span className="mono">{tokenSplit.read !== undefined ? formatTokens(tokenSplit.read, localeCode) : "\u2014"}</span>
             <span className="muted">{t("logs.tokens.cacheWrite")}</span><span className="mono">{tokenSplit.write !== undefined ? formatTokens(tokenSplit.write, localeCode) : "\u2014"}</span>
             <span className="muted">{t("logs.tokens.reasoning")}</span><span className="mono">{detail.usage?.reasoningOutputTokens !== undefined ? formatTokens(detail.usage.reasoningOutputTokens, localeCode) : "\u2014"}</span>
-            <span className="muted">{t("logs.detail.totalTokens")}</span><span className="mono">{displayTokenTotal(detail) !== undefined ? formatTokens(displayTokenTotal(detail)!, localeCode) : "\u2014"}</span>
+            <span className="muted">{t("logs.detail.totalTokens")}</span><span className="mono">{displayContextTokenTotal(detail) !== undefined ? formatTokens(displayContextTokenTotal(detail)!, localeCode) : "\u2014"}</span>
+            {detail.usage?.contextTotalTokens !== undefined && (
+              <>
+                <span className="muted">{t("logs.tokens.contextTotal")}</span>
+                <span className="mono">{formatTokens(detail.usage.contextTotalTokens, localeCode)}</span>
+              </>
+            )}
           </div>
           {detail.usageStatus === "estimated" && (
             <p className="log-detail-notes-line muted">{t("logs.tokens.estimatedNote")}</p>

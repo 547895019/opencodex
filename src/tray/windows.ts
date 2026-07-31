@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { expandUserPath, getConfigDir } from "../config";
 import { durableBunPath } from "../lib/bun-runtime";
 import { hardenSecretDir, hardenSecretPath } from "../lib/windows-secret-acl";
+import { recordOwnedConfigPath } from "../lib/config-ownership";
 
 const RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const RUN_PARENT_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion";
@@ -413,17 +414,43 @@ function assertWindows(): void {
   if (process.platform !== "win32") throw new Error(`The opencodex tray is Windows-only (current platform: ${process.platform}).`);
 }
 
-function spawnTray(state: WindowsTrayEntry): void {
-  const child = spawn(state.bun, [state.cli, "__tray-host"], {
-    detached: true,
+const DETACHED_TRAY_HOST_LAUNCHER = [
+  "$startInfo = New-Object System.Diagnostics.ProcessStartInfo",
+  "$startInfo.FileName = $env:OCX_TRAY_HOST_BUN",
+  "$startInfo.Arguments = $env:OCX_TRAY_HOST_ARGS",
+  "$startInfo.UseShellExecute = $true",
+  "$startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden",
+  "$child = [System.Diagnostics.Process]::Start($startInfo)",
+  "if ($null -eq $child) { throw 'Windows tray host did not start.' }",
+  "$child.Dispose()",
+].join("; ");
+
+const DETACHED_TRAY_HOST_LAUNCHER_B64 = Buffer.from(DETACHED_TRAY_HOST_LAUNCHER, "utf16le").toString("base64");
+
+export function launchWindowsTrayHost(state: WindowsTrayEntry): void {
+  const bun = safePath(state.bun);
+  const cli = safePath(state.cli);
+  execFileSync(windowsPowerShellPath(), [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-EncodedCommand",
+    DETACHED_TRAY_HOST_LAUNCHER_B64,
+  ], {
     stdio: "ignore",
     windowsHide: true,
+    timeout: 15_000,
     env: {
       ...process.env,
+      OCX_TRAY_HOST_BUN: bun,
+      OCX_TRAY_HOST_ARGS: `${quoteRunValue(cli)} __tray-host`,
       OCX_TRAY_ENTRY_B64: Buffer.from(JSON.stringify(state), "utf8").toString("base64"),
     },
   });
-  child.unref();
+}
+
+function spawnTray(state: WindowsTrayEntry): void {
+  launchWindowsTrayHost(state);
 }
 
 function parseTrayHostEntry(): WindowsTrayEntry {
@@ -442,6 +469,8 @@ export async function runWindowsTrayHost(): Promise<void> {
   assertWindows();
   const entry = parseTrayHostEntry();
   delete process.env.OCX_TRAY_ENTRY_B64;
+  delete process.env.OCX_TRAY_HOST_BUN;
+  delete process.env.OCX_TRAY_HOST_ARGS;
   const child = spawn(windowsPowerShellPath(), windowsTrayProcessArgs(entry, "Run", process.pid), {
     stdio: "ignore",
     windowsHide: true,
@@ -476,6 +505,7 @@ export function installWindowsTray(startNow = true): WindowsTrayStatus {
   for (const path of [entry.bun, entry.cli, sourceScript, ...iconPairs.map(pair => pair.source)]) {
     if (!existsSync(path)) throw new Error(`Cannot install the tray because a required file is missing: ${path}`);
   }
+  recordOwnedConfigPath(getConfigDir(), trayStatePath());
   if (!existsSync(getConfigDir())) mkdirSync(getConfigDir(), { recursive: true, mode: 0o700 });
   const runCommand = buildWindowsTrayRunCommand(entry);
   const runValue = windowsTrayRunValue(entry.opencodexHome);

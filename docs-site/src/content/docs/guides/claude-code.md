@@ -7,6 +7,33 @@ opencodex serves `POST /v1/messages` (plus `count_tokens`) alongside `/v1/respon
 Code can use every routed provider — OAuth logins, account pools, key failover and sidecars
 included — with zero extra auth work.
 
+## Claude OAuth account pool (experimental)
+
+You can log in multiple Claude accounts via the Providers dashboard (`ocx login anthropic` /
+add-account). By default every request uses the **active** account only.
+
+An **experimental, opt-in** Claude account pool (`anthropicAccountPool.enabled`) adds sticky
+session affinity and 429 cooldown failover across those OAuth accounts. For **new** sessions
+only, `anthropicAccountPool.strategy` selects among eligible accounts: `quota` (default) picks
+lowest known 5-hour usage when above `autoSwitchThreshold`; `round-robin` spreads evenly
+(`stickyLimit`, default `1`); `fill-first` drains the active account until cooldown,
+reauthentication, or threshold, then advances. It is **off by default**, shows a GUI warning,
+and is not battle-tested — Anthropic may restrict accounts that look like automated rotation;
+rotation does not protect against provider enforcement.
+
+Operational contract when enabled:
+
+- Upstream **429** cools that account using `Retry-After` when present (else a default backoff),
+  clears its affinities, and may rotate to another eligible account within the same request
+  (bounded).
+- Affinity is **process-local** (lost on proxy restart).
+- **401/403** credential failures quarantine the account (`needsReauth`) so it is excluded from
+  selection until re-authenticated.
+- If every eligible account is cooling, the proxy returns **429** (not 401) with `Retry-After`
+  when known.
+
+See [Configuration](/reference/configuration/#anthropicaccountpool-experimental).
+
 ## Quickstart
 
 ```bash
@@ -27,6 +54,14 @@ ocx claude
 | `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT` | `1` when `alwaysEnableEffort` is on (conditional) |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` / `DISABLE_COMPACT` | Legacy context override when `maxContextTokens` is set (conditional) |
 Variables you export yourself always win. Extra arguments pass through: `ocx claude -p "hello"`.
+
+One exception is about *where* a variable comes from, not about precedence. The bundled Bun
+runtime auto-loads a project `.env` / `.env.local`, so a stray `ANTHROPIC_API_KEY` in the
+directory you happen to launch from used to look identical to a deliberate export — and it
+silently disabled a healthy claude.ai subscription in favour of API billing. `ocx claude` now
+ignores Anthropic credentials that only a project dotenv introduced. A value you exported in
+your shell still wins, in every auth mode. To use an API key deliberately, export it
+(`export ANTHROPIC_API_KEY=...`) rather than leaving it in a project file.
 
 ## Auth mode
 
@@ -140,7 +175,7 @@ with `claude` or `anthropic`, opencodex exposes routed models as stable, reversi
 
 | Surface | Format | Example |
 | --- | --- | --- |
-| Claude Code CLI | `claude-ocx-<provider>--<model>` | `claude-ocx-native--gpt-5.6-sol` |
+| Claude Code CLI | `claude-ocx-<provider>--<model>` (plain) or `claude-ocx2-…` (escaped) | `claude-ocx-native--gpt-5.6-sol` |
 | Claude Desktop 3P | `claude-opus-4-8-<code>` (3-char base36 hash) | `claude-opus-4-8-ncb` |
 
 The proxy picks the family per request: `?ids=cli` or `?ids=desktop` wins; otherwise the
@@ -164,9 +199,14 @@ the alias back to the routed model. On older Claude Code versions the picker sta
 slots via
 `ANTHROPIC_MODEL` or type any routed id with `/model` (Claude Code passes strings through).
 
-**Alias grammar rules:** provider must not contain `/` or `--` or equal `native`; model must not
-contain `/`. Routes the readable form cannot express fall back to the hashed alias. Model ids
-MAY contain `--` (resolution splits on the first `--` only); native slugs containing `--` fall back to the hashed form.
+**Alias grammar rules:** provider must not contain `/` or `--` or equal `native`.
+Plain model ids (no `/` or `~`) keep the v1 prefix `claude-ocx-…`. Model ids that contain `/` or
+`~` mint the v2 prefix `claude-ocx2-…` with escapes (`/` → `~s`, `~` → `~t`), e.g.
+`openrouter/anthropic/claude-opus-4-8` → `claude-ocx2-openrouter--anthropic~sclaude-opus-4-8`.
+v1 aliases decode literally (so a historical model id that contained the two-char sequences
+`~s` / `~t` is preserved); v2 aliases expand the escapes. Routes that the readable form cannot
+express fall back to the hashed alias. Model ids MAY contain `--` (resolution splits on the first
+`--` only); native slugs containing `--` fall back to the hashed form.
 
 **Model resolution order:** `[1m]` marker stripped → readable alias decoded → Desktop hashed
 alias decoded → `modelMap` exact match → date-stripped match (`-20250514` removed) → passthrough.

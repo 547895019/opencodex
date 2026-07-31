@@ -1,6 +1,9 @@
-import { IconAlert, IconExternal, IconInfo, IconRefresh } from "../icons";
+import { IconAlert, IconInfo, IconRefresh } from "../icons";
+import { Trans } from "../i18n/provider";
 import { Select } from "../ui";
+import { navigateHash } from "../hash-routing";
 import { EFFORT_CAP_LEVELS, requireJson, sidecarBackendForModel, updateJobLabel } from "./dashboard-shared";
+import { shadowSourceModelBadge } from "./shadow-call-source";
 import type { useDashboardData } from "./use-dashboard-data";
 
 type Dash = ReturnType<typeof useDashboardData>;
@@ -86,40 +89,32 @@ export function DashboardEffortCapPanel({ apiBase, d }: { apiBase: string; d: Da
   );
 }
 
-export function DashboardInjectionPanel({ apiBase, d }: { apiBase: string; d: Dash }) {
+/**
+ * Delegation row: pick the model (and effort) inline, with a link to the rest.
+ *
+ * The two switches moved to the Subagents tab, which is where the roster they affect lives.
+ * The model pick stays: it is the same shape as the sidecar rows below it (label left,
+ * dropdown right), and it is the one delegation choice worth changing without leaving the
+ * status page.
+ */
+export function DashboardInjectionPanel({ d }: { apiBase: string; d: Dash }) {
   const {
-    t,
-    injectionModel, injectionEffort, injectionEfforts, injectionAvailable, injectionSaving,
-    setInjectionModel, setInjectionEffort, setInjectionSaving,
-    multiAgentGuidanceEnabled, setMultiAgentGuidanceEnabled,
+    t, injectionModel, injectionEffort, injectionEfforts, injectionAvailable, injectionSaving,
+    saveInjection,
   } = d;
 
   return (
-    <div className="panel">
-      <div className="injection-head">
-        <span className="injection-label">{t("dash.injectionLabel")}</span>
+    <div className="panel dash-delegation-summary">
+      <div className="font-semibold">{t("dash.injectionLabel")}</div>
+      <div className="dash-delegation-controls">
         <Select
           value={injectionModel}
           options={[
             { value: "", label: t("dash.injectionNone") },
             ...injectionAvailable.map(m => ({ value: m.namespaced, label: `${m.provider} / ${m.model}` })),
           ]}
-          onChange={async (v) => {
-            if (injectionSaving) return;
-            setInjectionSaving(true);
-            try {
-              const res = await fetch(`${apiBase}/api/injection-model`, {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ model: v || null, effort: injectionEffort || null }),
-              });
-              const data = await requireJson<{ model?: string | null; effort?: string | null }>(res);
-              setInjectionModel(data.model ?? "");
-              setInjectionEffort(data.effort ?? "");
-            } catch { /* ignore */ }
-            finally { setInjectionSaving(false); }
-          }}
-          disabled={injectionSaving || !multiAgentGuidanceEnabled}
+          onChange={(v) => { void saveInjection({ model: v || null, effort: injectionEffort || null }); }}
+          disabled={injectionSaving}
           label={t("dash.injectionLabel")}
         />
         {injectionModel && injectionEfforts.length > 0 && (
@@ -129,55 +124,17 @@ export function DashboardInjectionPanel({ apiBase, d }: { apiBase: string; d: Da
               { value: "", label: t("dash.injectionEffortNone") },
               ...injectionEfforts.map(e => ({ value: e, label: e })),
             ]}
-            onChange={async (v) => {
-              if (injectionSaving) return;
-              setInjectionSaving(true);
-              try {
-                const res = await fetch(`${apiBase}/api/injection-model`, {
-                  method: "PUT",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ model: injectionModel || null, effort: v || null }),
-                });
-                const data = await requireJson<{ model?: string | null; effort?: string | null }>(res);
-                setInjectionModel(data.model ?? "");
-                setInjectionEffort(data.effort ?? "");
-              } catch { /* ignore */ }
-              finally { setInjectionSaving(false); }
-            }}
-            disabled={injectionSaving || !multiAgentGuidanceEnabled}
+            onChange={(v) => { void saveInjection({ model: injectionModel || null, effort: v || null }); }}
+            disabled={injectionSaving}
             label={t("dash.injectionEffortLabel")}
           />
         )}
-        {injectionModel && multiAgentGuidanceEnabled && <span className="badge badge-green text-micro">{t("dash.injectionActive")}</span>}
-      </div>
-      <div className="muted text-control" style={{ marginTop: 6 }}>{t("dash.injectionHint")}</div>
-      <div className="spread dash-subagent-guidance-row">
-        <div className="setting-copy" style={{ flex: 1 }}>
-          <div className="font-semibold">{t("dash.multiAgentGuidance")}</div>
-          <div className="muted setting-hint">{t("dash.multiAgentGuidanceHint")}</div>
-        </div>
         <button
           type="button"
-          className={`switch ${multiAgentGuidanceEnabled ? "on" : ""}`}
-          onClick={async () => {
-            if (injectionSaving) return;
-            setInjectionSaving(true);
-            try {
-              const res = await fetch(`${apiBase}/api/injection-model`, {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ multiAgentGuidanceEnabled: !multiAgentGuidanceEnabled }),
-              });
-              const data = await requireJson<{ multiAgentGuidanceEnabled?: boolean }>(res);
-              setMultiAgentGuidanceEnabled(data.multiAgentGuidanceEnabled !== false);
-            } catch { /* ignore */ }
-            finally { setInjectionSaving(false); }
-          }}
-          disabled={injectionSaving}
-          aria-label={t("dash.multiAgentGuidance")}
-          aria-pressed={multiAgentGuidanceEnabled}
+          className="btn btn-ghost btn-sm"
+          onClick={() => navigateHash("#subagents")}
         >
-          <span className="knob" />
+          {t("dash.injectionManage")}
         </button>
       </div>
     </div>
@@ -194,34 +151,42 @@ export function DashboardMaintenancePanel({ d }: { d: Dash }) {
     <div className="panel maintenance-panel">
       <div className="spread maintenance-head">
         <div>
-          <div className="font-semibold">{t("dash.maintenance")}</div>
-          <div className="muted text-control" style={{ marginTop: 3 }}>{t("dash.maintenanceHint")}</div>
+          <div className="font-semibold">{t("dash.syncModels")}</div>
+          <div className="muted text-control" style={{ marginTop: 3 }}>{t("dash.syncModelsHint")}</div>
         </div>
         <div className="maintenance-actions">
           <button type="button" className="btn btn-ghost" onClick={runSync} disabled={syncing}>
-            <IconRefresh /> {syncing ? t("dash.syncing") : t("dash.syncModels")}
+            <IconRefresh /> {syncing ? t("dash.syncing") : t("dash.syncRun")}
           </button>
+          {/*
+            The update flow lives in the sidebar footer, which reports whether one is waiting
+            and is reachable from every page. A second button here duplicated it without
+            adding that signal. The trigger stays as a zero-size anchor so the deep link
+            (`#dashboard/update`) still has something to open against and the dialog has a
+            focus target to return to on close.
+          */}
           <button
             ref={updateTriggerRef}
             type="button"
-            className="btn btn-primary"
+            className="maintenance-update-anchor"
             onClick={openUpdateDialog}
             disabled={updateLoading}
             aria-haspopup="dialog"
             aria-controls="dashboard-update-dialog"
             aria-expanded={updateOpen}
-          >
-            <IconExternal /> {t("dash.checkUpdate")}
-          </button>
+            aria-label={t("dash.checkUpdate")}
+            tabIndex={-1}
+          />
         </div>
       </div>
       {syncResult && (
-        <div className="notice notice-ok maintenance-notice" role="status">
-          <IconRefresh />
+        <div className={`notice ${syncResult.nativeSubagentDefaultsWarning ? "notice-warn" : "notice-ok"} maintenance-notice`} role="status">
+          {syncResult.nativeSubagentDefaultsWarning ? <IconAlert /> : <IconRefresh />}
           <span>
             {t("dash.syncOk", { count: syncResult.added })}
             {syncResult.warning ? ` ${syncResult.warning}` : ""}
-            {syncResult.staleAppServerHint ? ` ${t("dash.syncStaleHint")}` : ""}
+            {syncResult.nativeSubagentDefaultsWarning ? ` ${syncResult.nativeSubagentDefaultsWarning}` : ""}
+            {syncResult.staleAppServerHint ? <>{" "}<Trans k="dash.syncStaleHint" cmd="ocx sync --restart-codex" /></> : null}
           </span>
         </div>
       )}
@@ -274,7 +239,7 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
       </div>
 
       <div className="dash-sidecar-grid">
-        <div className="panel dash-sidecar-card">
+        <div className="panel dash-sidecar-card" aria-busy={!sidecar || undefined}>
           <div className="dash-sidecar-card__row">
             <div className="font-semibold">{t("dash.webSearchSidecar")}</div>
             <Select
@@ -288,7 +253,7 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
           <div className="muted setting-hint">{t("dash.webSearchSidecarHint")}</div>
         </div>
 
-        <div className="panel dash-sidecar-card">
+        <div className="panel dash-sidecar-card" aria-busy={!sidecar || undefined}>
           <div className="dash-sidecar-card__row">
             <div className="font-semibold">{t("dash.visionSidecar")}</div>
             <Select
@@ -303,7 +268,7 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
         </div>
       </div>
 
-      <div className="panel">
+      <div className="panel" aria-busy={!shadowCall || undefined}>
         <div className="spread" style={{ alignItems: "center" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <span className="font-semibold">{t("dash.shadowCallIntercept")}</span>
@@ -320,7 +285,7 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
             >
               <IconInfo width={13} height={13} aria-hidden="true" />
             </button>
-            <code className="muted text-caption">⚠ 5.4-mini</code>
+            <code className="muted text-caption">{`⚠ ${shadowSourceModelBadge(shadowCall?.sourceModels)}`}</code>
           </div>
           <div className="setting-controls" style={{ display: "flex", gap: 8, alignItems: "center" }}>
             <button
