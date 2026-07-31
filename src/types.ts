@@ -589,6 +589,17 @@ export interface OcxConfig {
   tokenGuardian?: OcxTokenGuardianConfig;
   /** Additional origins allowed for CORS (e.g. ["https://clisu-oracle.tail19a2d7.ts.net"]). Loopback origins are always allowed. */
   corsAllowOrigins?: string[];
+  /** Debug-only capture settings (runtime on/off flags live in debug-settings; these persist). */
+  debug?: OcxDebugConfig;
+}
+
+/** Persisted debug-capture knobs. The on/off flag is runtime-only (debug-settings). */
+export interface OcxDebugConfig {
+  /** Full prompt-body capture: redaction level + ring rotation limit. */
+  promptCapture?: {
+    redaction?: "none" | "secrets" | "secrets-pii";
+    maxEntries?: number;
+  };
 }
 
 export type OcxComboStrategy = "failover" | "round-robin";

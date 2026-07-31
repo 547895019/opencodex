@@ -48,6 +48,15 @@ import {
   setDebugSettings,
   type DebugFlag,
 } from "../../lib/debug-settings";
+import {
+  clearPromptCapture,
+  getPromptCaptureEntries,
+  getPromptCaptureOptions,
+  loadPromptCaptureConfig,
+  MAX_ENTRIES_CAP,
+  setPromptCaptureOptions,
+  type PromptCaptureRedaction,
+} from "../../lib/prompt-capture";
 import type { OcxClaudeCodeConfig, OcxConfig, OcxCustomModel, OcxProviderConfig } from "../../types";
 import { drainAndShutdown } from "../lifecycle";
 import { filterRequestLogs, getRequestLogEntries, type RequestLogEntry } from "../request-log";
@@ -88,32 +97,86 @@ export async function handleLogsUsageRoutes(ctx: ManagementContext): Promise<Res
     return jsonResponse({ enabled: isClaudeDebugEnabled(), entries: getClaudeInboundDebugEntries() });
   }
 
+  if (url.pathname === "/api/debug/prompt-capture" && req.method === "GET") {
+    const { isPromptCaptureEnabled } = await import("../../lib/debug-settings");
+    const opts = getPromptCaptureOptions();
+    return jsonResponse({
+      enabled: isPromptCaptureEnabled(),
+      redaction: opts.redaction,
+      maxEntries: opts.maxEntries,
+      entries: getPromptCaptureEntries(),
+    });
+  }
+
+  if (url.pathname === "/api/debug/prompt-capture" && req.method === "PUT") {
+    let raw: unknown;
+    try { raw = await req.json(); } catch { return jsonResponse({ error: "invalid JSON body" }, 400); }
+    if (!isPlainRecord(raw)) return jsonResponse({ error: "body must be a JSON object" }, 400);
+    const body = raw as { redaction?: unknown; maxEntries?: unknown };
+    const opts: { redaction?: PromptCaptureRedaction; maxEntries?: number } = {};
+    if (body.redaction !== undefined) {
+      if (body.redaction !== "none" && body.redaction !== "secrets" && body.redaction !== "secrets-pii") {
+        return jsonResponse({ error: "redaction must be none, secrets, or secrets-pii" }, 400);
+      }
+      opts.redaction = body.redaction;
+    }
+    if (body.maxEntries !== undefined) {
+      if (typeof body.maxEntries !== "number" || !Number.isInteger(body.maxEntries)
+        || body.maxEntries < 1 || body.maxEntries > MAX_ENTRIES_CAP) {
+        return jsonResponse({ error: `maxEntries must be a positive integer <= ${MAX_ENTRIES_CAP}` }, 400);
+      }
+      opts.maxEntries = body.maxEntries;
+    }
+    if (opts.redaction === undefined && opts.maxEntries === undefined) {
+      return jsonResponse({ error: "provide redaction and/or maxEntries" }, 400);
+    }
+    setPromptCaptureOptions(opts);
+    config.debug = { ...(config.debug ?? {}) };
+    config.debug.promptCapture = {
+      ...(config.debug.promptCapture ?? {}),
+      ...(opts.redaction !== undefined ? { redaction: opts.redaction } : {}),
+      ...(opts.maxEntries !== undefined ? { maxEntries: opts.maxEntries } : {}),
+    };
+    saveConfig(config);
+    const snap = getPromptCaptureOptions();
+    return jsonResponse({ ok: true, redaction: snap.redaction, maxEntries: snap.maxEntries });
+  }
+
+  if (url.pathname === "/api/debug/prompt-capture/clear" && req.method === "POST") {
+    clearPromptCapture();
+    return jsonResponse({ ok: true });
+  }
+
   if (url.pathname === "/api/debug/injection-logs" && req.method === "GET") {
     const { after, limit } = parseDebugLogQuery(url);
     return jsonResponse(getInjectionDebugLogEntries({ after, limit }));
   }
 
   if (url.pathname === "/api/debug" && req.method === "PUT") {
-    let body: { debug?: unknown; usage?: unknown; injection?: unknown; claude?: unknown; reset?: unknown };
+    let body: { debug?: unknown; usage?: unknown; injection?: unknown; claude?: unknown; promptCapture?: unknown; reset?: unknown };
     try { body = await req.json(); } catch { return jsonResponse({ error: "invalid JSON body" }, 400); }
     if (body.reset === true) return jsonResponse(clearDebugSettings());
     if (body.reset === "debug" || body.reset === "provider") return jsonResponse(clearDebugSetting("debug"));
     if (body.reset === "usage") return jsonResponse(clearDebugSetting("usage"));
     if (body.reset === "injection") return jsonResponse(clearDebugSetting("injection"));
     if (body.reset === "claude") return jsonResponse(clearDebugSetting("claude"));
+    if (body.reset === "promptCapture") return jsonResponse(clearDebugSetting("promptCapture"));
     const partial: Partial<Record<DebugFlag, boolean>> = {};
-    for (const key of ["debug", "usage", "injection", "claude"] as const) {
+    for (const key of ["debug", "usage", "injection", "claude", "promptCapture"] as const) {
       if (body[key] === undefined) continue;
       if (typeof body[key] !== "boolean") return jsonResponse({ error: `${key} must be a boolean` }, 400);
       partial[key] = body[key];
     }
     if (Object.keys(partial).length === 0) {
-      return jsonResponse({ error: "provide debug/usage/injection/claude booleans or reset:true" }, 400);
+      return jsonResponse({ error: "provide debug/usage/injection/claude/promptCapture booleans or reset:true" }, 400);
     }
     // Turning capture off should also flush already-captured entries (privacy contract).
     if (partial.claude === false) {
       const { clearClaudeInboundDebug } = await import("../../claude/inbound-debug");
       clearClaudeInboundDebug();
+    }
+    if (partial.promptCapture === false) {
+      clearPromptCapture();
     }
     return jsonResponse(setDebugSettings(partial));
   }

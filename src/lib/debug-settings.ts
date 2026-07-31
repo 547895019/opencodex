@@ -14,6 +14,7 @@ export const DEBUG_ENV = {
   usage: "OPENCODEX_USAGE_DEBUG",
   injection: "OCX_INJECTION_DEBUG",
   claude: "OCX_CLAUDE_DEBUG",
+  promptCapture: "OCX_PROMPT_CAPTURE_DEBUG",
 } as const;
 
 /** Legacy env var that still enables provider debug logging. */
@@ -26,6 +27,7 @@ export interface DebugSettingsView {
   usage: boolean;
   injection: boolean;
   claude: boolean;
+  promptCapture: boolean;
   runtimeOverride: Partial<Record<DebugFlag, boolean>>;
   env: Record<DebugFlag, boolean>;
 }
@@ -67,24 +69,32 @@ export function isClaudeDebugEnabled(): boolean {
   return envFlag(DEBUG_ENV.claude);
 }
 
+/** Full prompt-body capture (default OFF; GUI toggle / API / CLI). Stores redacted bodies. */
+export function isPromptCaptureEnabled(): boolean {
+  if (runtimeOverride.promptCapture !== undefined) return runtimeOverride.promptCapture;
+  return envFlag(DEBUG_ENV.promptCapture);
+}
+
 export function getDebugSettings(): DebugSettingsView {
   return {
     enabled: isDebugEnabled(),
     usage: isUsageDebugEnabled(),
     injection: isInjectionDebugEnabled(),
     claude: isClaudeDebugEnabled(),
+    promptCapture: isPromptCaptureEnabled(),
     runtimeOverride: { ...runtimeOverride },
     env: {
       debug: envFlag(DEBUG_ENV.debug) || legacyDebugEnvEnabled(),
       usage: envFlag(DEBUG_ENV.usage),
       injection: envFlag(DEBUG_ENV.injection),
       claude: envFlag(DEBUG_ENV.claude),
+      promptCapture: envFlag(DEBUG_ENV.promptCapture),
     },
   };
 }
 
 export function setDebugSettings(partial: Partial<Record<DebugFlag, boolean>>): DebugSettingsView {
-  for (const key of ["debug", "usage", "injection", "claude"] as const) {
+  for (const key of ["debug", "usage", "injection", "claude", "promptCapture"] as const) {
     if (partial[key] !== undefined) runtimeOverride[key] = partial[key];
   }
   return getDebugSettings();
@@ -96,7 +106,7 @@ export function clearDebugSetting(flag: DebugFlag): DebugSettingsView {
 }
 
 export function clearDebugSettings(): DebugSettingsView {
-  for (const key of ["debug", "usage", "injection", "claude"] as const) {
+  for (const key of ["debug", "usage", "injection", "claude", "promptCapture"] as const) {
     delete runtimeOverride[key];
   }
   return getDebugSettings();

@@ -1,4 +1,5 @@
 import { markActivity } from "../lib/sidecar-tracker";
+import { loadPromptCaptureConfig } from "../lib/prompt-capture";
 import {
   buildWarmupCompletionFrames,
   buildWsErrorFrame,
@@ -269,6 +270,8 @@ export function startServer(port?: number) {
   // usage.jsonl already persists every request; rehydrate the in-memory Logs ring so
   // /api/logs (and the GUI) survive `ocx stop` / `ocx start` process restarts.
   hydrateRequestLogsFromDisk();
+  // Load persisted prompt-capture options (redaction/maxEntries) into the capture module.
+  loadPromptCaptureConfig(config);
   // #314: warn-only RSS observability (unref'd, idempotent — safe under repeated
   // startServer(0) in tests). Snapshot surfaces via GET /api/system/memory.
   startMemoryWatchdog();

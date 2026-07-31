@@ -26,6 +26,7 @@ import {
 } from "../../combos";
 import { isInjectionDebugEnabled } from "../../lib/debug-settings";
 import { injectionDebugLog } from "../../lib/injection-debug-log";
+import { capturePromptInbound } from "../../lib/prompt-capture";
 import { modelInList, namespacedToolName } from "../../types";
 import type { AdapterEvent, OcxConfig, OcxParsedRequest, OcxProviderConfig, OcxProviderContinuationState, OcxUsage } from "../../types";
 import {
@@ -684,6 +685,12 @@ export async function handleResponses(
   } catch (err) {
     return formatErrorResponse(400, "invalid_request_error", err instanceof Error ? err.message : String(err));
   }
+  // Full prompt-body capture (debug only, default OFF) BEFORE the shadow-call / model
+  // rewrite so the original inbound body is observable. Stores redacted bodies only.
+  capturePromptInbound("codex-responses", parsed._rawBody, {
+    resolvedModel: parsed.modelId,
+    headers: req.headers,
+  });
   logCtx.requestedModel = parsed.modelId;
   logCtx.requestedEffort = parsed.options.reasoning;
   logCtx.requestedServiceTier = parsed.options.serviceTier;

@@ -12,6 +12,7 @@ import { normalizeAnthropicImages } from "../adapters/anthropic-image-normalize"
 import { AnthropicRequestError, anthropicToResponsesTranslation, extractOcxRouteDirective, resolveInboundModel, type ClaudeCacheKeySource } from "../claude/inbound";
 import { stripOneMillionMarker } from "../claude/context-windows";
 import { captureClaudeInbound } from "../claude/inbound-debug";
+import { capturePromptInbound } from "../lib/prompt-capture";
 import { isTransientUpstreamStatus } from "../lib/upstream-retry";
 import {
   anthropicErrorBody,
@@ -547,6 +548,13 @@ export async function handleClaudeMessages(
         : undefined,
       req.headers.get("anthropic-beta") ?? undefined,
     );
+    capturePromptInbound("claude-messages", anthropicBody, {
+      resolvedModel:
+        isRec(anthropicBody) && typeof anthropicBody.model === "string"
+          ? resolveInboundModel(anthropicBody.model, config.claudeCode)
+          : undefined,
+      headers: req.headers,
+    });
     if (isRec(anthropicBody) && wantsNativePassthrough(req, config, anthropicBody.model)) {
       return await anthropicNativePassthrough(req, config, logCtx, logIds, anthropicBody, "/v1/messages");
     }
@@ -793,6 +801,10 @@ export async function handleClaudeCountTokens(req: Request, config: OcxConfig): 
     raw.model = model;
   }
   captureClaudeInbound("count_tokens", raw, resolveInboundModel(model, config.claudeCode), req.headers.get("anthropic-beta") ?? undefined);
+  capturePromptInbound("claude-count-tokens", raw, {
+    resolvedModel: resolveInboundModel(model, config.claudeCode),
+    headers: req.headers,
+  });
   if (wantsNativePassthrough(req, config, model)) {
     return await anthropicNativePassthrough(req, config, { model, provider: "anthropic-native", surface: "claude" }, undefined, raw, "/v1/messages/count_tokens");
   }

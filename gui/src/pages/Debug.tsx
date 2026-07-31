@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useI18n } from "../i18n/shared";
 import { IconRefresh } from "../icons";
@@ -9,8 +9,9 @@ interface DebugSettings {
   usage: boolean;
   injection: boolean;
   claude: boolean;
-  runtimeOverride: Partial<Record<"debug" | "usage" | "injection" | "claude", boolean>>;
-  env: Record<"debug" | "usage" | "injection" | "claude", boolean>;
+  promptCapture: boolean;
+  runtimeOverride: Partial<Record<"debug" | "usage" | "injection" | "claude" | "promptCapture", boolean>>;
+  env: Record<"debug" | "usage" | "injection" | "claude" | "promptCapture", boolean>;
 }
 
 interface DebugLogEntry {
@@ -37,6 +38,19 @@ interface ClaudeInboundEntry {
   systemTag?: string;
 }
 
+type PromptCaptureRedaction = "none" | "secrets" | "secrets-pii";
+
+interface PromptCaptureEntry {
+  at: number;
+  surface: string;
+  model: string;
+  resolvedModel?: string;
+  redaction: PromptCaptureRedaction;
+  bodySize: number;
+  body: unknown;
+  headers?: Record<string, string>;
+}
+
 type LogStream = "provider" | "usage" | "injection";
 
 const STREAMS = ["provider", "usage", "injection"] as const;
@@ -54,7 +68,11 @@ function isStreamEnabled(debug: DebugSettings | null, stream: LogStream): boolea
 }
 
 function isDebugFlagEnabled(debug: DebugSettings, flag: keyof DebugSettings["env"]): boolean {
-  return flag === "debug" ? debug.enabled : flag === "usage" ? debug.usage : flag === "injection" ? debug.injection : debug.claude;
+  if (flag === "debug") return debug.enabled;
+  if (flag === "usage") return debug.usage;
+  if (flag === "injection") return debug.injection;
+  if (flag === "claude") return debug.claude;
+  return debug.promptCapture;
 }
 
 export default function Debug({ apiBase, embedded }: { apiBase: string; embedded?: boolean }) {
@@ -66,6 +84,11 @@ export default function Debug({ apiBase, embedded }: { apiBase: string; embedded
   const [follow, setFollow] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [claudeEntries, setClaudeEntries] = useState<ClaudeInboundEntry[]>([]);
+  const [promptEntries, setPromptEntries] = useState<PromptCaptureEntry[]>([]);
+  const [promptRedaction, setPromptRedaction] = useState<PromptCaptureRedaction>("secrets");
+  const [promptMaxEntries, setPromptMaxEntries] = useState<number>(20);
+  const [promptBusy, setPromptBusy] = useState(false);
+  const [promptExpanded, setPromptExpanded] = useState<number | null>(null);
   const afterRef = useRef(0);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
 
@@ -175,7 +198,61 @@ export default function Debug({ apiBase, embedded }: { apiBase: string; embedded
     return () => clearInterval(interval);
   }, [apiBase, debug?.claude]);
 
-  const setDebugFlag = async (flag: "debug" | "usage" | "injection" | "claude", enabled: boolean) => {
+  useEffect(() => {
+    if (!debug?.promptCapture) {
+      setPromptEntries([]);
+      return;
+    }
+    const fetchPrompt = async () => {
+      try {
+        const res = await fetch(`${apiBase}/api/debug/prompt-capture`);
+        if (res.ok) {
+          const data = await res.json() as {
+            redaction?: PromptCaptureRedaction;
+            maxEntries?: number;
+            entries?: PromptCaptureEntry[];
+          };
+          if (data.redaction) setPromptRedaction(data.redaction);
+          if (typeof data.maxEntries === "number") setPromptMaxEntries(data.maxEntries);
+          setPromptEntries(Array.isArray(data.entries) ? data.entries : []);
+        }
+      } catch { /* ignore */ }
+    };
+    void fetchPrompt();
+    const interval = setInterval(() => void fetchPrompt(), 2000);
+    return () => clearInterval(interval);
+  }, [apiBase, debug?.promptCapture]);
+
+  const putPromptOptions = async (opts: { redaction?: PromptCaptureRedaction; maxEntries?: number }) => {
+    setPromptBusy(true);
+    try {
+      const res = await fetch(`${apiBase}/api/debug/prompt-capture`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(opts),
+      });
+      if (res.ok) {
+        const data = await res.json() as { redaction?: PromptCaptureRedaction; maxEntries?: number };
+        if (data.redaction) setPromptRedaction(data.redaction);
+        if (typeof data.maxEntries === "number") setPromptMaxEntries(data.maxEntries);
+      }
+    } catch { /* ignore */ } finally {
+      setPromptBusy(false);
+    }
+  };
+
+  const clearPromptEntries = async () => {
+    setPromptBusy(true);
+    try {
+      await fetch(`${apiBase}/api/debug/prompt-capture/clear`, { method: "POST" });
+      setPromptEntries([]);
+      setPromptExpanded(null);
+    } catch { /* ignore */ } finally {
+      setPromptBusy(false);
+    }
+  };
+
+  const setDebugFlag = async (flag: "debug" | "usage" | "injection" | "claude" | "promptCapture", enabled: boolean) => {
     setDebugBusy(true);
     try {
       const res = await fetch(`${apiBase}/api/debug`, {
@@ -230,7 +307,7 @@ export default function Debug({ apiBase, embedded }: { apiBase: string; embedded
         <div className="card" style={{ marginBottom: 16, padding: "12px 14px" }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 16 }}>
-              {(["debug", "usage", "injection", "claude"] as const).map(flag => {
+              {(["debug", "usage", "injection", "claude", "promptCapture"] as const).map(flag => {
                 const checked = isDebugFlagEnabled(debug, flag);
                 return (
                   <div key={flag} style={{ display: "inline-flex", alignItems: "center", gap: 10, minWidth: 220 }}>
@@ -328,6 +405,104 @@ export default function Debug({ apiBase, embedded }: { apiBase: string; embedded
                       </td>
                       <td className="mono">{entry.hasSystem ? entry.systemTag ?? "yes" : t("debug.claudeInbound.none")}</td>
                     </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {debug?.promptCapture && (
+        <div className="card" style={{ marginBottom: 16, padding: "12px 14px" }}>
+          <div className="font-semibold" style={{ marginBottom: 4 }}>{t("debug.promptCapture.title")}</div>
+          <div className="muted text-control" style={{ marginBottom: 10 }}>{t("debug.promptCapture.sub")}</div>
+          <div style={{ border: "1px solid var(--danger, #d33)", borderRadius: 6, padding: "8px 10px", marginBottom: 12, background: "var(--danger-bg, rgba(221,51,51,0.08))" }}>
+            <span style={{ color: "var(--danger, #d33)", fontWeight: 600 }}>⚠ {t("debug.promptCapture.warning")}</span>
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 16, marginBottom: 12 }}>
+            <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <span className="text-control">{t("debug.promptCapture.redaction")}</span>
+              <select
+                value={promptRedaction}
+                disabled={promptBusy}
+                onChange={e => void putPromptOptions({ redaction: e.target.value as PromptCaptureRedaction })}
+              >
+                <option value="secrets">{t("debug.promptCapture.redactionSecrets")}</option>
+                <option value="secrets-pii">{t("debug.promptCapture.redactionSecretsPii")}</option>
+                <option value="none">{t("debug.promptCapture.redactionNone")}</option>
+              </select>
+            </label>
+            <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <span className="text-control">{t("debug.promptCapture.maxEntries")}</span>
+              <input
+                type="number"
+                min={1}
+                max={200}
+                value={promptMaxEntries}
+                disabled={promptBusy}
+                style={{ width: 72 }}
+                onChange={e => {
+                  const v = Number(e.target.value);
+                  if (Number.isFinite(v) && v >= 1 && v <= 200) void putPromptOptions({ maxEntries: Math.floor(v) });
+                }}
+              />
+            </label>
+            <button type="button" className="btn btn-ghost btn-sm" disabled={promptBusy} onClick={() => void clearPromptEntries()}>
+              {t("debug.promptCapture.clear")}
+            </button>
+          </div>
+          {promptEntries.length === 0 ? (
+            <div className="muted text-control">{t("debug.promptCapture.empty")}</div>
+          ) : (
+            <div style={{ overflowX: "auto" }}>
+              <table className="table text-label">
+                <thead>
+                  <tr>
+                    <th>{t("debug.promptCapture.time")}</th>
+                    <th>{t("debug.promptCapture.surface")}</th>
+                    <th>{t("debug.promptCapture.model")}</th>
+                    <th>{t("debug.promptCapture.bodySize")}</th>
+                    <th>{t("debug.promptCapture.redaction")}</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {promptEntries.map((entry, i) => (
+                    <Fragment key={`${entry.at}-${i}`}>
+                      <tr>
+                        <td className="muted mono">{formatClaudeInboundTime(entry.at)}</td>
+                        <td className="mono">{entry.surface}</td>
+                        <td className="mono" title={entry.resolvedModel}>
+                          {entry.model}
+                          {entry.resolvedModel && entry.resolvedModel !== entry.model && (
+                            <span className="muted"> → {entry.resolvedModel}</span>
+                          )}
+                        </td>
+                        <td className="mono">{entry.bodySize >= 0 ? entry.bodySize : "?"}</td>
+                        <td className="mono">{entry.redaction}</td>
+                        <td>
+                          <button
+                            type="button"
+                            className="btn btn-ghost btn-sm"
+                            onClick={() => setPromptExpanded(promptExpanded === i ? null : i)}
+                          >
+                            {promptExpanded === i ? t("debug.promptCapture.hideBody") : t("debug.promptCapture.viewBody")}
+                          </button>
+                        </td>
+                      </tr>
+                      {promptExpanded === i && (
+                        <tr>
+                          <td colSpan={6}>
+                            <pre className="mono" style={{ maxHeight: 420, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 12, margin: 0 }}>
+                              {(() => {
+                                try { return JSON.stringify(entry.body, null, 2); } catch { return String(entry.body); }
+                              })()}
+                            </pre>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
                   ))}
                 </tbody>
               </table>
