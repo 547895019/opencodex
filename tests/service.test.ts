@@ -661,10 +661,12 @@ describe("service lifecycle cleanup ordering", () => {
     expect(service).toContain('verifyPidIdentity');
     expect(service).toContain("removeRuntimePort(pid);");
     expect(service).toContain('import { isProcessAlive, stopProxy } from "./lib/process-control";');
-    expect(service).toContain('import { findLiveProxy } from "./server/proxy-liveness";');
+    expect(service).toContain('import { findLiveProxy, SERVICE_STOP_LIVENESS } from "./server/proxy-liveness";');
     expect(service).toContain('type TrackedProxyCleanupResult = "none" | "stale" | "stopped";');
     expect(service).toContain("async function stopTrackedProxyIfRunning(): Promise<TrackedProxyCleanupResult>");
-    expect(service).toContain("await findLiveProxy({ timeoutMs: 1500 })");
+    expect(service).toContain("...SERVICE_STOP_LIVENESS");
+    expect(service).toContain("deadlineAt:");
+    expect(service).toContain("SERVICE_STOP_LIVENESS");
     expect(service).toContain("await stopProxy(trackedKillPid);");
     expect(service).toContain("await stopProxy(liveKillPid);");
     expect(service).toContain("removePid(pid);");
@@ -744,6 +746,15 @@ describe("service diagnostics", () => {
     expect(deriveWindowsServiceDiagnostic({ ...base, ...installedEnabled, nativeStatus: "started" })).toMatchObject({ viable: false, conflict: true });
     expect(deriveWindowsServiceDiagnostic({ ...base, nativeStatus: "stopped" })).toMatchObject({ installed: true, viable: false, startable: false, stale: true, running: false });
     expect(deriveWindowsServiceDiagnostic({ ...base, nativeRepairAssetsOnly: true })).toMatchObject({ installed: false, viable: false, stale: true });
+    // Missing on-disk assets while the task remains registered — the post-update status line.
+    const missingAssets = deriveWindowsServiceDiagnostic({
+      ...base,
+      ...installedEnabled,
+      recordedBackend: "scheduler",
+      schedulerAssetsPresent: false,
+    });
+    expect(missingAssets).toMatchObject({ installed: true, viable: false, stale: true, startable: false });
+    expect(missingAssets.summary).toContain("stale or missing service assets");
   });
 
   test("a stopped healthy WinSW service remains startable from the tray", () => {
