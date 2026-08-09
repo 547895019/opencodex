@@ -1153,8 +1153,13 @@ export default function Dashboard({ apiBase }: { apiBase: string }) {
         <span className="knob" />
       </button>
       <Select
-        value={shadowCall?.model ?? ""}
-        options={[{ value: "", label: "—" }, ...models.map(m => ({ value: m.id, label: `${m.provider}/${m.id}` }))]}
+        value={(() => {
+          const configured = shadowCall?.model ?? "";
+          if (!configured || configured.includes("/")) return configured;
+          const match = models.find(m => m.id === configured);
+          return match ? `${match.provider}/${match.id}` : configured;
+        })()}
+        options={[{ value: "", label: "—" }, ...models.map(m => ({ value: `${m.provider}/${m.id}`, label: `${m.provider}/${m.id}` }))]}
         onChange={v => { void saveShadowCall({ model: v }); }}
         disabled={!shadowCall || shadowCallSaving || !shadowCall?.enabled}
         label={t("dash.shadowCallModel")}
