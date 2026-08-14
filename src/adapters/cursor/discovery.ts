@@ -1,4 +1,8 @@
-import { CANONICAL_EFFORT_SUFFIXES, cursorModelEffortLadder } from "./effort-map";
+import {
+  CANONICAL_EFFORT_SUFFIXES,
+  cursorModelEffortLadder,
+  cursorWireModelIdWithEffort,
+} from "./effort-map";
 
 export interface CursorModelInfo {
   id: string;
@@ -22,10 +26,10 @@ export function inferCursorContextWindow(modelId: string): number {
   const id = modelId.trim().toLowerCase();
   if (id.includes("1m")) return CONTEXT_1M;
   if (id.startsWith("gemini-")) return CONTEXT_1M;
-  if (id === "glm-5.2") return CONTEXT_1M;
+  if (id === "glm-5.3" || id === "glm-5.2") return CONTEXT_1M;
   if (id.startsWith("gpt-5.6-")) return CONTEXT_1M;
   if (id.startsWith("gpt-5") || id === "gpt-5-codex") return CONTEXT_272K;
-  if (id.startsWith("grok-4.5")) return 500_000;
+  if (id.startsWith("grok-4.5") || id.startsWith("grok-4.6")) return 500_000;
   if (id.startsWith("grok-")) return CONTEXT_256K;
   if (id.includes("claude")) return CONTEXT_200K;
   return CURSOR_DEFAULT_CONTEXT_WINDOW;
@@ -66,14 +70,20 @@ function stripCursorWirePrefix(id: string): string {
 
 /**
  * True when a configured Cursor base model should remain exposed after live GetUsableModels filtering.
- * Live ids are full effort-suffixed variants (`claude-4.6-opus-high`); base ids match exactly or by prefix.
+ * Live ids are full effort-suffixed variants (`claude-4.6-opus-high`); base ids match exactly, the
+ * ordinary `{base}-{effort}` form, or Cursor's current `{base-without-fast}-{effort}-fast` form.
  */
 export function isCursorModelAvailableForAccount(modelId: string, liveIds: readonly string[]): boolean {
   return liveIds.some(raw => {
     const id = stripCursorWirePrefix(raw);
     if (id === modelId) return true;
-    const effortPrefix = `${modelId}-`;
-    return id.startsWith(effortPrefix) && CANONICAL_EFFORT_SUFFIXES.has(id.slice(effortPrefix.length));
+    for (const effort of CANONICAL_EFFORT_SUFFIXES) {
+      if (
+        id === `${modelId}-${effort}` ||
+        id === cursorWireModelIdWithEffort(modelId, effort)
+      ) return true;
+    }
+    return false;
   });
 }
 
@@ -167,7 +177,7 @@ export const CURSOR_STATIC_MODELS: readonly CursorModelInfo[] = normalizeCursorM
   // the request builder appends the per-model suffix (see effort-map.ts) and reasoning models
   // advertise effort so Codex exposes the tier picker. `supportsReasoningEffort` tracks whether the
   // model has *selectable effort tiers* (CURSOR_MODEL_EFFORT_TIERS), NOT merely whether it reasons:
-  // gemini/grok/kimi/gpt-5-mini are reasoning models in the SOT but are sent bare (no tier picker).
+  // gemini/grok/kimi-k2.7/gpt-5-mini are reasoning models in the SOT but are sent bare (no tier picker).
   ...CURSOR_ROUTER_MODEL_IDS.map(id => ({ id, contextWindow: CONTEXT_200K, supportsReasoningEffort: false })),
 
   { id: "claude-sonnet-5", contextWindow: CONTEXT_200K, supportsReasoningEffort: true },
@@ -223,10 +233,18 @@ export const CURSOR_STATIC_MODELS: readonly CursorModelInfo[] = normalizeCursorM
   // Conflict resolution (260709): keep the refreshed 1M context + kimi-k2.7-code from de12fc8,
   // take PR #73's supportsReasoningEffort for glm-5.2 (its effort-map tiers landed with the PR).
   { id: "glm-5.2", contextWindow: CONTEXT_1M, supportsReasoningEffort: true },
+  // 260814 preemptive: glm-5.3 seeded ahead of Cursor's lineup update (mirrors glm-5.2).
+  { id: "glm-5.3", contextWindow: CONTEXT_1M, supportsReasoningEffort: true },
   { id: "kimi-k2.7-code", contextWindow: CONTEXT_262K },
+  // kimi-k3: cursor.com/docs/models/kimi-k3; account-verified via GetUsableModels (2026-07-28) —
+  // ships only as effort-suffixed kimi-k3-{low,high,max}, so the tier picker is exposed.
+  { id: "kimi-k3", contextWindow: CONTEXT_262K, supportsReasoningEffort: true },
 
   { id: "grok-4.5", contextWindow: 500_000, supportsReasoningEffort: true },
   { id: "grok-4.5-fast", contextWindow: 500_000, supportsReasoningEffort: true },
+  // 260813 preemptive: grok-4.6 seeded ahead of Cursor's lineup update (mirrors grok-4.5).
+  { id: "grok-4.6", contextWindow: 500_000, supportsReasoningEffort: true },
+  { id: "grok-4.6-fast", contextWindow: 500_000, supportsReasoningEffort: true },
 ]);
 
 export function cursorModelIds(models: readonly CursorModelInfo[] = CURSOR_STATIC_MODELS): string[] {

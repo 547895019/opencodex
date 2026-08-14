@@ -7,13 +7,17 @@ import { McpToolDefinitionSchema, McpToolsSchema, type McpToolDefinition } from 
 export const OCX_RESPONSES_TOOL_PROVIDER = "opencodex-responses";
 export const CODEX_EXEC_COMMAND_TOOL = "exec_command";
 export const CODEX_SHELL_COMMAND_TOOL = "shell_command";
+/** Codex Desktop unified-exec client tool. Companion of `wait`; not an `exec_command` schema alias. */
+export const CODEX_UNIFIED_EXEC_TOOL = "exec";
+export const CODEX_WAIT_TOOL = "wait";
 export const CODEX_APPLY_PATCH_TOOL = "apply_patch";
+export const CURSOR_EDIT_FILE_TOOL = "edit_file";
+export const CURSOR_MULTI_EDIT_TOOL = "multi_edit";
+export const CURSOR_STRUCTURED_EDIT_TOOLS = [CURSOR_EDIT_FILE_TOOL, CURSOR_MULTI_EDIT_TOOL] as const;
 export const CURSOR_EXEC_COMMAND_TOOL = CODEX_EXEC_COMMAND_TOOL;
 export const CODEX_SHELL_BRIDGE_TOOL_NAMES = [CODEX_EXEC_COMMAND_TOOL, CODEX_SHELL_COMMAND_TOOL] as const;
 export const CURSOR_SHELL_ALIAS_SYSTEM_NOTE =
   'Shell commands use the Codex shell bridge tool shown in this turn\'s catalog (`shell_command` or `exec_command`) with JSON arguments like {"cmd":"..."}. The long `mcp_opencodex-responses_*` display name is the same tool. Prefer it over Cursor-native Shell; never say native shell is blocked.';
-export const CURSOR_SHELL_ALIAS_USER_HINT =
-  "Use the Codex shell bridge tool listed this turn (`shell_command` or `exec_command`, including the long `mcp_opencodex-responses_*` name). Prefer that bridge over Cursor-native Shell/Read. Never say phrases like \"Native shell access is blocked\" or \"Shell access is blocked\" — silently use the bridge unless that bridge tool itself fails.";
 const NEIGHBOR_AGENT_TOOL_NAMES = ["Read", "Grep", "Glob", "Bash", "LS"] as const;
 
 export const CURSOR_GENERIC_TOOL_USE_USER_HINT = [
@@ -40,6 +44,47 @@ export const CURSOR_EXEC_COMMAND_INPUT_SCHEMA = {
     max_output_tokens: { type: "number", description: "Output token budget. Defaults to 10000 tokens; larger requests may be capped by policy." },
   },
   required: ["cmd"],
+  additionalProperties: false,
+} as const;
+
+/**
+ * Structured single-replacement schema advertised to Cursor models in addition to the freeform
+ * `apply_patch` tool. Cursor-trained models reliably emit exact-match replacements (the native
+ * Edit shape) but cannot produce Codex's freeform patch grammar, so every file edit attempt on the
+ * Cursor route produced malformed `apply_patch` payloads that the Codex client rejected locally
+ * (#1017). Calls to this tool are converted server-side into a valid apply_patch payload.
+ */
+export const CURSOR_EDIT_FILE_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    file_path: { type: "string", description: "Path of the file to edit, relative to the workspace root." },
+    old_string: { type: "string", description: "Exact text to replace. Must match the current file content, including line breaks." },
+    new_string: { type: "string", description: "Replacement text. Empty removes the matched text." },
+  },
+  required: ["file_path", "old_string", "new_string"],
+  additionalProperties: false,
+} as const;
+
+/** Structured multi-replacement schema; mirrors Cursor's native MultiEdit shape. */
+export const CURSOR_MULTI_EDIT_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    file_path: { type: "string", description: "Path of the file to edit, relative to the workspace root." },
+    edits: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          old_string: { type: "string", description: "Exact text to replace. Must match the current file content, including line breaks." },
+          new_string: { type: "string", description: "Replacement text. Empty removes the matched text." },
+        },
+        required: ["old_string", "new_string"],
+        additionalProperties: false,
+      },
+      description: "Ordered replacement edits for this file. Each old_string must match the current file content.",
+    },
+  },
+  required: ["file_path", "edits"],
   additionalProperties: false,
 } as const;
 
@@ -125,6 +170,27 @@ export function isBareCodexShellBridgeTool(tool: Pick<OcxTool, "namespace" | "na
   return !tool.namespace && isCodexShellBridgeToolName(tool.name);
 }
 
+function isCursorResponsesProvider(namespace: string | undefined): boolean {
+  return !namespace || namespace === OCX_RESPONSES_TOOL_PROVIDER;
+}
+
+const CURSOR_EXECUTION_PATH_TOOL_NAMES = [
+  CODEX_UNIFIED_EXEC_TOOL,
+  CODEX_EXEC_COMMAND_TOOL,
+  CODEX_SHELL_COMMAND_TOOL,
+] as const;
+
+/** True for the Codex execution path that must survive Cursor transport truncation. */
+export function isCursorExecutionPathTool(tool: Pick<OcxTool, "namespace" | "name">): boolean {
+  return isCursorResponsesProvider(tool.namespace)
+    && (CURSOR_EXECUTION_PATH_TOOL_NAMES as readonly string[]).includes(tool.name);
+}
+
+/** `wait` only resumes a yielded exec cell; it is unusable without an execution-path tool. */
+export function isCursorWaitTool(tool: Pick<OcxTool, "namespace" | "name">): boolean {
+  return isCursorResponsesProvider(tool.namespace) && tool.name === CODEX_WAIT_TOOL;
+}
+
 /** @deprecated Prefer isBareCodexShellBridgeTool; kept for older call sites/tests. */
 function isBareCodexExecCommandTool(tool: Pick<OcxTool, "namespace" | "name">): boolean {
   return isBareCodexShellBridgeTool(tool);
@@ -140,6 +206,73 @@ export function cursorRequestAdvertisesApplyPatch(
 ): boolean {
   const catalog = tools ?? [];
   return catalog.some(tool => !tool.namespace && tool.name === CODEX_APPLY_PATCH_TOOL && tool.freeform === true && cursorToolAllowedByChoice(tool, toolChoice, catalog));
+}
+
+export function isCursorStructuredEditToolName(name: string): boolean {
+  return (CURSOR_STRUCTURED_EDIT_TOOLS as readonly string[]).includes(name);
+}
+
+/** Internal provenance gate for synthetic edits after prompt filtering and catalog budgeting. */
+export function isCursorSyntheticStructuredEditTool(
+  tool: Pick<OcxTool, "namespace" | "name" | "cursorStructuredEdit">,
+): boolean {
+  return !tool.namespace && tool.cursorStructuredEdit === true && isCursorStructuredEditToolName(tool.name);
+}
+
+/**
+ * Synthetic structured edit tools for the Cursor route (#1017).
+ *
+ * Codex exposes `apply_patch` as a freeform custom tool whose body must be the exact Codex patch
+ * grammar (`*** Begin Patch` envelope, `@@` hunks, `-`/`+` prefixes). Cursor-trained models are
+ * trained on exact-match edit tools instead and emit malformed patch text on every attempt, which
+ * the Codex client then rejects locally ("invalid hunk"). When the request advertises the freeform
+ * `apply_patch` tool, also advertise Cursor-native-shaped `edit_file` / `multi_edit` tools; the
+ * adapter converts their exact-match replacements into a valid apply_patch payload (see
+ * protobuf-events.translateStructuredEditCall).
+ *
+ * Never widened when the caller pinned an explicit tool choice: a forced `apply_patch` selection
+ * must not gain sibling tools the client did not ask for.
+ */
+export function cursorStructuredEditTools(
+  tools: readonly Pick<OcxTool, "namespace" | "name" | "freeform">[] | undefined,
+  toolChoice?: OcxRequestOptions["toolChoice"],
+): OcxTool[] {
+  if (!cursorRequestAdvertisesApplyPatch(tools, toolChoice)) return [];
+  if (toolChoice && toolChoice !== "auto" && toolChoice !== "required") return [];
+  // Never shadow an already-advertised bare tool with the same name (a client catalog could
+  // legitimately expose its own `edit_file` / `multi_edit` MCP-style tools).
+  const existingBareNames = new Set(
+    (tools ?? []).filter(tool => !tool.namespace).map(tool => tool.name),
+  );
+  const candidates: OcxTool[] = [
+    {
+      name: CURSOR_EDIT_FILE_TOOL,
+      cursorStructuredEdit: true,
+      description:
+        "Replace one block of exact text in a file. OpenCodex converts the replacement into a Codex apply_patch change, which the Codex client applies with its normal approval and sandbox policy. old_string must match the current file content exactly at exactly one location (apply_patch rejects ambiguous hunks). Matching is line-based, so an edit cannot add or remove only the file's final newline, and old_string/new_string that are identical after line normalization are rejected as a no-op.",
+      parameters: { ...CURSOR_EDIT_FILE_INPUT_SCHEMA },
+    },
+    {
+      name: CURSOR_MULTI_EDIT_TOOL,
+      cursorStructuredEdit: true,
+      description:
+        "Apply several exact-text replacements to one file. OpenCodex converts the edits into a single Codex apply_patch change, which the Codex client applies with its normal approval and sandbox policy. Each old_string must match the current file content exactly at exactly one location (apply_patch rejects ambiguous hunks). Edits are independent: every old_string is matched against the ORIGINAL file content, so a later edit must not rely on text introduced by an earlier one. Matching is line-based, so an edit cannot add or remove only the file's final newline, and old_string/new_string that are identical after line normalization are rejected as a no-op.",
+      parameters: { ...CURSOR_MULTI_EDIT_INPUT_SCHEMA },
+    },
+  ];
+  return candidates.filter(tool => !existingBareNames.has(tool.name));
+}
+
+/**
+ * True when this request actually advertises the synthetic structured edit tools (`edit_file` /
+ * `multi_edit`) — i.e. a freeform `apply_patch` is advertised, no tool-choice pin blocks widening,
+ * and neither name is shadowed by an existing bare tool in the client catalog.
+ */
+export function cursorRequestAdvertisesStructuredEdits(
+  tools: readonly Pick<OcxTool, "namespace" | "name" | "freeform">[] | undefined,
+  toolChoice?: OcxRequestOptions["toolChoice"],
+): boolean {
+  return cursorStructuredEditTools(tools, toolChoice).length > 0;
 }
 
 export function cursorToolWireName(tool: Pick<OcxTool, "namespace" | "name">): string {
@@ -211,17 +344,6 @@ function shellBridgeArgNormalizeSchema(tool: OcxTool): unknown {
     properties,
     required: requiresCommand ? required : ["command"],
   };
-}
-
-function activeTextMentionsExecCommand(text: string): boolean {
-  return /\b(?:exec_command|shell_command)\b/i.test(text);
-}
-
-function looksLikeShellCommandRequest(text: string): boolean {
-  const hasKnownCommand = /(?:^|[\s`$])(?:echo|pwd|ls|cat|grep|rg|find|python3?|node|bun|npm|pnpm|yarn|git|curl|wget|chmod|mkdir|rm|cp|mv|touch|docker|kubectl|make|cargo|go|pytest)(?=\s|$|[`:;|&])/i.test(text);
-  const hasRunIntent = /\b(?:run|execute|exec)\b/i.test(text) || /\b(?:stdout|stderr|exit\s+code)\b/i.test(text);
-  const hasShellTarget = /\b(?:shell|terminal|command|cmd)\b/i.test(text);
-  return /\b(?:run|execute|exec)\s*:/i.test(text) || hasKnownCommand || (hasRunIntent && hasShellTarget);
 }
 
 export function isGenericToolUseCountDemoPrompt(text: string): boolean {
@@ -316,23 +438,69 @@ export function cursorToolsForActivePrompt<T extends Pick<OcxTool, "namespace" |
   return execTools && execTools.length > 0 ? execTools : tools;
 }
 
-export function shouldAppendCursorShellAliasHint(
-  tools: readonly Pick<OcxTool, "namespace" | "name">[] | undefined,
-  text: string,
-): boolean {
-  const trimmed = text.trim();
-  return trimmed.length > 0
-    && cursorRequestHasShellAlias(tools)
-    && !activeTextMentionsExecCommand(trimmed)
-    && looksLikeShellCommandRequest(trimmed);
+/**
+ * Required command payload keys for a shell bridge tool, derived from the advertised schema when present.
+ */
+export function shellBridgeRequiredCommandKeys(
+  toolName: string,
+  schema?: unknown,
+): readonly ("cmd" | "command")[] {
+  if (schema && typeof schema === "object") {
+    const required = (schema as Record<string, unknown>).required;
+    if (Array.isArray(required)) {
+      const keys = required.filter((key): key is "cmd" | "command" => key === "cmd" || key === "command");
+      if (keys.length > 0) return keys;
+    }
+  }
+  return toolName === CODEX_SHELL_COMMAND_TOOL ? ["command"] : ["cmd"];
 }
 
-export function appendCursorShellAliasHint(
-  tools: readonly Pick<OcxTool, "namespace" | "name">[] | undefined,
-  text: string,
-): string {
-  if (!shouldAppendCursorShellAliasHint(tools, text)) return text;
-  return `${text}${text.endsWith("\n") ? "\n" : "\n\n"}${CURSOR_SHELL_ALIAS_USER_HINT}`;
+/** Normalize-schema defaults used when validating stateless synthetic shell-bridge calls. */
+export function defaultShellBridgeArgNormalizeSchema(toolName: string): unknown {
+  return toolName === CODEX_SHELL_COMMAND_TOOL
+    ? CODEX_SHELL_BRIDGE_ARG_NORMALIZE_SCHEMA
+    : {
+      type: "object",
+      properties: CURSOR_EXEC_COMMAND_INPUT_SCHEMA.properties,
+      required: ["cmd"],
+    };
+}
+
+export function cursorShellBridgeDropError(toolName: string): string {
+  return `Cursor emitted ${toolName} without a non-empty command; the tool call was dropped.`;
+}
+
+/**
+ * Extract a non-empty shell command from completed Cursor bridge args using the schema's required
+ * command key (`cmd` for bare exec_command, `command` for shell_command).
+ */
+export function nonEmptyShellBridgeCommandFromArgs(
+  finalArgs: string,
+  toolName: string,
+  schema?: unknown,
+): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = finalArgs.length > 0 ? JSON.parse(finalArgs) : {};
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const record = parsed as Record<string, unknown>;
+  for (const key of shellBridgeRequiredCommandKeys(toolName, schema)) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return undefined;
+}
+
+export function cursorShellBridgeArgsValid(
+  finalArgs: string,
+  toolName: string,
+  schema?: unknown,
+): boolean {
+  return !isCodexShellBridgeToolName(toolName)
+    || nonEmptyShellBridgeCommandFromArgs(finalArgs, toolName, schema) !== undefined;
 }
 
 export function cursorToolAllowedByChoice(
@@ -382,8 +550,16 @@ export function buildCursorToolGuidanceSystemNote(
   const hasBareExec = shellBridgeNames.length > 0;
   const shellBridgeLabel = quotedNames(shellBridgeNames.length > 0 ? shellBridgeNames : [...CODEX_SHELL_BRIDGE_TOOL_NAMES]);
   const hasApplyPatch = cursorRequestAdvertisesApplyPatch(tools, toolChoice);
+  const structuredEditNames = tools
+    ?.filter(tool => !tool.namespace && isCursorStructuredEditToolName(tool.name))
+    .map(tool => tool.name) ?? [];
   const discoveryTools = discoveryToolLabel(wireNames);
   const unavailableNeighborNames = unavailableNeighborAgentToolNames(wireNames);
+  // Host-shell-neutral: the Codex client executes bridge commands, and may differ from
+  // the OpenCodex proxy OS (LAN/SSH remote-proxy). Always cover PowerShell 5.1 pitfalls.
+  const hostShellNote = hasBareExec
+    ? "Match shell syntax to the Codex client host that runs the bridge (not only the proxy OS). Windows PowerShell 5.1: no CMD `cd /d`, no bash heredocs (`<<EOF`); `&&`/`||` are unsupported parser errors — prefer the bridge working-directory argument for directory changes, and use `if ($?) { ... }` for success-gated follow-up steps; do not treat `;` as a substitute for `&&`. POSIX: use portable commands. After a shell failure, make at most one corrected bridge attempt, then report the error and stop — do not repeat equivalent failing commands."
+    : undefined;
   const notes = [
     `Cursor tool calls: available tool names are exactly ${listedNames}.`,
     "Use the current tool catalog as ground truth and call only those exact names with their listed argument keys.",
@@ -399,12 +575,15 @@ export function buildCursorToolGuidanceSystemNote(
     hasBareExec
       ? "Never tell the user that shell or read access is blocked, disabled, or denied unless the Codex shell bridge tool itself fails. Prefer the bridge over Cursor-native Shell/Read; do not narrate phrases like \"Native shell access is blocked\" — silently call `shell_command` / `exec_command`."
       : undefined,
+    hostShellNote,
     "Cursor product features (Chronicle, screen recording, Notes, Plans, background agents) are available only if this turn's catalog lists a matching tool; do not offer or promise them otherwise.",
     hasBareExec
       ? `For file read/search/listing, use ${shellBridgeLabel} when no more specific listed tool is available.`
       : undefined,
     hasApplyPatch
-      ? "For file edits, use the `apply_patch` tool, not built-in file write/delete tools."
+      ? structuredEditNames.length > 0
+        ? `For file edits, prefer the structured edit tools ${quotedNames(structuredEditNames)} — they take exact-match replacements that OpenCodex converts into Codex \`apply_patch\` changes for approval. Use \`apply_patch\` directly only when you can emit its exact freeform syntax (\`*** Begin Patch\` envelope with \`@@\` hunks and \`-\`/\`+\` line prefixes); never emit patch-like plain text as tool arguments.`
+        : "For file edits, use the `apply_patch` tool, not built-in file write/delete tools."
       : undefined,
     hasBareExec
       ? "For tool-count demos, each counted tool must be a separate Codex shell-bridge invocation/result; do not collapse several requested tools into one chained shell command."
@@ -418,7 +597,7 @@ export function buildCursorToolGuidanceSystemNote(
       : undefined,
     "Do not count or report a tool call unless a tool result was actually returned.",
     hasBareExec
-      ? `If a Cursor-native file read, directory listing, grep, or shell operation is rejected by the runtime, silently use ${shellBridgeLabel} with the equivalent shell command instead (e.g. \`cat\`, \`ls\`, \`rg\`, \`grep\`). Do not tell the user access is blocked. For file edits, use \`apply_patch\` when available.`
+      ? `If a Cursor-native file read, directory listing, grep, or shell operation is rejected by the runtime, silently use ${shellBridgeLabel} with an equivalent host-shell-safe command (POSIX: \`cat\`/\`ls\`/\`rg\`; Windows PowerShell: \`Get-Content\`/\`Get-ChildItem\`/\`Select-String\`). Do not tell the user access is blocked. For file edits, use ${structuredEditNames.length > 0 ? `the structured edit tools (${quotedNames(structuredEditNames)}) or ` : ""}\`apply_patch\` when available.`
       : undefined,
   ].filter((note): note is string => typeof note === "string");
   return notes.join(" ");

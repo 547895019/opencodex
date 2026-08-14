@@ -16,6 +16,7 @@ import { compactionItemToText } from "./compaction";
 import { previousResponseReplayPrefixLength } from "./state";
 import { decodeReasoningEnvelope } from "./reasoning-envelope";
 import { extractHostedWebSearch, WEB_SEARCH_TOOL_NAME } from "../web-search/synthetic-tool";
+import { extractHostedImageGeneration, IMAGE_GEN_TOOL_NAME } from "../images/synthetic-tool";
 
 function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -25,28 +26,54 @@ type InputBlock =
   | { type: "input_text"; text: string }
   | { type: "text"; text: string }
   | { type: "input_image"; image_url?: string; file_id?: string; detail?: string }
-  | { type: "input_file"; file_id?: string; filename?: string };
+  | { type: "input_file"; file_id?: string; filename?: string; file_data?: string };
 
-function inputContentParts(blocks: unknown[] | string | undefined): string | OcxContentPart[] {
+/** A usable reference string, or undefined. Empty strings and non-strings are not references. */
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function inputContentParts(blocks: unknown): string | OcxContentPart[] {
   if (typeof blocks === "string") return blocks;
-  if (!blocks) return [];
+  // The catch-all can also hand back a non-array `content` (an object, a number), which would
+  // throw at the loop below before any per-block guard runs.
+  if (!Array.isArray(blocks)) return [];
   const parts: OcxContentPart[] = [];
   for (const raw of blocks) {
+    // A malformed message item fails its strict schema and falls through to inputItemSchema's
+    // permissive catch-all, so blocks reaching here are NOT guaranteed to match the declared
+    // shape. Validate each field before use, as outputToToolResultContent already does.
+    if (!isObj(raw)) continue;
     const block = raw as InputBlock;
     if (block.type === "input_text" || block.type === "text") {
-      parts.push({ type: "text", text: (block as { text: string }).text });
+      if (typeof raw.text === "string") parts.push({ type: "text", text: raw.text });
     } else if (block.type === "input_image") {
       const b = block as { image_url?: string; file_id?: string; detail?: string };
-      if (b.image_url) {
+      const imageUrl = nonEmptyString(b.image_url);
+      const fileId = nonEmptyString(b.file_id);
+      const detail = nonEmptyString(b.detail);
+      if (imageUrl) {
         // Preserve the image as a structured part — adapters send it as a native image block.
         // NEVER inline the (often base64 data-URL) image_url as text: that explodes the token count.
-        parts.push({ type: "image", imageUrl: b.image_url, ...(b.detail ? { detail: normalizeImageDetail(b.detail) } : {}) });
-      } else {
-        parts.push({ type: "text", text: `[image: ${b.file_id ?? "?"}]` }); // file_id ref → no inline data
+        parts.push({ type: "image", imageUrl, ...(detail ? { detail: normalizeImageDetail(detail) } : {}) });
+      } else if (fileId) {
+        parts.push({ type: "text", text: `[image: ${fileId}]` }); // file_id ref → no inline data
       }
+      // No usable reference: omit the block. A "[image: ?]" marker would claim an attachment
+      // the request never carried, which is worse than dropping malformed input.
     } else if (block.type === "input_file") {
-      const ref = (block as { file_id?: string; filename?: string }).file_id ?? (block as { filename?: string }).filename ?? "?";
-      parts.push({ type: "text", text: `[file: ${ref}]` });
+      const b = block as { file_id?: string; filename?: string; file_data?: string };
+      const fileId = nonEmptyString(b.file_id);
+      const fileData = nonEmptyString(b.file_data);
+      const filename = nonEmptyString(b.filename);
+      if (fileId) {
+        parts.push({ type: "text", text: `[file: ${fileId}]` });
+      } else if (fileData) {
+        // Inline file_data is often large base64. Preserve only its presence and name, never bytes.
+        parts.push({ type: "text", text: filename ? `[file: ${filename}]` : "[file: inline data]" });
+      }
+      // A bare filename is not a file resource in the Responses schema, so omit it rather than
+      // fabricating a "[file: ...]" marker for an attachment that was never sent.
     }
   }
   // Collapse to a plain string only for a single TEXT part; images must stay structured.
@@ -56,14 +83,19 @@ function inputContentParts(blocks: unknown[] | string | undefined): string | Ocx
 
 type OutputBlock = { type: "output_text"; text: string } | { type: "text"; text: string } | { type: "refusal"; refusal: string };
 
-function outputTextOf(blocks: unknown[] | string | undefined): OcxTextContent[] {
+function outputTextOf(blocks: unknown): OcxTextContent[] {
   if (typeof blocks === "string") return blocks.length > 0 ? [{ type: "text", text: blocks }] : [];
-  if (!blocks) return [];
+  if (!Array.isArray(blocks)) return [];
   const out: OcxTextContent[] = [];
   for (const raw of blocks) {
+    // Same catch-all caveat as inputContentParts: validate before use.
+    if (!isObj(raw)) continue;
     const b = raw as OutputBlock;
-    if (b.type === "output_text" || b.type === "text") out.push({ type: "text", text: (b as { text: string }).text });
-    else if (b.type === "refusal") out.push({ type: "text", text: `[refusal: ${(b as { refusal: string }).refusal}]` });
+    if (b.type === "output_text" || b.type === "text") {
+      if (typeof raw.text === "string") out.push({ type: "text", text: raw.text });
+    } else if (b.type === "refusal") {
+      if (typeof raw.refusal === "string") out.push({ type: "text", text: `[refusal: ${raw.refusal}]` });
+    }
   }
   return out;
 }
@@ -75,6 +107,10 @@ function mapToolChoice(value: unknown): OcxRequestOptions["toolChoice"] {
     const t = (value as { type: string }).type;
     if ((t === "function" || t === "custom") && "name" in value) {
       return { name: (value as { name: string }).name };
+    }
+    // Hosted image tool types (with or without a name) map to the synthetic image_gen wire name.
+    if (t === "image_generation" || t === "image_gen") {
+      return { name: IMAGE_GEN_TOOL_NAME };
     }
     if (t === "allowed_tools" && Array.isArray(value.tools)) {
       const names = value.tools
@@ -93,6 +129,7 @@ function allowedToolName(tool: unknown): string | undefined {
   if (!isObj(tool)) return undefined;
   if (typeof tool.name === "string" && tool.name.length > 0) return tool.name;
   if (tool.type === "web_search" || tool.type === "web_search_preview") return WEB_SEARCH_TOOL_NAME;
+  if (tool.type === "image_generation" || tool.type === "image_gen") return IMAGE_GEN_TOOL_NAME;
   if (tool.type === "tool_search") return "tool_search";
   return undefined;
 }
@@ -100,11 +137,15 @@ function allowedToolName(tool: unknown): string | undefined {
 function buildTools(tools: unknown[] | undefined): OcxTool[] | undefined {
   if (!tools) return undefined;
   const out: OcxTool[] = [];
+  const normalizeParameters = (raw: unknown): Record<string, unknown> => {
+    if (isObj(raw) && raw.type === "object") return raw;
+    return { ...(isObj(raw) ? raw : {}), type: "object" };
+  };
   const pushFn = (t: Record<string, unknown>, namespace?: string) => {
     const tool: OcxTool = {
       name: t.name as string,
       description: (t.description as string) ?? "",
-      parameters: (t.parameters ?? {}) as Record<string, unknown>,
+      parameters: normalizeParameters(t.parameters),
     };
     if (t.strict !== undefined) tool.strict = t.strict as boolean;
     if (namespace) tool.namespace = namespace;
@@ -222,6 +263,34 @@ function findToolById(messages: OcxMessage[], callId: string): { name: string; n
   return { name: "" };
 }
 
+/**
+ * Attach pending reasoning to the assistant turn that owns the given call id.
+ * Reconstructed histories (resume/retry/synthetic) can order a `reasoning`
+ * item AFTER the `function_call` it belongs to; without this, the pending
+ * buffer is cleared at the tool output and the turn serializes without
+ * `reasoning_content`, which DeepSeek thinking mode rejects with HTTP 400
+ * (issue #950).
+ */
+function attachPendingReasoningToCallOwner(
+  messages: OcxMessage[],
+  callId: string,
+  pendingReasoning: Array<{ part: OcxThinkingContent; envelopeSigned: boolean }>,
+): void {
+  if (pendingReasoning.length === 0 || !callId) return;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== "assistant") continue;
+    for (const part of m.content) {
+      if (part.type === "toolCall" && part.id === callId) {
+        // Prepend so thinking still precedes tool_use for adapters that require
+        // that ordering (Anthropic-style replay).
+        m.content = [...pendingReasoning.map(entry => entry.part), ...m.content];
+        return;
+      }
+    }
+  }
+}
+
 const REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 export function parseRequest(body: unknown): OcxParsedRequest {
@@ -255,17 +324,33 @@ export function parseRequest(body: unknown): OcxParsedRequest {
   // synthetic `{type:"compaction"}` output item (src/responses/compaction.ts). Flagged for the server.
   let compactionRequest = false;
   let contextCompactionBoundary = false;
+  let continuationConversationMessageIndex: number | undefined;
 
   if (typeof data.instructions === "string" && data.instructions.length > 0) {
     systemPrompt.push(data.instructions);
   }
 
   if (typeof data.input === "string") {
+    if (data.previous_response_id) continuationConversationMessageIndex = messages.length;
     messages.push({ role: "user", content: data.input, timestamp: now });
   } else if (data.input) {
     for (let inputIndex = 0; inputIndex < data.input.length; inputIndex++) {
       const item = data.input[inputIndex];
       const effectiveType = (item as { type?: string }).type ?? ("role" in item ? "message" : undefined);
+      const itemRole = (item as { role?: string }).role;
+      // Raw protocol items do not map one-to-one onto context messages. Capture the boundary while
+      // both representations are available so later metadata can stay before conversation in both.
+      if (
+        data.previous_response_id
+        && inputIndex >= replayedInputPrefixLength
+        && continuationConversationMessageIndex === undefined
+        && (
+          effectiveType === "agent_message"
+          || (effectiveType === "message" && (itemRole === "user" || itemRole === "assistant"))
+        )
+      ) {
+        continuationConversationMessageIndex = messages.length;
+      }
 
       if (effectiveType === "compaction_trigger") {
         compactionRequest = true;
@@ -311,9 +396,7 @@ export function parseRequest(body: unknown): OcxParsedRequest {
           content?: unknown;
         };
 
-        const content = inputContentParts(
-          agentMessage.content as unknown[] | string | undefined,
-        );
+        const content = inputContentParts(agentMessage.content);
 
         const hasContent =
           typeof content === "string"
@@ -338,7 +421,7 @@ export function parseRequest(body: unknown): OcxParsedRequest {
         switch (msg.role) {
           case "system": {
             pendingReasoning.length = 0;
-            const text = inputContentParts(msg.content as unknown[] | string | undefined);
+            const text = inputContentParts(msg.content);
             const flat = typeof text === "string" ? text : text.map(p => (p.type === "text" ? p.text : "")).join("");
             if (flat.length > 0) systemPrompt.push(flat);
             break;
@@ -346,12 +429,12 @@ export function parseRequest(body: unknown): OcxParsedRequest {
           case "user":
           case "developer": {
             pendingReasoning.length = 0;
-            const content = inputContentParts(msg.content as unknown[] | string | undefined);
+            const content = inputContentParts(msg.content);
             messages.push({ role: msg.role, content, timestamp: now });
             break;
           }
           case "assistant": {
-            const parts = outputTextOf(msg.content as unknown[] | string | undefined);
+            const parts = outputTextOf(msg.content);
             messages.push({
               role: "assistant",
               content: pendingReasoning.length > 0
@@ -376,6 +459,18 @@ export function parseRequest(body: unknown): OcxParsedRequest {
           ? decodeReasoningEnvelope(reasoning.encrypted_content)
           : null;
         const thinkingText = envelope?.txt || text;
+
+        // Kiro reasoning round-trip: a krc-only item carries nothing renderable — it is provider
+        // state for the assistant turn that ALREADY closed, because Kiro emits its
+        // reasoningContentEvent at the END of a turn (after content AND tool calls, verified
+        // against kiro-cli 2.14.1/2.16.0). Folding it into the FOLLOWING turn like ordinary
+        // reasoning would attach turn N's blob to turn N+1, so attach it backwards instead. With
+        // no assistant turn to own it the blob is dropped rather than mis-paired.
+        if (envelope?.krc && thinkingText.length === 0) {
+          const previous = messages[messages.length - 1];
+          if (previous?.role === "assistant") previous.kiroRedactedReasoning = envelope.krc;
+          continue;
+        }
 
         // Native/non-ocxr1 encrypted-only reasoning is opaque here. Do not create a detached
         // assistant turn or invent replayable plaintext/signatures from the encrypted payload.
@@ -506,8 +601,9 @@ export function parseRequest(body: unknown): OcxParsedRequest {
       }
 
       if (effectiveType === "function_call_output") {
-        pendingReasoning.length = 0;
         const output = item as { call_id: string; output?: string | unknown[] };
+        attachPendingReasoningToCallOwner(messages, output.call_id, pendingReasoning);
+        pendingReasoning.length = 0;
         const toolInfo = findToolById(messages, output.call_id);
         messages.push({
           role: "toolResult", toolCallId: output.call_id,
@@ -519,8 +615,9 @@ export function parseRequest(body: unknown): OcxParsedRequest {
       }
 
       if (effectiveType === "custom_tool_call_output") {
-        pendingReasoning.length = 0;
         const output = item as { call_id: string; output: string | unknown[] };
+        attachPendingReasoningToCallOwner(messages, output.call_id, pendingReasoning);
+        pendingReasoning.length = 0;
         const toolInfo = findToolById(messages, output.call_id);
         messages.push({
           role: "toolResult", toolCallId: output.call_id,
@@ -532,6 +629,9 @@ export function parseRequest(body: unknown): OcxParsedRequest {
         });
       }
     }
+  }
+  if (data.previous_response_id && continuationConversationMessageIndex === undefined) {
+    continuationConversationMessageIndex = messages.length;
   }
 
   const declaredTools = buildTools(data.tools as unknown[] | undefined) ?? [];
@@ -583,9 +683,16 @@ export function parseRequest(body: unknown): OcxParsedRequest {
   // gpt-mini sidecar for routed providers. buildTools still drops the hosted tool; the sidecar path
   // re-injects a synthetic function tool only when it will actually handle the call.
   const webSearch = extractHostedWebSearch(data.tools as unknown[] | undefined);
-  // Detect structured-output mode (Responses `text.format`) so the web-search sidecar can render its
-  // tool_result as JSON rather than prose that could corrupt the model's schema-constrained answer.
-  const structuredOutput = detectStructuredOutput(data.text);
+  const imageGen = extractHostedImageGeneration([
+    ...(data.tools as unknown[] ?? []),
+    ...loadedToolSpecs,
+  ]);
+  // Capture structured-output mode (Responses `text.format`): the format object rides
+  // options.textFormat for adapters whose wire has an equivalent (openai-chat response_format),
+  // while the `_structuredOutput` flag keeps the web-search sidecar rendering its tool_result
+  // as JSON rather than prose that could corrupt the model's schema-constrained answer.
+  const textFormat = parseTextFormat(data.text);
+  if (textFormat) options.textFormat = textFormat;
 
   return {
     modelId: data.model,
@@ -595,18 +702,35 @@ export function parseRequest(body: unknown): OcxParsedRequest {
     options,
     _rawBody: body,
     ...(replayedInputPrefixLength > 0 ? { _replayPrefixLen: replayedInputPrefixLength } : {}),
+    ...(continuationConversationMessageIndex !== undefined
+      ? { _continuationConversationMessageIndex: continuationConversationMessageIndex }
+      : {}),
     ...(webSearch ? { _webSearch: webSearch } : {}),
-    ...(structuredOutput ? { _structuredOutput: true } : {}),
+    ...(imageGen ? { _imageGeneration: imageGen } : {}),
+    ...(textFormat ? { _structuredOutput: true } : {}),
     ...(compactionRequest ? { _compactionRequest: true } : {}),
     ...(contextCompactionBoundary ? { _contextCompactionBoundary: true } : {}),
   };
 }
 
-/** True when the Responses `text.format` requests structured output (json_schema or json_object). */
-function detectStructuredOutput(text: unknown): boolean {
-  if (!isObj(text)) return false;
+/**
+ * The Responses `text.format` object when it requests structured output (json_schema or
+ * json_object), undefined otherwise. Acceptance is identical to the boolean detector this
+ * replaces; unknown or malformed formats are ignored, never rejected, so the native
+ * passthrough keeps forwarding whatever the caller sent via `_rawBody`.
+ */
+function parseTextFormat(text: unknown): OcxRequestOptions["textFormat"] {
+  if (!isObj(text)) return undefined;
   const format = (text as { format?: unknown }).format;
-  if (!isObj(format)) return false;
-  const t = (format as { type?: unknown }).type;
-  return t === "json_schema" || t === "json_object";
+  if (!isObj(format)) return undefined;
+  const f = format as { type?: unknown; name?: unknown; description?: unknown; schema?: unknown; strict?: unknown };
+  if (f.type === "json_object") return { type: "json_object" };
+  if (f.type !== "json_schema") return undefined;
+  return {
+    type: "json_schema",
+    ...(typeof f.name === "string" ? { name: f.name } : {}),
+    ...(typeof f.description === "string" ? { description: f.description } : {}),
+    ...(isObj(f.schema) ? { schema: f.schema as Record<string, unknown> } : {}),
+    ...(typeof f.strict === "boolean" ? { strict: f.strict } : {}),
+  };
 }

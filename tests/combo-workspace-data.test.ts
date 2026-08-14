@@ -1,15 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import {
   type ComboItem,
+  COMBO_EFFORTS,
   buildComboAttention,
   comboPublicModelId,
   draftEquals,
   emptyDraft,
   filterCombos,
   groupCombos,
+  intersectComboEfforts,
   isValidComboId,
   parseComboList,
   toPutBody,
+  updateComboAliasDraft,
   validateComboDraft,
 } from "../gui/src/combo-workspace-data";
 
@@ -26,6 +29,8 @@ function combo(overrides: Partial<ComboItem> = {}): ComboItem {
     id: "free",
     model: "combo/free",
     alias: null,
+    nativeAlias: false,
+    displayName: null,
     strategy: "failover",
     stickyLimit: 1,
     defaultEffort: "medium",
@@ -85,24 +90,31 @@ describe("combo-workspace-data", () => {
         id: "fallback",
         model: "combo/fallback",
         alias: null,
+        nativeAlias: false,
+        displayName: null,
         strategy: "failover",
         stickyLimit: 1,
         defaultEffort: null,
-        targets: [{ provider: "a", model: "m1", weight: 1 }],
+        targets: [{ provider: "a", model: "m1", weight: 1, clientKey: expect.stringMatching(/^ct-\d+$/) }],
       },
       {
         id: "weighted",
         model: "combo/weighted",
         alias: null,
+        nativeAlias: false,
+        displayName: null,
         strategy: "round-robin",
         stickyLimit: 4,
         defaultEffort: "high",
         targets: [
-          { provider: "a", model: "m1", weight: 3 },
-          { provider: "b", model: "m2", weight: 1 },
+          { provider: "a", model: "m1", weight: 3, clientKey: expect.stringMatching(/^ct-\d+$/) },
+          { provider: "b", model: "m2", weight: 1, clientKey: expect.stringMatching(/^ct-\d+$/) },
         ],
       },
     ]);
+    // UI-only keys must be unique across the parsed list.
+    const keys = items.flatMap((item) => item.targets.map((t) => t.clientKey));
+    expect(new Set(keys).size).toBe(keys.length);
     expect(parseComboList([])).toEqual([]);
     expect(parseComboList({ combos: "invalid" })).toEqual([]);
   });
@@ -156,6 +168,42 @@ describe("combo-workspace-data", () => {
     expect(filterCombos(items, "gpt-balanced").map((item) => item.id)).toEqual(["balanced"]);
   });
 
+  test("intersectComboEfforts keeps only common advertised efforts (#488)", () => {
+    const map = new Map<string, readonly string[] | undefined>([
+      ["a/m1", ["low", "medium", "high", "ultra"]],
+      ["b/m2", ["medium", "high", "xhigh"]],
+    ]);
+    expect(intersectComboEfforts(
+      [{ provider: "a", model: "m1" }, { provider: "b", model: "m2" }],
+      map,
+    )).toEqual(["medium", "high"]);
+  });
+
+  test("intersectComboEfforts treats unknown members as picker wildcards", () => {
+    const map = new Map<string, readonly string[] | undefined>([
+      ["a/m1", ["low", "medium"]],
+    ]);
+    expect(intersectComboEfforts(
+      [{ provider: "a", model: "m1" }, { provider: "b", model: "unknown" }],
+      map,
+    )).toEqual(["low", "medium"]);
+    expect(intersectComboEfforts(
+      [{ provider: "b", model: "unknown" }],
+      map,
+    )).toEqual(COMBO_EFFORTS);
+  });
+
+  test("intersectComboEfforts keeps an advertised empty ladder restrictive", () => {
+    const map = new Map<string, readonly string[] | undefined>([
+      ["a/m1", ["low", "medium"]],
+      ["b/no-reasoning", []],
+    ]);
+    expect(intersectComboEfforts(
+      [{ provider: "a", model: "m1" }, { provider: "b", model: "no-reasoning" }],
+      map,
+    )).toEqual([]);
+  });
+
   test("attention flags zero-target and one-target defensive rows", () => {
     const attention = buildComboAttention([
       combo({ id: "empty", model: "combo/empty", targets: [] }),
@@ -166,6 +214,21 @@ describe("combo-workspace-data", () => {
     expect(attention).toEqual([
       { id: "empty", model: "combo/empty", reason: "empty-targets" },
       { id: "thin", model: "combo/thin", reason: "few-targets" },
+    ]);
+  });
+
+  test("attention flags combos missing from the live catalog (#484)", () => {
+    const attention = buildComboAttention(
+      [
+        combo({ id: "ok" }),
+        combo({ id: "missing", model: "combo/missing" }),
+        combo({ id: "empty", model: "combo/empty", targets: [] }),
+      ],
+      { cataloguedComboIds: new Set(["ok"]) },
+    );
+    expect(attention).toEqual([
+      { id: "missing", model: "combo/missing", reason: "catalog-omitted" },
+      { id: "empty", model: "combo/empty", reason: "empty-targets" },
     ]);
   });
 
@@ -196,10 +259,65 @@ describe("combo-workspace-data", () => {
     expect(validate(combo({ alias: "combo" }))).toBe("aliasReservedNamespace");
     expect(validate(combo({ alias: "gpt-5" }))).toBe("aliasNativeFamily");
     expect(validate(combo({ alias: "codex-latest" }))).toBe("aliasNativeFamily");
+    expect(validate(combo({
+      alias: "gpt-5.6-sol",
+      nativeAlias: true,
+      displayName: "Nova1 - Sol",
+    }))).toBeNull();
+    expect(validate(combo({
+      alias: "ordinary-alias",
+      nativeAlias: true,
+      displayName: "Nova1 - Sol",
+    }))).toBe("unsupportedNativeAlias");
+    expect(validate(combo({
+      alias: "gpt-unknown",
+      nativeAlias: true,
+      displayName: "Nova1 - Unknown",
+    }))).toBe("unsupportedNativeAlias");
+    expect(validate(combo({
+      alias: "gpt-5.6-sol",
+      nativeAlias: true,
+      displayName: null,
+    }))).toBe("missingNativeAliasDisplayName");
+    expect(validate(combo({
+      alias: "gpt-5.6-sol",
+      nativeAlias: true,
+      displayName: `Nova1${String.fromCharCode(10)}Sol`,
+    }))).toBe("invalidDisplayName");
     // Slashed ids in the same families are fine — only BARE names collide with natives.
     expect(validate(combo({ alias: "openai/gpt-5" }))).toBeNull();
     expect(validate(combo({ alias: "taken" }), { existingAliases: ["taken"] })).toBe("duplicateAlias");
     expect(validate(combo({ alias: "taken" }), { existingAliases: ["other"] })).toBeNull();
+  });
+
+  test("alias edits can convert a hidden native alias back to an ordinary combo", () => {
+    const native = combo({
+      alias: "gpt-5.6-sol",
+      nativeAlias: true,
+      displayName: "Nova1 - Sol",
+    });
+
+    const ordinary = updateComboAliasDraft(native, "fast-chat");
+    expect(ordinary).toMatchObject({
+      alias: "fast-chat",
+      model: "fast-chat",
+      nativeAlias: false,
+      displayName: null,
+    });
+    expect(validate(ordinary)).toBeNull();
+    expect(toPutBody(ordinary).combo).not.toHaveProperty("nativeAlias");
+    expect(toPutBody(ordinary).combo).not.toHaveProperty("displayName");
+
+    expect(updateComboAliasDraft(native, "")).toMatchObject({
+      alias: null,
+      model: "combo/free",
+      nativeAlias: false,
+      displayName: null,
+    });
+    expect(updateComboAliasDraft(native, "gpt-5.6-terra")).toMatchObject({
+      nativeAlias: true,
+      displayName: "Nova1 - Sol",
+    });
   });
 
   test("create drafts support bare, custom-prefixed, and default public names", () => {
@@ -257,6 +375,14 @@ describe("combo-workspace-data", () => {
     });
     expect("stickyLimit" in failoverBody.combo).toBe(false);
     expect("weight" in failoverBody.combo.targets[0]!).toBe(false);
+    // clientKey is UI-only — never serialize it upstream even when present on the draft.
+    const withClientKeys = toPutBody(combo({
+      targets: [
+        { provider: "a", model: "m1", clientKey: "ct-ui-1" },
+        { provider: "b", model: "m2", clientKey: "ct-ui-2" },
+      ],
+    }));
+    expect(withClientKeys.combo.targets.every((t) => !("clientKey" in t))).toBe(true);
   });
 
   test("preserves an unset effort through parse, draft, and PUT", () => {
@@ -286,6 +412,29 @@ describe("combo-workspace-data", () => {
     expect(renamed.id).toBe("new-name");
     expect(renamed.renameFrom).toBe("free");
     expect("alias" in renamed.combo).toBe(false);
+  });
+
+  test("parse and PUT preserve advanced native-alias fields", () => {
+    const parsed = parseComboList({
+      combos: [{
+        id: "nova-sol",
+        model: "gpt-5.6-sol",
+        alias: "gpt-5.6-sol",
+        nativeAlias: true,
+        displayName: "Nova1 - Sol",
+        targets: [{ provider: "a", model: "m1" }],
+      }],
+    })[0]!;
+
+    expect(parsed).toMatchObject({
+      nativeAlias: true,
+      displayName: "Nova1 - Sol",
+    });
+    expect(toPutBody(parsed).combo).toMatchObject({
+      alias: "gpt-5.6-sol",
+      nativeAlias: true,
+      displayName: "Nova1 - Sol",
+    });
   });
 
   test("rejects duplicate targets", () => {

@@ -28,6 +28,31 @@ ocx claude
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` / `DISABLE_COMPACT` | `maxContextTokens`가 설정된 경우 기존 컨텍스트 재정의 값 (조건부) |
 직접 내보낸 변수가 항상 우선해요. 추가 인자는 그대로 전달돼요: `ocx claude -p "hello"`.
 
+## 인증 모드
+
+Claude Code가 게이트웨이와 통신하려면 `ANTHROPIC_AUTH_TOKEN`에 토큰이 필요해요. 그런데 이 변수를
+설정하면 claude.ai 로그인과 커넥터가 꺼져요. 둘 중 무엇이 필요한지는 지금 이 컴퓨터에 Claude
+로그인이 있느냐에 달려 있고, 그건 opencodex가 직접 확인할 수 있어요.
+
+**Claude → Claude Code**의 **인증 모드**를 기본값인 **자동**으로 두면 실행할 때마다 이렇게 판단해요.
+
+| 발견한 것 | 동작 |
+| --- | --- |
+| Claude 로그인(`~/.claude.json`의 OAuth 계정, `.credentials.json`, macOS 키체인, 내보낸 `ANTHROPIC_API_KEY`) | 토큰을 설정하지 않아요. 구독과 커넥터가 그대로 유지돼요 |
+| Claude 인증이 전혀 없음 | 더미 토큰을 넣어요. Claude Code가 로그인을 요구하지 않고 프록시로 라우팅돼요 |
+| 확인 실패(키체인 접근 거부, 파일 손상 등) | 구독으로 간주하고 경고를 출력해요. 읽기에 실패했다고 구독자를 프록시로 옮기지는 않아요 |
+
+이 판단은 저장하지 않고 실행할 때마다 다시 계산해요. 그래서 로그인하거나 로그아웃하면 다음
+`ocx claude`부터 알아서 반영돼요.
+
+고정하고 싶다면 **구독** 또는 **프록시**를 직접 선택하세요. 직접 고른 값은 `claudeCode.authMode`에
+저장되고, 이후에 로그인 상태가 바뀌어도 자동 감지가 이 값을 덮어쓰지 않아요. 다시 자동으로
+돌리면 판단을 opencodex에 넘겨요.
+
+macOS의 자동 연결(`claudeCode.systemEnv`)도 같은 방식으로 판단하므로, `ocx` 없이 실행한 `claude`도
+동일하게 동작해요. 다만 이쪽은 프록시가 시작하거나 설정을 저장할 때 갱신되는 스냅숏이고,
+`ocx claude`는 실행할 때마다 실시간으로 판단해요.
+
 ## 시스템 환경 통합(macOS)
 
 `claudeCode.systemEnv`를 `true`로 설정하면(기본값: **꺼짐**) `ocx start`가 `launchctl setenv`를
@@ -50,18 +75,32 @@ ocx claude
 네이티브 상태로 유지되고, 같은 세션에서 선택기 별칭을 써서 라우팅 모델도 계속 사용할 수 있어요.
 
 **헤더 처리:** hop-by-hop 헤더와 `host`, `content-length`, `accept-encoding`,
-`x-opencodex-api-key`, `origin`은 전달 전에 제거해요. 그 밖의 헤더(`anthropic-beta`,
-`anthropic-version` 포함)는 그대로 전달해요.
+`x-opencodex-api-key`, `origin`은 항상 전달 전에 제거해요. 비루프백 바인드의 네이티브 패스스루는
+유효한 프록시 자격 증명을 `x-opencodex-api-key`로도 요구하고, 이때 `Authorization`과
+`x-api-key`는 Anthropic 전용이에요. 두 provider 헤더 중 프록시 admission secret이 있으면
+제거하고, 다른 헤더의 실제 provider 자격 증명은 유지해요. 쉼표로 결합된 모호한 자격 증명
+헤더는 전달하지 않아요.
 
-다음 네 조건을 **모두** 충족하면 패스스루가 작동해요. `nativePassthrough`가 `false`가 아니고,
-모델 이름이 `claude` 또는 `anthropic`으로 시작하며, bearer 또는 `x-api-key`가 `sk-ant-`로
-시작하고, 별칭/모델 맵 해석 결과가 변경되지 않은 같은 모델이어야 해요. 그래서 `ocx claude`를
+다음 조건을 **모두** 충족하면 패스스루가 작동해요. `nativePassthrough`가 `false`가 아니고,
+모델 이름이 `claude` 또는 `anthropic`으로 시작하며, bearer 토큰 또는 `x-api-key`가 `sk-ant-`로
+시작하고, 별칭/모델 맵 해석 결과가 변경되지 않은 같은 모델이며, 비루프백 바인드에서는 전용
+프록시 admission 헤더도 유효해야 해요. 그래서 `ocx claude`를
 사용할 때 "claude.ai connectors are disabled" 경고도 더 이상 나타나지 않아요.
 
 `claudeCode.nativePassthrough: false`로 끌 수 있고, `claudeCode.anthropicBaseUrl`로 다른 주소를
 지정할 수 있어요.
 
 ## /model 선택기("From gateway")
+각 항목은 `gemini-3-pro (gemini)` 같은 정직한 표시 이름과 함께, 공식 ModelInfo 형태의 모델
+능력 정보(추론 강도 사다리, thinking 타입)를 실어 보냅니다 — Claude Desktop의 서드파티
+게이트웨이 모드가 추론 강도 선택 UI를 열 수 있게 하기 위해서입니다. 실제 Anthropic 모델은
+원래 id를 그대로 유지합니다. 합성된 2026 날짜는 내부 슬롯이며 출시일이 아닙니다. 구버전의
+해시 별칭과 `claude-ocx-<provider>--<model>` 별칭도 계속 해석됩니다. 컨텍스트가 1M인 모델에는
+`…[1m]` 행이 하나 더 생깁니다 — 이걸 고르면 Claude Code가 그 모델의 컨텍스트를 1M로 계산합니다
+(자동 요약 유지, 프록시가 표식을 떼고 라우팅). 선택하면 Claude Code의
+`settings.json` `model` 필드에 저장되고, 인바운드 요청에서
+별칭이 라우팅 모델로 되돌려집니다. 구버전 Claude Code에서는 `ANTHROPIC_MODEL`로 슬롯을
+지정하거나 `/model`에 라우팅 id를 직접 입력하세요 (Claude Code는 문자열을 그대로 통과시킵니다).
 
 Claude Code 2.1.129 이상은 `GET /v1/models?limit=1000`에서 게이트웨이 모델을 찾아 기본 `/model`
 선택기의 "From gateway" 항목에 표시해요. 선택기는 `claude` 또는 `anthropic`으로 시작하는 ID만
@@ -69,7 +108,7 @@ Claude Code 2.1.129 이상은 `GET /v1/models?limit=1000`에서 게이트웨이 
 
 | 화면 | 형식 | 예시 |
 | --- | --- | --- |
-| Claude Code CLI | `claude-ocx-<provider>--<model>` | `claude-ocx-native--gpt-5.6-sol` |
+| Claude Code CLI | `claude-ocx-<provider>--<model>` (plain) 또는 `claude-ocx2-…` (escaped) | `claude-ocx-native--gpt-5.6-sol` |
 | Claude Desktop 3P | `claude-opus-4-8-<code>` (3자리 base36 해시) | `claude-opus-4-8-ncb` |
 
 프록시는 요청마다 계열을 골라요. `?ids=cli` 또는 `?ids=desktop`이 우선하고, 지정하지 않으면
@@ -77,9 +116,17 @@ Claude Code 2.1.129 이상은 `GET /v1/models?limit=1000`에서 게이트웨이 
 제공해요. 두 계열은 계속 디코딩할 수 있으므로 어느 형식이든 `settings.json`에 저장한 모델이
 계속 작동해요.
 
-**별칭 문법 규칙:** provider에는 `/`나 `--`를 넣을 수 없고 `native`와 같아도 안 돼요. model에는
-`/`를 넣을 수 없어요. 읽기 쉬운 형식으로 표현할 수 없는 라우트는 해시 별칭으로 대체해요. 모델
-ID에는 `--`를 넣을 **수 있어요**(해석할 때 첫 번째 `--`만 기준으로 나눠요). `--`가 포함된
+Claude Desktop의 하단 선택기로 이미 실행 중인 3P 대화의 모델이 바뀌지 않는다면, 그 대화에서
+`/model <id>`를 사용하세요. OpenCodex는 선택기 상태를 따로 볼 수 없고 각 요청에 실린 모델 ID를
+라우팅해요. 적용 결과는 **Logs → requestedModel**에서 확인할 수 있어요.
+
+**별칭 문법 규칙:** provider에는 `/`나 `--`를 넣을 수 없고 `native`와 같아도 안 돼요. `/`와 `~`가
+없는 plain model ID는 v1 접두사 `claude-ocx-…`를 유지해요. `/` 또는 `~`가 있는 model ID는 v2
+접두사 `claude-ocx2-…`로 만들고 이스케이프해요(`/` → `~s`, `~` → `~t`). 예:
+`openrouter/anthropic/claude-opus-4-8` → `claude-ocx2-openrouter--anthropic~sclaude-opus-4-8`.
+v1 별칭은 리터럴로 디코딩해요(예전 model ID에 들어 있던 두 글자 시퀀스 `~s` / `~t`도 그대로 보존).
+v2 별칭은 이스케이프를 펼쳐요. 읽기 쉬운 형식으로 표현할 수 없는 라우트는 해시 별칭으로 대체해요.
+모델 ID에는 `--`를 넣을 **수 있어요**(해석할 때 첫 번째 `--`만 기준으로 나눠요). `--`가 포함된
 네이티브 슬러그는 해시 형식으로 대체해요.
 
 **모델 해석 순서:** `[1m]` 표식 제거 → 읽기 쉬운 별칭 디코딩 → Desktop 해시 별칭 디코딩 →
@@ -244,7 +291,7 @@ Claude Code의 `/effort` 설정은 어댑터에서도 유지돼요.
 | --- | --- |
 | `thinking.type: "adaptive"` + `output_config.effort` | Effort를 그대로 전달해요(`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`\|`ultra`) |
 | `thinking.type: "enabled"` + `budget_tokens` | ≤4096→`low`, ≤16384→`medium`, 그보다 크면→`high` |
-| `thinking.type: "disabled"` | 추론 매개변수를 모두 생략해요 |
+| `thinking.type: "disabled"` | `reasoning: { effort: "none" }`을 명시하고 `summary`는 생략해요 |
 
 해석된 값은 요청 로그의 **Reasoning effort** 열에 표시돼요.
 
@@ -262,7 +309,7 @@ Claude Code의 `/effort` 설정은 어댑터에서도 유지돼요.
 | 사용자 `tool_result` | `function_call_output`(`is_error` → `[tool error]` 접두사) |
 | `thinking` / `redacted_thinking` 재생 | 버려요 |
 | Function 도구 | `{type: "function"}`(`web_search*` → `{type: "web_search"}`) |
-| `tool_choice` | `auto`→`auto`, `none`→`none`, `any`→`required`, 이름 지정→`{type:"function",name}` |
+| `tool_choice` | `auto`→`auto`, `none`→`none`, `any`→`required`, 이름 지정 함수→`{type:"function",name}`, 호스팅 WebSearch/web_search→`{type:"web_search"}` |
 | `max_tokens` | `max_output_tokens` |
 | `stop_sequences` | `stop` |
 

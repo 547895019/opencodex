@@ -1,23 +1,25 @@
 import { useEffect, useRef, useState } from "react";
+import { useKeyedClientResource } from "./client-resource";
 import Dashboard from "./pages/Dashboard";
 import Providers from "./pages/Providers";
 import Models from "./pages/Models";
-import Combos from "./pages/Combos";
 import Subagents from "./pages/Subagents";
 import Logs from "./pages/Logs";
 import Usage from "./pages/Usage";
 import Storage from "./pages/Storage";
 import CodexAuth from "./pages/CodexAuth";
-import ApiKeys from "./pages/ApiKeys";
-import ClaudeCode from "./pages/ClaudeCode";
+import Integrations from "./pages/Integrations";
 import Startup from "./pages/Startup";
 import ErrorBoundary from "./components/ErrorBoundary";
-import { IconGrid, IconServer, IconBoxes, IconBot, IconList, IconActivity, IconHardDrive, IconKey, IconGithub, IconMenu, IconSun, IconMoon, IconMonitor, IconGlobe, IconPower, IconSparkle, IconX } from "./icons";
-import { useI18n, useT, LOCALES, type Locale, type TKey } from "./i18n";
-import { Select, Switch } from "./ui";
+import { SidebarGithubRow } from "./components/sidebar-github-row";
+import { IconGrid, IconServer, IconBoxes, IconBot, IconList, IconActivity, IconHardDrive, IconKey, IconMenu, IconSun, IconMoon, IconMonitor, IconGlobe, IconPower, IconX } from "./icons";
+import { useI18n, useT, LOCALES, localeDisplayName, type Locale, type TKey } from "./i18n/shared";
+import { Select } from "./ui";
 import { installApiAuthFetch } from "./api";
 import { type Page } from "./app-routing";
+import { readModelsTab, type ModelsTab } from "./pages/models-tab";
 import { useAppRouteState } from "./use-app-route-state";
+import { requestProxyStop } from "./stop-proxy";
 
 installApiAuthFetch();
 
@@ -28,20 +30,32 @@ const PAGE_TKEY: Record<Page, TKey> = {
   startup: "nav.startup",
   providers: "nav.providers",
   models: "nav.models",
-  combos: "nav.combos",
   subagents: "nav.subagents",
   logs: "nav.logs",
   usage: "nav.usage",
   storage: "nav.storage",
   "codex-auth": "nav.codexAuth",
-  api: "nav.api",
-  claude: "nav.claude",
+  integrations: "nav.integrations",
 };
 
 const API_BASE = import.meta.env.VITE_API_BASE || "";
 const THEME_KEY = "ocx-theme";
 
-const NAV: { id: Page; tkey: TKey; Icon: typeof IconGrid }[] = [
+/**
+ * Every sidebar row maps one-to-one onto a page again.
+ *
+ * The Claude row was the exception: a second entry pointing at a tab of Integrations,
+ * which needed `subPath`, `activeHashes`, and an `isNavEntryActive` helper whose only
+ * job was stopping the sidebar from lighting two rows and claiming the user was in two
+ * places. Removing the duplicate removed all four.
+ */
+type NavEntry = {
+  id: Page;
+  tkey: TKey;
+  Icon: typeof IconGrid;
+};
+
+const NAV: NavEntry[] = [
   { id: "dashboard", tkey: "nav.dashboard", Icon: IconGrid },
   { id: "codex-auth", tkey: "nav.codexAuth", Icon: IconKey },
   { id: "providers", tkey: "nav.providers", Icon: IconServer },
@@ -50,8 +64,7 @@ const NAV: { id: Page; tkey: TKey; Icon: typeof IconGrid }[] = [
   { id: "logs", tkey: "nav.logs", Icon: IconList },
   { id: "usage", tkey: "nav.usage", Icon: IconActivity },
   { id: "storage", tkey: "nav.storage", Icon: IconHardDrive },
-  { id: "api", tkey: "nav.api", Icon: IconGlobe },
-  { id: "claude", tkey: "nav.claude", Icon: IconSparkle },
+  { id: "integrations", tkey: "nav.integrations", Icon: IconGlobe },
 ];
 
 const THEME_ICON = { light: IconSun, dark: IconMoon, system: IconMonitor } as const;
@@ -70,8 +83,21 @@ function readStoredTheme(): Theme {
 
 export default function App() {
   const { page, navigateToPage } = useAppRouteState();
+  /*
+   * App needs the Models tab for one reason only: the full-bleed combos modifier lives
+   * on `.main-inner`, which is App's element. Models owns every other tab concern.
+   */
+  const [modelsTab, setModelsTab] = useState<ModelsTab>(readModelsTab);
+  useEffect(() => {
+    const syncModelsTab = () => setModelsTab(readModelsTab());
+    window.addEventListener("hashchange", syncModelsTab);
+    window.addEventListener("popstate", syncModelsTab);
+    return () => {
+      window.removeEventListener("hashchange", syncModelsTab);
+      window.removeEventListener("popstate", syncModelsTab);
+    };
+  }, []);
   const [theme, setTheme] = useState<Theme>(readStoredTheme);
-  const [runtimeVersion, setRuntimeVersion] = useState<string | null>(null);
   const { locale, setLocale } = useI18n();
   const t = useT();
 
@@ -98,30 +124,22 @@ export default function App() {
     else { el.setAttribute("data-theme", theme); localStorage.setItem(THEME_KEY, theme); }
   }, [theme]);
 
-  useEffect(() => {
-    let cancelled = false;
-    const fetchRuntimeVersion = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/healthz`);
-        if (!res.ok) return;
-        const version = readRuntimeVersion(await res.json());
-        if (!cancelled && version) setRuntimeVersion(version);
-      } catch {
-        // Keep the build-time fallback when the proxy is unavailable.
-      }
-    };
-    fetchRuntimeVersion();
-    const interval = setInterval(fetchRuntimeVersion, 30000);
-    return () => { cancelled = true; clearInterval(interval); };
-  }, []);
+  const healthPoll = useKeyedClientResource(
+    `app-healthz:${API_BASE}`,
+    [],
+    async (signal) => {
+      const res = await fetch(`${API_BASE}/healthz`, { signal });
+      if (!res.ok) return null;
+      return readRuntimeVersion(await res.json());
+    },
+    { pollMs: 30_000 },
+  );
 
   const cycleTheme = () => setTheme(t => (t === "light" ? "dark" : t === "dark" ? "system" : "light"));
   const ThemeIcon = THEME_ICON[theme];
-  const displayedVersion = runtimeVersion ?? __APP_VERSION__;
+  const displayedVersion: string = healthPoll.data ?? __APP_VERSION__;
 
   const [stopping, setStopping] = useState(false);
-  // Claude navigation row also owns the connection toggle.
-  const [claudeEnabled, setClaudeEnabled] = useState<boolean | null>(null);
 
   useEffect(() => {
     if (!navOpen) return;
@@ -151,34 +169,19 @@ export default function App() {
     return () => mq.removeEventListener("change", onChange);
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    fetch(`${API_BASE}/api/claude-code`)
-      .then(res => res.json())
-      .then(d => { if (!cancelled && typeof d.enabled === "boolean") setClaudeEnabled(d.enabled); })
-      .catch(() => { /* toggle stays hidden until the API answers */ });
-    return () => { cancelled = true; };
-  }, []);
-
-  const toggleClaude = async () => {
-    if (claudeEnabled === null) return;
-    const next = !claudeEnabled;
-    setClaudeEnabled(next); // optimistic
-    try {
-      const res = await fetch(`${API_BASE}/api/claude-code`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: next }),
-      });
-      if (!res.ok) setClaudeEnabled(!next);
-    } catch {
-      setClaudeEnabled(!next);
-    }
-  };
   const handleStop = async () => {
     if (!confirm(t("dash.stopConfirm"))) return;
     setStopping(true);
-    try { await fetch(`${API_BASE}/api/stop`, { method: "POST" }); } catch { /* connection drops */ }
+    const outcome = await requestProxyStop(API_BASE, {
+      formatFailure: status => t("dash.stopFailed", { status: String(status) }),
+    });
+    // Refusals and restore failures return normally instead of dropping the connection.
+    // In both cases the proxy did not reach a clean-stop result, so re-enable the control
+    // and surface the server's remediation instead of leaving "stopping…" stuck forever.
+    if (!outcome.accepted) {
+      setStopping(false);
+      alert(outcome.message);
+    }
   };
 
   const brand = (
@@ -220,29 +223,36 @@ export default function App() {
             account pool. It is now promoted to the second slot instead: there is only
             one layout, so that filter would have hidden the page permanently.
           */}
-          {NAV.map(({ id, tkey, Icon }) => (
-            <div key={id} className={`nav-entry${id === "claude" ? ` nav-entry-claude${page === id ? " active" : ""}` : ""}`}>
-              <button className={`nav-item${page === id ? " active" : ""}`} data-page={id}
-                onClick={() => {
-                  // Deliberate sidebar navigation — push a history entry.
-                  navigateToPage(id);
-                  setNavOpen(false);
-                }}
-                aria-current={page === id ? "page" : undefined}>
-                <Icon /> {t(tkey)}
-              </button>
-              {id === "claude" && claudeEnabled !== null && (
-                <Switch on={claudeEnabled} onClick={() => void toggleClaude()} label={t("claude.toggleAria")} />
-              )}
-            </div>
-          ))}
+          {/*
+            The sidebar is navigation only — no row owns a mutation. That rule was
+            written when the Claude row carried the Claude Code connection switch;
+            ClaudeCode owns GET/PUT /api/claude-code now, and the row itself is gone.
+          */}
+          {NAV.map(entry => {
+            const { id, tkey, Icon } = entry;
+            const active = id === page;
+            return (
+              <div key={id} className="nav-entry">
+                <button type="button" className={`nav-item${active ? " active" : ""}`}
+                  data-page={id}
+                  onClick={() => {
+                    // Deliberate sidebar navigation — push a history entry.
+                    navigateToPage(id);
+                    setNavOpen(false);
+                  }}
+                  aria-current={active ? "page" : undefined}>
+                  <Icon /> {t(tkey)}
+                </button>
+              </div>
+            );
+          })}
         </nav>
         <div className="sidebar-foot">
           <div className="lang-toggle">
             <IconGlobe aria-hidden />
             <Select
               value={locale}
-              options={LOCALES.map(l => ({ value: l.code, label: l.name }))}
+              options={LOCALES.map(l => ({ value: l.code, label: localeDisplayName(l.code) }))}
               onChange={v => setLocale(v as Locale)}
               label={t("lang.label")}
               placement="right"
@@ -258,14 +268,28 @@ export default function App() {
             aria-label={t("dash.stop")} title={t("dash.stop")}>
             <IconPower /> <span className="mode">{stopping ? t("dash.stopping") : t("dash.stop")}</span>
           </button>
-          <a className="sidebar-link" href="https://github.com/lidge-jun/opencodex" target="_blank" rel="noreferrer">
-            <IconGithub /> {t("common.github")}
-          </a>
+          <SidebarGithubRow
+            apiBase={API_BASE}
+            onOpenUpdate={() => {
+              // The update dialog lives on the dashboard maintenance panel. Deep-link to
+              // `#dashboard/update` and let the dashboard own the check/run flow — no
+              // cross-component event bus, and the link survives a refresh.
+              setNavOpen(false);
+              navigateToPage("dashboard", "update");
+            }}
+          />
         </div>
       </aside>
 
       <main className="main" inert={navOpen}>
-        <div className={`main-inner${page === "combos" ? " main-inner--combos" : ""}`}>
+        {/*
+          Combos is full-bleed, unlike every other surface, and it is reachable only as
+          a Models tab. `.main-inner` is App's element, so App is the only place that
+          can know which tab is showing.
+        */}
+        <div className={`main-inner${
+          page === "models" && modelsTab === "combos" ? " main-inner--combos" : ""
+        }`}>
           <ErrorBoundary
             key={page}
             pageName={t(PAGE_TKEY[page])}
@@ -277,15 +301,13 @@ export default function App() {
             {page === "dashboard" && <Dashboard apiBase={API_BASE} />}
             {page === "startup" && <Startup apiBase={API_BASE} />}
             {page === "providers" && <Providers apiBase={API_BASE} />}
-            {page === "models" && <Models apiBase={API_BASE} />}
-            {page === "combos" && <Combos apiBase={API_BASE} />}
-            {page === "subagents" && <Subagents apiBase={API_BASE} />}
+            {page === "models" && <Models key={API_BASE} apiBase={API_BASE} />}
+            {page === "subagents" && <Subagents key={API_BASE} apiBase={API_BASE} />}
             {page === "logs" && <Logs apiBase={API_BASE} />}
             {page === "usage" && <Usage apiBase={API_BASE} />}
             {page === "storage" && <Storage apiBase={API_BASE} />}
             {page === "codex-auth" && <CodexAuth apiBase={API_BASE} />}
-            {page === "api" && <ApiKeys apiBase={API_BASE} />}
-            {page === "claude" && <ClaudeCode apiBase={API_BASE} />}
+            {page === "integrations" && <Integrations apiBase={API_BASE} />}
           </ErrorBoundary>
         </div>
       </main>

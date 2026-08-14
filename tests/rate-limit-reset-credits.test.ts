@@ -128,7 +128,7 @@ describe("rate-limit reset credits", () => {
         },
         rate_limit_reset_credits: { available_count: 0 },
       });
-      expect(quota).toEqual({ monthlyPercent: 6, monthlyResetAt: 1787336442, resetCredits: 0 });
+      expect(quota).toEqual({ monthlyPercent: 6, monthlyResetAt: 1787336442, resetCredits: 0, monthlyIsPrimaryWindow: true });
       expect(quota!.weeklyPercent).toBeUndefined();
     });
 
@@ -143,6 +143,7 @@ describe("rate-limit reset credits", () => {
       expect(quota).toEqual({
         monthlyPercent: 39,
         monthlyResetAt: 1787401330,
+        monthlyIsPrimaryWindow: true,
         weeklyPercent: 20,
         weeklyResetAt: 1787000000,
       });
@@ -156,7 +157,7 @@ describe("rate-limit reset credits", () => {
           tertiary_window: { used_percent: 50, reset_at: 1788000000 },
         },
       });
-      expect(quota).toEqual({ monthlyPercent: 39, monthlyResetAt: 1787401330 });
+      expect(quota).toEqual({ monthlyPercent: 39, monthlyResetAt: 1787401330, monthlyIsPrimaryWindow: true });
     });
 
     it("falls back to tertiary wholesale when a monthly primary has no percent", () => {
@@ -179,6 +180,8 @@ describe("rate-limit reset credits", () => {
           tertiary_window: { used_percent: 50, reset_at: 1788000000 },
         },
       });
+      // No provenance flag on the Go/Free branch: the monthly window governs those plans
+      // regardless of which window produced the reading, so recovery never consults it.
       expect(quota).toEqual({ monthlyPercent: 30, monthlyResetAt: 1787401330 });
     });
 
@@ -237,11 +240,15 @@ describe("rate-limit reset credits", () => {
     });
 
     it("does not exclude team or workspace plans from ticket badges", async () => {
-      const source = await Bun.file("gui/src/components/CodexAccountPool.tsx").text();
+      const [pool, helpers] = await Promise.all([
+        Bun.file("gui/src/components/CodexAccountPool.tsx").text(),
+        Bun.file("gui/src/components/codex-account-pool-helpers.tsx").text(),
+      ]);
+      const source = `${pool}\n${helpers}`;
       expect(source).not.toContain("isWorkspaceAccount");
       expect(source).not.toContain("Not available for workspace accounts");
-      expect(source).toContain("if (credits === undefined) return null;");
-      expect(source).toContain("className={`badge ${hasCredits ? \"badge-amber\" : \"badge-muted\"} badge-clickable`}");
+      expect(helpers).toContain("if (credits === undefined) return null;");
+      expect(helpers).toContain("className={`badge ${hasCredits ? \"badge-amber\" : \"badge-muted\"} badge-clickable`}");
     });
 
     it("keeps clickable ticket badges from overriding visual badge colors", async () => {
@@ -254,12 +261,12 @@ describe("rate-limit reset credits", () => {
     });
 
     it("renders reset tickets beside next-session badges instead of replacing them", async () => {
-      const source = await Bun.file("gui/src/components/CodexAccountPool.tsx").text();
+      const source = await Bun.file("gui/src/components/codex-account-pool-cards.tsx").text();
       expect(source).toContain("className=\"card-badges\"");
-      expect(source).toContain("<TicketBadge t={t} account={a} onClick={() => openResetPopup(a)} />");
-      // Since the pool/direct mode split, the next-session badge is conditional on the
-      // account mode (poolPrepared in direct mode) but still renders BESIDE the ticket.
-      expect(source).toContain("{isNext(a.id) && !a.needsReauth && (");
+      expect(source).toContain("<CodexTicketBadge t={t} account={a} onClick={() => onOpenReset(a)} />");
+      // Next-session still renders BESIDE the ticket; health projection also suppresses
+      // it for projected reauth/cooldown (not only the legacy needsReauth flag).
+      expect(source).toContain("{isNext(a) && !showReauth && !inCooldown && (");
       expect(source).toContain("{t(accountModeState === \"direct\" ? \"codexAuth.poolPrepared\" : \"codexAuth.nextSession\")}");
       const styles = await Bun.file("gui/src/styles.css").text();
       expect(styles).toContain(".card-badges { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }");
@@ -306,11 +313,12 @@ describe("rate-limit reset credits", () => {
           secondary_window: null,
         },
       });
-      expect(quota).toEqual({ monthlyPercent: 100, monthlyResetAt: 1787401330 });
+      expect(quota).toEqual({ monthlyPercent: 100, monthlyResetAt: 1787401330, monthlyIsPrimaryWindow: true });
       setAccountQuotaFromParsed("monthly-A", quota!);
       expect(getAccountQuota("monthly-A")).toEqual({
         monthlyPercent: 100,
         monthlyResetAt: 1787401330,
+        monthlyIsPrimaryWindow: true,
         updatedAt: expect.any(Number),
       });
     });
@@ -327,6 +335,7 @@ describe("rate-limit reset credits", () => {
       expect(getAccountQuota("monthly-A")).toEqual({
         monthlyPercent: 100,
         monthlyResetAt: 1787401330,
+        monthlyIsPrimaryWindow: true,
         updatedAt: expect.any(Number),
       });
     });
@@ -377,6 +386,7 @@ describe("rate-limit reset credits", () => {
       expect(getAccountQuota("team-tertiary")).toEqual({
         monthlyPercent: 39,
         monthlyResetAt: 1787401330,
+        monthlyIsPrimaryWindow: true,
         updatedAt: expect.any(Number),
       });
     });
@@ -427,6 +437,7 @@ describe("rate-limit reset credits", () => {
       expect(getAccountQuota("team-A")).toEqual({
         monthlyPercent: 39,
         monthlyResetAt: 1787401330,
+        monthlyIsPrimaryWindow: true,
         weeklyPercent: 20,
         weeklyResetAt: 1787000000,
         updatedAt: expect.any(Number),

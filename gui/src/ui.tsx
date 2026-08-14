@@ -14,23 +14,69 @@ export function Switch({ on, onClick, disabled, label }: { on: boolean; onClick:
   );
 }
 
-export function Notice({ tone, children }: { tone: "ok" | "err"; children: ReactNode }) {
+/** Shared presentation tone for success, degraded success, and failure notices. */
+export type NoticeTone = "ok" | "warn" | "err";
+
+export function Notice({ tone, children }: { tone: NoticeTone; children: ReactNode }) {
+  // `warn` is degraded-but-not-failed: the action happened, something adjacent
+  // did not. It must not render as the clean success the user did not get.
+  const toneClass = tone === "ok" ? "notice-ok" : tone === "warn" ? "notice-warn" : "notice-err";
   return (
-    <div className={`notice ${tone === "ok" ? "notice-ok" : "notice-err"}`} role="status">
+    <div className={`notice ${toneClass}`} role="status">
       {tone === "ok" ? <IconCheck /> : <IconAlert />}
       <span>{children}</span>
     </div>
   );
 }
 
+/**
+ * Fixed-position status toast. Portaled so it never consumes page flow / shifts layout.
+ * Parent owns auto-dismiss timing (success banners are typically transient).
+ */
+export function ToastNotice({
+  tone,
+  children,
+  onDismiss,
+  dismissLabel,
+}: {
+  tone: NoticeTone;
+  children: ReactNode;
+  onDismiss?: () => void;
+  /** Required whenever onDismiss is provided — pass t("common.close"). */
+  dismissLabel: string;
+}) {
+  return createPortal(
+    <div className="toast-notice-host" role="presentation">
+      <div
+        className={`toast-notice notice ${tone === "ok" ? "notice-ok" : tone === "warn" ? "notice-warn" : "notice-err"}`}
+        role="status"
+        aria-live="polite"
+      >
+        {tone === "ok" ? <IconCheck /> : <IconAlert />}
+        <span className="toast-notice-copy">{children}</span>
+        {onDismiss && (
+          <button type="button" className="toast-notice-dismiss" onClick={onDismiss} aria-label={dismissLabel}>
+            ×
+          </button>
+        )}
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
 export interface SelectOption { value: string; label: React.ReactNode }
 
-export function Select({ value, options, onChange, disabled, label, style, align, placement, dropdownStyle, portal = true }: {
+export function Select({ value, options, onChange, disabled, id, label, describedBy, title, style, align, placement, dropdownStyle, portal = true }: {
   value: string;
   options: SelectOption[];
   onChange: (value: string) => void;
   disabled?: boolean;
+  /** Put on the trigger, so a sibling `<label htmlFor>` can name it — a button is labelable. */
+  id?: string;
   label?: string;
+  describedBy?: string;
+  title?: string;
   style?: CSSProperties;
   align?: "left" | "right";
   placement?: "below" | "right";
@@ -123,6 +169,7 @@ export function Select({ value, options, onChange, disabled, label, style, align
   }, [activeIndex, open, optionId]);
 
   const selectIndex = (index: number) => {
+    if (disabled) return;
     const option = options[index];
     if (!option) return;
     onChange(option.value);
@@ -175,7 +222,12 @@ export function Select({ value, options, onChange, disabled, label, style, align
 
   const activeDescendant = open && options[activeIndex] ? optionId(activeIndex) : undefined;
 
-  const dropdown = open ? (
+  // A shared controller can flip `disabled` while the menu is already open (for
+  // example `priorityUpdatingId` starts an order write). The trigger alone being
+  // disabled must not leave the rendered option buttons able to call `onChange`
+  // and silently drop the second update, so the dropdown is not rendered (and the
+  // option buttons are disabled) whenever `disabled` is true.
+  const dropdown = open && !disabled ? (
     <div
       ref={menuRef}
       id={listboxId}
@@ -191,6 +243,7 @@ export function Select({ value, options, onChange, disabled, label, style, align
           type="button"
           role="option"
           tabIndex={-1}
+          disabled={disabled}
           aria-selected={o.value === value}
           className={`select-option${o.value === value ? " active" : ""}${index === activeIndex ? " select-option-active" : ""}`}
           onMouseEnter={() => setHighlightIndex(index)}
@@ -204,8 +257,11 @@ export function Select({ value, options, onChange, disabled, label, style, align
     <div ref={ref} className="custom-select" style={{ position: "relative", display: "inline-block", ...style }}>
       <button
         ref={triggerRef}
+        id={id}
         type="button"
         role="combobox"
+        title={title}
+        aria-describedby={describedBy}
         className="select-trigger"
         onClick={() => {
           if (disabled) return;
@@ -260,7 +316,8 @@ export function Tooltip({ content, children, side = "top", maxWidth = 280 }: {
   useEffect(() => () => { if (timer.current !== null) window.clearTimeout(timer.current); }, []);
 
   return (
-    <span
+    <button
+      type="button"
       className="ocx-tooltip"
       onMouseEnter={show}
       onMouseLeave={hide}
@@ -270,7 +327,7 @@ export function Tooltip({ content, children, side = "top", maxWidth = 280 }: {
         if (event.key === "Escape") hide();
       }}
       aria-describedby={open ? tipId : undefined}
-      tabIndex={0}
+      style={{ display: "inline", border: 0, background: "transparent", padding: 0, margin: 0, color: "inherit", font: "inherit", cursor: "inherit" }}
     >
       {children}
       {open && (
@@ -278,6 +335,6 @@ export function Tooltip({ content, children, side = "top", maxWidth = 280 }: {
           {content}
         </span>
       )}
-    </span>
+    </button>
   );
 }

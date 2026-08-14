@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { invalidateCodexModelsCache, syncCatalogModels } from "./catalog";
+import type { ComboCatalogOmission } from "./catalog/aggregation";
 import { CODEX_MODELS_CACHE_PATH } from "./paths";
 import { atomicWriteFile } from "../config";
 import type { OcxConfig } from "../types";
@@ -8,7 +9,11 @@ export interface CodexCatalogRefreshResult {
   added: number;
   path: string;
   catalogExists: boolean;
+  catalogWritten: boolean;
   cacheSynced: boolean;
+  comboOmissions: ComboCatalogOmission[];
+  /** Desired OFF observed under K during the catalog commit; no cache write either. */
+  skippedReason?: "desired_disabled";
 }
 
 interface RefreshDeps {
@@ -40,7 +45,16 @@ export async function refreshCodexModelCatalog(
 ): Promise<CodexCatalogRefreshResult> {
   const result = await deps.syncCatalogModels(config);
   const catalogExists = deps.existsSync(result.path);
-  if (!catalogExists) return { ...result, catalogExists, cacheSynced: false };
-  deps.invalidateCodexModelsCache();
-  return { ...result, catalogExists, cacheSynced: true };
+  const catalogWritten = result.catalogWritten === true;
+  const comboOmissions = result.comboOmissions ?? [];
+  if (result.skippedReason === "desired_disabled") {
+    // The commit path observed OFF under K. Invalidate nothing: rewriting the
+    // models cache here would be exactly the routed-cache write the skip refused.
+    return { ...result, catalogExists, catalogWritten: false, cacheSynced: false, comboOmissions };
+  }
+  if (!catalogExists) {
+    return { ...result, catalogExists, catalogWritten: false, cacheSynced: false, comboOmissions };
+  }
+  const cacheSynced = deps.invalidateCodexModelsCache();
+  return { ...result, catalogExists, catalogWritten, cacheSynced, comboOmissions };
 }

@@ -29,7 +29,7 @@ describe("install scripts", () => {
     expect(pkg.exports?.["."]?.bun).toBe("./src/index.ts");
     expect(pkg.exports?.["."]?.default).toBe("./bin/package-main.mjs");
     expect(pkg.dependencies?.zod).toBe("4.4.3");
-    expect(pkg.devDependencies?.typescript).toBe("5.9.3");
+    expect(pkg.devDependencies?.typescript).toBe("7.0.2");
     expect(pkg.devDependencies?.["@types/bun"]).toBe("1.3.14");
     expect(pkg.scripts?.dev).toBe("bun run src/cli/index.ts start");
     expect(pkg.scripts?.["dev:proxy"]).toBe("bun run src/cli/index.ts start");
@@ -38,6 +38,7 @@ describe("install scripts", () => {
     expect(pkg.scripts?.prepack).toBe("bun run prepare:package");
     expect(pkg.files).toContain("assets/banner.png");
     expect(pkg.files).toContain("assets/architecture.png");
+    expect(pkg.files).toContain("assets/claude-code-models.gif");
     expect(pkg.files).toContain("assets/codex-app-picker.png");
   });
 
@@ -105,8 +106,12 @@ describe("install scripts", () => {
     const script = await readText("scripts/release.ts");
 
     expect(script).toContain("waitForReleaseWorkflowRun");
-    expect(script).toContain("gh run list --workflow release.yml --branch");
-    expect(script).toContain("--commit");
+    // The invariant is that the dispatched run is located by workflow, branch
+    // and commit — not that the call is a shell string. Every external command
+    // now goes through the shared launcher as an argv array, because Bun.$
+    // resolved PATH itself and walked past the Windows `.cmd` test shims.
+    expect(script).toContain('"gh", "run", "list", "--workflow", "release.yml", "--branch"');
+    expect(script).toContain('"--commit"');
     expect(script).toContain("createdAt,databaseId,headSha,status,url");
     expect(script).toContain("await watchRun(releaseRun.databaseId)");
   });

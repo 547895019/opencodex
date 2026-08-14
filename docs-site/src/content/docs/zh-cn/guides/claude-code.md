@@ -49,19 +49,29 @@ macOS；在其他平台上，请使用 `ocx claude`。
 **原样**转发到 `api.anthropic.com`——beta、思考签名、提示缓存和计费身份都保持完全原生，
 而已路由模型仍可在同一会话中通过选择器别名使用。
 
-**请求头处理：**转发前会移除逐跳请求头以及 `host`、`content-length`、`accept-encoding`、
-`x-opencodex-api-key` 和 `origin`。其他所有请求头（包括 `anthropic-beta` 和
-`anthropic-version`）都会透传。
+**请求头处理：**转发前始终会移除逐跳请求头以及 `host`、`content-length`、
+`accept-encoding`、`x-opencodex-api-key` 和 `origin`。在非回环绑定上，原生透传还要求通过
+`x-opencodex-api-key` 提供有效的代理准入凭据；此时 `Authorization` 和 `x-api-key` 只属于
+Anthropic。若任一提供方请求头包含代理准入密钥，该密钥会被移除，而另一请求头中的真实提供方
+凭据会保留。含逗号拼接的歧义凭据请求头不会被转发。
 
-只有同时满足以下**四个**条件时才会触发透传：`nativePassthrough` 不为 `false`；模型以
-`claude` 或 `anthropic` 开头；bearer 或 `x-api-key` 以 `sk-ant-` 开头；并且别名/模型映射
-解析后返回的模型保持不变。这也意味着使用 `ocx claude` 时不再出现
+只有同时满足以下所有条件时才会触发透传：`nativePassthrough` 不为 `false`；模型以
+`claude` 或 `anthropic` 开头；bearer 令牌或 `x-api-key` 以 `sk-ant-` 开头；并且别名/模型映射
+解析后返回的模型保持不变；并且在非回环绑定上，专用代理准入请求头有效。这也意味着使用 `ocx claude` 时不再出现
 “claude.ai connectors are disabled”警告。
 
 可以设置 `claudeCode.nativePassthrough: false` 来禁用；也可以通过
 `claudeCode.anthropicBaseUrl` 指向其他位置。
 
 ## /model 选择器（“From gateway”）
+每个条目带有诚实的显示名（如 `gemini-3-pro (gemini)`），并以官方 ModelInfo 形态附带模型能力
+信息（推理强度梯度、thinking 类型），使 Claude Desktop 的第三方网关模式能够启用推理强度选择
+UI。真实 Anthropic 模型保留其原始 id。合成的 2026 日期是内部槽位，不是发布日期。旧版哈希
+别名和 `claude-ocx-<provider>--<model>` 别名仍可解析。拥有 1M 上下文的模型会多出一行 `…[1m]`：
+选中后 Claude Code 会按 1M 计算该模型的上下文（自动压缩保留，代理在路由前去掉该标记）。
+选中后会保存到 Claude Code 的 `settings.json` `model` 字段；入站请求会将别名解析回路由
+模型。旧版 Claude Code 中选择器保持原生 — 通过 `ANTHROPIC_MODEL` 设置槽位，或直接在 `/model`
+中输入任意路由 id（Claude Code 会原样传递字符串）。
 
 Claude Code 2.1.129+ 通过 `GET /v1/models?limit=1000` 发现网关模型，并在原生 `/model`
 选择器中以“From gateway”标签列出。由于选择器只接受以 `claude` 或 `anthropic` 开头的 ID，
@@ -69,16 +79,24 @@ opencodex 会将已路由模型公开为稳定且可逆的别名：
 
 | 界面 | 格式 | 示例 |
 | --- | --- | --- |
-| Claude Code CLI | `claude-ocx-<provider>--<model>` | `claude-ocx-native--gpt-5.6-sol` |
+| Claude Code CLI | `claude-ocx-<provider>--<model>`（plain）或 `claude-ocx2-…`（escaped） | `claude-ocx-native--gpt-5.6-sol` |
 | Claude Desktop 3P | `claude-opus-4-8-<code>`（3 字符 base36 哈希） | `claude-opus-4-8-ncb` |
 
 代理会按请求选择别名族：`?ids=cli` 或 `?ids=desktop` 优先；否则，`claude-code/*`
 user-agent 会获得易读的 CLI 形式，其他客户端会获得 Desktop 哈希形式。两种别名族都会永久
 保持可解码——以任一形式保存在 `settings.json` 中的模型都能继续工作。
 
-**别名语法规则：**provider 不得包含 `/` 或 `--`，也不得等于 `native`；model 不得包含
-`/`。易读形式无法表达的路由会回退到哈希别名。模型 ID **可以**包含 `--`（解析时只按第一个
-`--` 拆分）；包含 `--` 的原生 slug 会回退到哈希形式。
+如果 Claude Desktop 底部的选择器没有切换已运行 3P 对话的模型，请在该对话中使用
+`/model <id>`。OpenCodex 无法读取选择器状态，只会路由每个请求实际携带的模型 ID；可在
+**Logs → requestedModel** 中确认结果。
+
+**别名语法规则：**provider 不得包含 `/` 或 `--`，也不得等于 `native`。
+不含 `/` 或 `~` 的普通 model ID 继续使用 v1 前缀 `claude-ocx-…`。包含 `/` 或 `~` 的 model ID
+会使用 v2 前缀 `claude-ocx2-…` 并转义（`/` → `~s`，`~` → `~t`），例如
+`openrouter/anthropic/claude-opus-4-8` → `claude-ocx2-openrouter--anthropic~sclaude-opus-4-8`。
+v1 别名按字面解码（历史上 model ID 中包含的两字符序列 `~s` / `~t` 会被保留）；v2 别名会展开转义。
+易读形式无法表达的路由会回退到哈希别名。模型 ID **可以**包含 `--`（解析时只按第一个 `--` 分割）；
+含 `--` 的原生 slug 会回退到哈希形式。
 
 **模型解析顺序：**移除 `[1m]` 标记 → 解码易读别名 → 解码 Desktop 哈希别名 →
 `modelMap` 精确匹配 → 移除日期后的匹配（移除 `-20250514`）→ 透传。
@@ -229,7 +247,7 @@ Claude Code 的 `/effort` 设置会完整保留并传递给适配器：
 | --- | --- |
 | `thinking.type: "adaptive"` + `output_config.effort` | 直接传递强度（`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`\|`ultra`） |
 | `thinking.type: "enabled"` + `budget_tokens` | ≤4096→`low`，≤16384→`medium`，更高→`high` |
-| `thinking.type: "disabled"` | 完全省略推理参数 |
+| `thinking.type: "disabled"` | 显式发送 `reasoning: { effort: "none" }`，并省略 `summary` |
 
 解析后的值会显示在请求日志的 **Reasoning effort** 列中。
 
@@ -247,7 +265,7 @@ Claude Code 的 `/effort` 设置会完整保留并传递给适配器：
 | 用户 `tool_result` | `function_call_output`（`is_error` → `[tool error]` 前缀） |
 | 重放 `thinking` / `redacted_thinking` | 丢弃 |
 | Function 工具 | `{type: "function"}`（`web_search*` → `{type: "web_search"}`） |
-| `tool_choice` | `auto`→`auto`，`none`→`none`，`any`→`required`，指定名称→`{type:"function",name}` |
+| `tool_choice` | `auto`→`auto`，`none`→`none`，`any`→`required`，指定函数→`{type:"function",name}`，托管 WebSearch/web_search→`{type:"web_search"}` |
 | `max_tokens` | `max_output_tokens` |
 | `stop_sequences` | `stop` |
 

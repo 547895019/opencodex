@@ -27,6 +27,23 @@ async function collectSse(stream: ReadableStream<Uint8Array>): Promise<{ event?:
 }
 
 describe("Responses streaming tool event contract", () => {
+  test("undeclared upstream tool names fail closed with a compatibility error", async () => {
+    const frames = await collectSse(bridgeToResponsesSSE(replay([
+      { type: "tool_call_start", id: "call_bad", name: "apply_patch" },
+      { type: "tool_call_delta", arguments: '{"input":"*** Begin Patch"}' },
+      { type: "tool_call_end" },
+      { type: "done" },
+    ]), "deepseek/deepseek-v4-flash", undefined, undefined, undefined, undefined, undefined, {
+      declaredToolNames: new Set(["exec"]),
+    }));
+
+    expect(frames.some(frame => frame.event === "response.output_item.added")).toBe(false);
+    expect(frames.some(frame => frame.event === "response.completed")).toBe(false);
+    const failed = frames.find(frame => frame.event === "response.failed")?.data.response as Record<string, unknown>;
+    expect((failed.error as Record<string, unknown>).message).toContain("undeclared client tool");
+    expect((failed.error as Record<string, unknown>).message).toContain("apply_patch");
+  });
+
   test("adapter tool events produce OpenAI-compatible streamed function-call frames", async () => {
     const frames = await collectSse(bridgeToResponsesSSE(replay([
       { type: "tool_call_start", id: "call_1", name: "read_file" },
@@ -50,5 +67,48 @@ describe("Responses streaming tool event contract", () => {
       arguments: "{\"path\":\"a.txt\"}",
       status: "completed",
     });
+  });
+
+  test("terminal error cancels an open tool call instead of completing it", async () => {
+    // #765 remainder: adapter error with an open tool call must not emit
+    // function_call_arguments.done / status:"completed" before response.failed.
+    const frames = await collectSse(bridgeToResponsesSSE(replay([
+      { type: "tool_call_start", id: "call_bad", name: "get_weather" },
+      { type: "tool_call_delta", arguments: "not json" },
+      { type: "error", message: "Anthropic stream sent malformed tool_use arguments (invalid JSON)" },
+    ]), "routed/model"));
+
+    expect(frames.some(frame => frame.event === "response.function_call_arguments.done")).toBe(false);
+    const itemDone = frames.filter(frame => frame.event === "response.output_item.done")
+      .map(frame => frame.data.item as Record<string, unknown>)
+      .find(item => item?.type === "function_call");
+    expect(itemDone).toMatchObject({
+      type: "function_call",
+      call_id: "call_bad",
+      status: "incomplete",
+    });
+    const failed = frames.find(frame => frame.event === "response.failed");
+    expect(failed).toBeTruthy();
+    const failedOutput = (failed?.data.response as Record<string, unknown>).output as Record<string, unknown>[];
+    expect(failedOutput.some(item => item.type === "function_call" && item.status === "completed")).toBe(false);
+    expect(frames.some(frame => frame.event === "response.completed")).toBe(false);
+  });
+
+  test("malformed assembled arguments at tool_call_end fail the turn without completing", async () => {
+    const frames = await collectSse(bridgeToResponsesSSE(replay([
+      { type: "tool_call_start", id: "call_1", name: "get_weather" },
+      { type: "tool_call_delta", arguments: "not json" },
+      { type: "tool_call_end" },
+      { type: "done" },
+    ]), "routed/model"));
+
+    expect(frames.some(frame => frame.event === "response.function_call_arguments.done")).toBe(false);
+    expect(frames.some(frame => frame.event === "response.completed")).toBe(false);
+    const failed = frames.find(frame => frame.event === "response.failed");
+    expect(failed).toBeTruthy();
+    const itemDone = frames.filter(frame => frame.event === "response.output_item.done")
+      .map(frame => frame.data.item as Record<string, unknown>)
+      .find(item => item?.type === "function_call");
+    expect(itemDone).toMatchObject({ status: "incomplete" });
   });
 });

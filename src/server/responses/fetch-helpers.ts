@@ -1,4 +1,5 @@
 import type { Server } from "bun";
+import { codexWsUpstreamFetch, shouldUseCodexWsUpstream } from "./ws-upstream";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse, type ResponsesTerminalStatus } from "../../bridge";
 import {
   getConfigPath,
@@ -118,10 +119,30 @@ export function safeHostLabel(url: string): string {
   }
 }
 
+/** Canonical origin (scheme + host) for failure-attribution keys: http and
+ * https for the same host must not share one ledger entry (#914 review). */
+export function safeOriginLabel(url: string): string {
+  try {
+    return new URL(url).origin.toLowerCase();
+  } catch {
+    return "upstream";
+  }
+}
+
 
 
 export function providerFetch(provider: OcxProviderConfig): typeof globalThis.fetch {
-  return (provider as OcxProviderConfig & { fetch?: typeof globalThis.fetch }).fetch ?? globalThis.fetch;
+  const base = (provider as OcxProviderConfig & { fetch?: typeof globalThis.fetch }).fetch ?? globalThis.fetch;
+  // ChatGPT Codex backend: streaming turns ride the responses_websockets
+  // transport (measured ~3s faster TTFT than the SSE POST queue); everything
+  // else keeps the provider's HTTP fetch. See ws-upstream.ts for the details.
+  const wrapped = (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+    if (typeof input === "string" && init && shouldUseCodexWsUpstream(input, init)) {
+      return codexWsUpstreamFetch(input, init, base);
+    }
+    return base(input, init);
+  };
+  return wrapped as typeof globalThis.fetch;
 }
 
 
@@ -133,6 +154,7 @@ export async function fetchWithHeaderTimeout(
   timeoutMs: number,
   preferIdentityEncoding = false,
   executor: typeof globalThis.fetch = globalThis.fetch,
+  manualRedirect = false,
 ): Promise<Response> {
   const timeout = new AbortController();
   const timer = setTimeout(() => {
@@ -148,10 +170,13 @@ export async function fetchWithHeaderTimeout(
     return await executor(url, {
       ...init,
       headers,
+      // Credential-bearing sends opt into manual redirects so a 3xx is relayed
+      // as a Response instead of being followed into a rejection that is
+      // indistinguishable from a pre-connection failure (#914).
+      ...(manualRedirect ? { redirect: "manual" as const } : {}),
       signal: AbortSignal.any([abortSignal, timeout.signal]),
     });
   } finally {
     clearTimeout(timer);
   }
 }
-

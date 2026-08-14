@@ -1,11 +1,11 @@
 import { baseProviderLabel } from "../providers/label";
 import { canonicalAntigravityUsageModel } from "../providers/antigravity-models";
 import { usageDisplayTotalTokens } from "./totals";
-import type { PersistedUsageEntry, UsageStatus } from "./log";
-import { estimateComboCost, estimateRequestCost, effectiveServiceTier } from "./cost";
+import { isCodexUsageAccountLogLabel, type PersistedUsageEntry, type UsageStatus } from "./log";
+import { estimateAttemptCost, estimateComboCost, estimateRequestCost, serviceTierContext } from "./cost";
 
 export type UsageRange = "7d" | "30d" | "all";
-export type UsageSurface = "all" | "codex" | "claude";
+export type UsageSurface = "all" | "codex" | "claude" | "grok";
 
 export interface UsageSummaryTotals {
   requests: number;
@@ -79,6 +79,28 @@ export interface UsageProvider {
   estimatedCostUsd?: number;
 }
 
+export interface UsageAccount {
+  accountLogLabel: string;
+  ambiguous: boolean;
+  requests: number;
+  attemptCount: number;
+  measuredAttempts: number;
+  reportedAttempts: number;
+  estimatedAttempts: number;
+  unmeteredAttempts: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+  usageCoverageRatio: number;
+  estimatedCostUsd?: number;
+  pricedAttempts: number;
+  unpricedAttempts: number;
+  priceCoverageRatio: number;
+}
+
 export interface UsageSummary {
   range: UsageRange;
   surface: UsageSurface;
@@ -88,9 +110,21 @@ export interface UsageSummary {
   days: UsageDay[];
   models: UsageModel[];
   providers: UsageProvider[];
+  accounts: UsageAccount[];
 }
 
 const DAY_MS = 86_400_000;
+export const MAX_USAGE_MODEL_BREAKDOWN_ROWS = 256;
+
+function retainedBreakdownRows<T>(
+  rows: T[],
+  aggregateOverflow: (overflow: T[]) => T,
+): T[] {
+  if (rows.length <= MAX_USAGE_MODEL_BREAKDOWN_ROWS) return rows;
+  const keep = rows.slice(0, MAX_USAGE_MODEL_BREAKDOWN_ROWS - 1);
+  keep.push(aggregateOverflow(rows.slice(MAX_USAGE_MODEL_BREAKDOWN_ROWS - 1)));
+  return keep;
+}
 
 export function parseRange(input: string | null | undefined): UsageRange {
   if (input === "7d" || input === "30d" || input === "all") return input;
@@ -98,7 +132,7 @@ export function parseRange(input: string | null | undefined): UsageRange {
 }
 
 export function parseUsageSurface(input: string | null | undefined): UsageSurface {
-  if (input === "codex" || input === "claude") return input;
+  if (input === "codex" || input === "claude" || input === "grok") return input;
   return "all";
 }
 
@@ -275,7 +309,7 @@ function addEstimatedCost(
     totals.unmeteredRequests += 1;
     return;
   }
-  const tier = effectiveServiceTier(entry);
+  const tier = serviceTierContext(entry);
   const estimate = entry.attempts?.length
     ? estimateComboCost(entry.attempts, undefined, tier)
     : estimateRequestCost({ provider: entry.provider, model: entry.model, usage: entry.usage, usageStatus: entry.usageStatus, serviceTier: tier });
@@ -334,7 +368,21 @@ function buildDayGrid(range: UsageRange, since: number | null, now: number, entr
   const out = [...grid.values()].sort((a, b) => a.date.localeCompare(b.date));
   for (const day of out) {
     const models = dayModels.get(day.date);
-    if (models) day.models = [...models.values()].sort((a, b) => b.requests - a.requests);
+    if (models) {
+      const sorted = [...models.values()].sort((a, b) => b.requests - a.requests);
+      day.models = retainedBreakdownRows(sorted, overflow => {
+        const requests = new Set<string>();
+        let attemptCount = 0;
+        let totalTokens = 0;
+        for (const model of overflow) {
+          attemptCount += model.attemptCount;
+          totalTokens += model.totalTokens;
+          const requestKey = `${day.date}\0${usageModelKey(model.provider, model.model)}`;
+          for (const requestId of dayModelRequests.get(requestKey) ?? []) requests.add(requestId);
+        }
+        return { model: "other", provider: "other", requests: requests.size, attemptCount, totalTokens };
+      });
+    }
   }
   return out;
 }
@@ -390,7 +438,7 @@ function buildModels(entries: PersistedUsageEntry[], totalTokens: number): Usage
   }
   // Accumulate per-model estimated cost
   for (const entry of entries) {
-    const tier = effectiveServiceTier(entry);
+    const tier = serviceTierContext(entry);
     const estimate = entry.attempts?.length
       ? estimateComboCost(entry.attempts, undefined, tier)
       : estimateRequestCost({ provider: entry.provider, model: entry.model, usage: entry.usage, usageStatus: entry.usageStatus, serviceTier: tier });
@@ -414,7 +462,47 @@ function buildModels(entries: PersistedUsageEntry[], totalTokens: number): Usage
   }
   const models = [...byKey.values()];
   for (const m of models) m.shareRatio = totalTokens === 0 ? 0 : m.totalTokens / totalTokens;
-  return models.sort((a, b) => b.requests - a.requests);
+  const sorted = models.sort((a, b) => b.requests - a.requests);
+  return retainedBreakdownRows(sorted, overflow => {
+    const statusesByRequest = new Map<string, UsageStatus[]>();
+    const other: UsageModel = {
+      provider: "other",
+      model: "other",
+      requests: 0,
+      attemptCount: 0,
+      measuredRequests: 0,
+      reportedRequests: 0,
+      estimatedRequests: 0,
+      totalTokens: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      shareRatio: 0,
+    };
+    for (const model of overflow) {
+      other.attemptCount += model.attemptCount;
+      other.totalTokens += model.totalTokens;
+      other.inputTokens += model.inputTokens;
+      other.outputTokens += model.outputTokens;
+      if (model.estimatedCostUsd !== undefined) {
+        other.estimatedCostUsd = (other.estimatedCostUsd ?? 0) + model.estimatedCostUsd;
+      }
+      const key = usageModelKey(model.provider, model.model);
+      for (const [requestId, statuses] of statusesByKey.get(key) ?? []) {
+        const combined = statusesByRequest.get(requestId) ?? [];
+        combined.push(...statuses);
+        statusesByRequest.set(requestId, combined);
+      }
+    }
+    other.requests = statusesByRequest.size;
+    for (const statuses of statusesByRequest.values()) {
+      const status = foldAttributionStatuses(statuses);
+      if (isMeasuredStatus(status)) other.measuredRequests += 1;
+      if (status === "reported") other.reportedRequests += 1;
+      else if (status === "estimated") other.estimatedRequests += 1;
+    }
+    other.shareRatio = totalTokens === 0 ? 0 : other.totalTokens / totalTokens;
+    return other;
+  });
 }
 
 function buildProviders(entries: PersistedUsageEntry[], totalTokens: number): UsageProvider[] {
@@ -459,7 +547,7 @@ function buildProviders(entries: PersistedUsageEntry[], totalTokens: number): Us
     }
   }
   for (const entry of entries) {
-    const tier = effectiveServiceTier(entry);
+    const tier = serviceTierContext(entry);
     const estimate = entry.attempts?.length
       ? estimateComboCost(entry.attempts, undefined, tier)
       : estimateRequestCost({ provider: entry.provider, model: entry.model, usage: entry.usage, usageStatus: entry.usageStatus, serviceTier: tier });
@@ -482,6 +570,133 @@ function buildProviders(entries: PersistedUsageEntry[], totalTokens: number): Us
   return providers.sort((a, b) => b.requests - a.requests);
 }
 
+const LEGACY_AMBIGUOUS_ACCOUNT_LABEL = "legacy-ambiguous";
+
+function legacyCodexAccountLabel(provider: string): string | null {
+  if (baseProviderLabel(provider) !== "openai") return null;
+  const suffix = provider.match(/-(main|p[a-f0-9]{6})$/)?.[1];
+  return suffix ?? LEGACY_AMBIGUOUS_ACCOUNT_LABEL;
+}
+
+function accountLabelForAttribution(provider: string, explicit: unknown): string | null {
+  if (isCodexUsageAccountLogLabel(explicit)) return explicit;
+  return legacyCodexAccountLabel(provider);
+}
+
+function buildAccounts(entries: PersistedUsageEntry[]): UsageAccount[] {
+  const byLabel = new Map<string, UsageAccount>();
+  const requestIds = new Map<string, Set<string>>();
+
+  const add = (input: {
+    requestId: string;
+    provider: string;
+    accountLogLabel?: string;
+    usageStatus: UsageStatus;
+    usage?: PersistedUsageEntry["usage"];
+    totalTokens?: number;
+    estimate: ReturnType<typeof estimateRequestCost>;
+  }): void => {
+    const label = accountLabelForAttribution(input.provider, input.accountLogLabel);
+    if (!label) return;
+    let row = byLabel.get(label);
+    if (!row) {
+      row = {
+        accountLogLabel: label,
+        ambiguous: label === LEGACY_AMBIGUOUS_ACCOUNT_LABEL,
+        requests: 0,
+        attemptCount: 0,
+        measuredAttempts: 0,
+        reportedAttempts: 0,
+        estimatedAttempts: 0,
+        unmeteredAttempts: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        reasoningOutputTokens: 0,
+        totalTokens: 0,
+        usageCoverageRatio: 0,
+        pricedAttempts: 0,
+        unpricedAttempts: 0,
+        priceCoverageRatio: 0,
+      };
+      byLabel.set(label, row);
+      requestIds.set(label, new Set());
+    }
+    requestIds.get(label)!.add(input.requestId);
+    row.requests = requestIds.get(label)!.size;
+    row.attemptCount += 1;
+    const measured = input.usage !== undefined && isMeasuredStatus(input.usageStatus);
+    if (!measured) {
+      row.unmeteredAttempts += 1;
+      return;
+    }
+
+    row.measuredAttempts += 1;
+    if (input.usageStatus === "reported") row.reportedAttempts += 1;
+    else if (input.usageStatus === "estimated") row.estimatedAttempts += 1;
+    row.inputTokens += input.usage!.inputTokens;
+    row.outputTokens += input.usage!.outputTokens;
+    const creation = input.usage!.cacheCreationInputTokens;
+    const read = typeof input.usage!.cacheReadInputTokens === "number"
+      ? input.usage!.cacheReadInputTokens
+      : typeof input.usage!.cachedInputTokens === "number" && typeof creation === "number"
+        ? Math.max(0, input.usage!.cachedInputTokens - creation)
+        : input.usage!.cachedInputTokens;
+    if (typeof read === "number") row.cacheReadInputTokens += read;
+    if (typeof creation === "number") row.cacheCreationInputTokens += creation;
+    if (typeof input.usage!.reasoningOutputTokens === "number") {
+      row.reasoningOutputTokens += input.usage!.reasoningOutputTokens;
+    }
+    row.totalTokens += usageDisplayTotalTokens(input.usage, input.totalTokens) ?? 0;
+    if (input.estimate) {
+      row.pricedAttempts += 1;
+      row.estimatedCostUsd = (row.estimatedCostUsd ?? 0) + input.estimate.cost.total;
+    } else {
+      row.unpricedAttempts += 1;
+    }
+  };
+
+  for (const entry of entries) {
+    const tier = serviceTierContext(entry);
+    if (entry.attempts?.length) {
+      for (const attempt of entry.attempts) {
+        add({
+          requestId: entry.requestId,
+          provider: attempt.provider,
+          ...(attempt.accountLogLabel ? { accountLogLabel: attempt.accountLogLabel } : {}),
+          usageStatus: attempt.usageStatus,
+          ...(attempt.usage ? { usage: attempt.usage } : {}),
+          ...(attempt.totalTokens !== undefined ? { totalTokens: attempt.totalTokens } : {}),
+          estimate: estimateAttemptCost(attempt, undefined, tier),
+        });
+      }
+      continue;
+    }
+    add({
+      requestId: entry.requestId,
+      provider: entry.provider,
+      ...(entry.accountLogLabel ? { accountLogLabel: entry.accountLogLabel } : {}),
+      usageStatus: entry.usageStatus,
+      ...(entry.usage ? { usage: entry.usage } : {}),
+      ...(entry.totalTokens !== undefined ? { totalTokens: entry.totalTokens } : {}),
+      estimate: estimateRequestCost({
+        provider: entry.provider,
+        model: entry.model,
+        usage: entry.usage,
+        usageStatus: entry.usageStatus,
+        serviceTier: tier,
+      }),
+    });
+  }
+
+  for (const row of byLabel.values()) {
+    row.usageCoverageRatio = row.attemptCount === 0 ? 0 : row.measuredAttempts / row.attemptCount;
+    row.priceCoverageRatio = row.measuredAttempts === 0 ? 0 : row.pricedAttempts / row.measuredAttempts;
+  }
+  return [...byLabel.values()].sort((a, b) => b.totalTokens - a.totalTokens);
+}
+
 export function summarizeUsage(
   entries: PersistedUsageEntry[],
   range: UsageRange,
@@ -491,8 +706,12 @@ export function summarizeUsage(
   const { since } = rangeWindow(range, now);
   const filteredEntries = entries.filter(entry => {
     if (since !== null && entry.timestamp < since) return false;
-    if (surface === "claude") return entry.surface === "claude";
-    if (surface === "codex") return entry.surface !== "claude";
+    if (surface === "claude") return entry.surface === "claude" || entry.surface === "claude-desktop";
+    if (surface === "grok") return entry.surface === "grok";
+    // Codex = the historical unlabelled bucket. Before the grok tag existed every
+    // non-Claude turn landed here, and `surface !== "claude"` also swallowed
+    // claude-desktop — disjoint predicates fix both.
+    if (surface === "codex") return entry.surface === undefined;
     return true;
   });
   const totals = blankTotals();
@@ -512,5 +731,6 @@ export function summarizeUsage(
     days: buildDayGrid(range, since, now, filteredEntries),
     models: buildModels(filteredEntries, totals.totalTokens),
     providers: buildProviders(filteredEntries, totals.totalTokens),
+    accounts: buildAccounts(filteredEntries),
   };
 }

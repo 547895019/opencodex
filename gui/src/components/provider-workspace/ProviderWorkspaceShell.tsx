@@ -5,7 +5,9 @@
  * arrive in WP090/091; until then the slot renders a real placeholder message.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { useT } from "../../i18n";
+import { useKeyedClientResource } from "../../client-resource";
+import { usageSummary30dResourceKey } from "../../usage-summary-resource";
+import { useT } from "../../i18n/shared";
 import { IconFilter, IconSearch, IconBoxes, IconGlobe, IconLock, IconKey, IconTrash } from "../../icons";
 import {
   applyActiveAccountReauth,
@@ -19,7 +21,9 @@ import {
   type WorkspaceSections,
 } from "../../provider-workspace/catalog";
 import { providerKind } from "../../provider-workspace/kind";
-import { countAvailableModels, parseAvailableModels, parseSelectedModels, type ProviderAvailableModels, type ProviderModelCounts, type ProviderSelectedModels } from "../../provider-workspace/usage";
+import { readJsonIfOk, readJsonOrThrow } from "../../fetch-json";
+import { readSessionListCache, writeSessionListCache } from "../../session-list-cache";
+import { countAvailableModels, parseAvailableModels, parseLiveModelCounts, parseSelectedModels, type ProviderAvailableModels, type ProviderLiveModelCounts, type ProviderModelCounts, type ProviderSelectedModels } from "../../provider-workspace/usage";
 import type { ProviderQuotaReportView } from "../../provider-workspace/report";
 import { formatProviderDisplayName } from "../../provider-icons";
 import { RailRow } from "./ProviderRail";
@@ -35,6 +39,8 @@ export interface DetailSlotData {
   modelUsage?: ProviderModelUsageRow[];
   quotaReport?: ProviderQuotaReportView;
   availableModels: string[];
+  /** Did the last successful discovery return rows? Server-reported, never inferred. */
+  hasLiveModels: boolean;
   selectedModels: string[];
   modelsLoading: boolean;
   modelsLoadFailed: boolean;
@@ -49,6 +55,51 @@ const SORT_DEFS: { id: ProviderSortMode; labelKey: "pws.sort.az" | "pws.sort.za"
   { id: "accounts-first", labelKey: "pws.sort.accountsFirst" },
 ];
 
+const QUOTA_REPORT_MAX_AGE_MS = 30 * 60_000;
+
+function freshQuotaReport(value: unknown, now: number): ProviderQuotaReportView | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  if (typeof row.updatedAt !== "number" || !Number.isFinite(row.updatedAt)) return null;
+  if (now - row.updatedAt >= QUOTA_REPORT_MAX_AGE_MS) return null;
+  if (!("quota" in row)) return null;
+  if (row.label !== undefined && typeof row.label !== "string") return null;
+  if (row.source !== undefined && typeof row.source !== "string") return null;
+  return {
+    ...(typeof row.label === "string" ? { label: row.label } : {}),
+    ...(typeof row.source === "string" ? { source: row.source } : {}),
+    updatedAt: row.updatedAt,
+    quota: row.quota,
+    ...(row.aggregation !== undefined ? { aggregation: row.aggregation } : {}),
+  };
+}
+
+function freshQuotaReportRecord(value: unknown, now = Date.now()): Record<string, ProviderQuotaReportView> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const out: Record<string, ProviderQuotaReportView> = {};
+  for (const [provider, raw] of Object.entries(value)) {
+    const report = freshQuotaReport(raw, now);
+    if (provider.trim() && report) out[provider] = report;
+  }
+  return out;
+}
+
+function readFreshQuotaReportCache(key: string): Record<string, ProviderQuotaReportView> | null {
+  return freshQuotaReportRecord(readSessionListCache<unknown>(key));
+}
+
+function freshQuotaReportsFromResponse(value: unknown, now = Date.now()): Record<string, ProviderQuotaReportView> {
+  if (!Array.isArray(value)) return {};
+  const out: Record<string, ProviderQuotaReportView> = {};
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const provider = (raw as Record<string, unknown>).provider;
+    const report = freshQuotaReport(raw, now);
+    if (typeof provider === "string" && provider.trim() && report) out[provider] = report;
+  }
+  return out;
+}
+
 export default function ProviderWorkspaceShell({
   providers,
   apiBase,
@@ -62,6 +113,9 @@ export default function ProviderWorkspaceShell({
   jsonSaving = false,
   modelsRefreshToken = 0,
   activeAccountNeedsReauth,
+  /** Stable key of active OAuth account ids — refetch overview quotas after account switch. */
+  quotaRefreshEpoch = 0,
+  quotaForceRefresh = false,
   detail,
 }: {
   providers: Record<string, WorkspaceProvider>;
@@ -78,6 +132,14 @@ export default function ProviderWorkspaceShell({
   /** Bump after login/config changes so /api/selected-models is refetched. */
   modelsRefreshToken?: number;
   activeAccountNeedsReauth?: Record<string, boolean>;
+  /**
+   * Monotonic quota revision. It moves only when something actually invalidates the quota
+   * view — an account switch, a login or logout, a key change, a config save — so account
+   * data arriving on a cold load no longer re-triggers the read once per provider.
+   */
+  quotaRefreshEpoch?: number;
+  /** True when the bump came from a mutation that needs the server to bypass its TTL. */
+  quotaForceRefresh?: boolean;
   /** Detail body for the selected provider (WP090); a placeholder renders when absent. */
   detail?: (item: WorkspaceItem, data: DetailSlotData) => ReactNode;
 }) {
@@ -91,14 +153,29 @@ export default function ProviderWorkspaceShell({
   const [railFocusName, setRailFocusName] = useState<string | null>(null);
   const [modelCounts, setModelCounts] = useState<ProviderModelCounts>({});
   const [availableModels, setAvailableModels] = useState<ProviderAvailableModels>({});
+  const [liveModelCounts, setLiveModelCounts] = useState<ProviderLiveModelCounts>({});
   const [selectedModels, setSelectedModels] = useState<ProviderSelectedModels>({});
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsLoadFailed, setModelsLoadFailed] = useState(false);
-  const [usageTotals, setUsageTotals] = useState<Record<string, ProviderUsageTotals>>({});
-  const [usageModels, setUsageModels] = useState<Record<string, ProviderModelUsageRow[]>>({});
-  const [quotaReports, setQuotaReports] = useState<Record<string, ProviderQuotaReportView>>({});
+  const quotasCacheKey = `ocx.providers.quotas.v1:${apiBase}`;
+  const usageCacheKey = `ocx.providers.usage.v1:${apiBase}`;
+  const [usageTotals, setUsageTotals] = useState<Record<string, ProviderUsageTotals>>(() => (
+    readSessionListCache<{ totals: Record<string, ProviderUsageTotals> }>(usageCacheKey)?.totals ?? {}
+  ));
+  const [usageModels, setUsageModels] = useState<Record<string, ProviderModelUsageRow[]>>(() => (
+    readSessionListCache<{ models: Record<string, ProviderModelUsageRow[]> }>(usageCacheKey)?.models ?? {}
+  ));
+  const [quotaReports, setQuotaReports] = useState<Record<string, ProviderQuotaReportView>>(() => (
+    readFreshQuotaReportCache(quotasCacheKey) ?? {}
+  ));
+  const [usageLoading, setUsageLoading] = useState(() => !readSessionListCache(usageCacheKey));
+  const [quotasLoading, setQuotasLoading] = useState(() => {
+    const cached = readFreshQuotaReportCache(quotasCacheKey);
+    return !cached || Object.keys(cached).length === 0;
+  });
   const [modelsLoadEpoch, setModelsLoadEpoch] = useState(0);
   const filterWrapRef = useRef<HTMLDivElement>(null);
+  const usageResource = useKeyedClientResource(usageSummary30dResourceKey(apiBase), [apiBase], async (signal) => { const res = await fetch(apiBase + "/api/usage?range=30d", { signal }); if (!res.ok) throw new Error(String(res.status)); return await res.json(); });
 
   const sections = useMemo(() => {
     const base = buildProviderWorkspace(hideRedundantChatGptForwardProviders(providers));
@@ -115,21 +192,23 @@ export default function ProviderWorkspaceShell({
     let cancelled = false;
     const timeout = window.setTimeout(() => {
       setModelsLoading(true);
-      fetch(`${apiBase}/api/selected-models`)
-        .then(r => r.ok ? r.json() : Promise.reject(new Error(String(r.status))))
-        .then(data => {
+      void (async () => {
+        try {
+          const res = await fetch(`${apiBase}/api/selected-models`);
+          const data = await readJsonOrThrow(res);
           if (cancelled) return;
           setModelCounts(countAvailableModels(data));
           setAvailableModels(parseAvailableModels(data));
+          setLiveModelCounts(parseLiveModelCounts(data));
           setSelectedModels(parseSelectedModels(data));
           setModelsLoadFailed(false);
-          setModelsLoading(false);
-        })
-        .catch(() => {
+        } catch {
           if (cancelled) return;
           setModelsLoadFailed(true);
-          setModelsLoading(false);
-        });
+        } finally {
+          if (!cancelled) setModelsLoading(false);
+        }
+      })();
     }, 0);
     return () => {
       cancelled = true;
@@ -139,62 +218,63 @@ export default function ProviderWorkspaceShell({
 
   useEffect(() => {
     let cancelled = false;
-    fetch(`${apiBase}/api/usage?range=30d`)
-      .then(r => r.ok ? r.json() : null)
-      .then((data: {
-        providers?: Array<{ provider: string; requests: number; totalTokens?: number }>;
-        models?: Array<{ provider: string; model: string; resolvedModel?: string; requests: number; totalTokens: number; inputTokens: number; outputTokens: number; shareRatio: number; estimatedCostUsd?: number }>;
-      } | null) => {
-        if (cancelled || !data) return;
-        const byProvider: Record<string, ProviderUsageTotals> = {};
-        for (const p of data.providers ?? []) byProvider[p.provider] = { requests: p.requests, totalTokens: p.totalTokens };
-        setUsageTotals(byProvider);
-        // Group model rows by provider
-        const byProviderModels: Record<string, ProviderModelUsageRow[]> = {};
-        for (const m of data.models ?? []) {
-          const key = m.provider;
-          if (!byProviderModels[key]) byProviderModels[key] = [];
-          byProviderModels[key].push({
-            model: m.model,
-            ...(m.resolvedModel ? { resolvedModel: m.resolvedModel } : {}),
-            requests: m.requests,
-            totalTokens: m.totalTokens,
-            inputTokens: m.inputTokens,
-            outputTokens: m.outputTokens,
-            shareRatio: m.shareRatio,
-            ...(m.estimatedCostUsd !== undefined ? { estimatedCostUsd: m.estimatedCostUsd } : {}),
-          });
-        }
-        setUsageModels(byProviderModels);
-      })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [apiBase]);
+    const timeout = window.setTimeout(() => {
+      const data = usageResource.data as { providers?: Array<{ provider: string; requests: number; totalTokens?: number }>; models?: Array<{ provider: string; model: string; resolvedModel?: string; requests: number; totalTokens: number; inputTokens: number; outputTokens: number; shareRatio: number; estimatedCostUsd?: number }> } | undefined;
+      if (cancelled) return;
+      if (!data) {
+        if (usageResource.loading) setUsageLoading(!readSessionListCache(usageCacheKey));
+        return;
+      }
+      const byProvider: Record<string, ProviderUsageTotals> = {};
+      for (const row of data.providers ?? []) byProvider[row.provider] = { requests: row.requests, totalTokens: row.totalTokens };
+      setUsageTotals(byProvider);
+      const byProviderModels: Record<string, ProviderModelUsageRow[]> = {};
+      for (const m of data.models ?? []) {
+        const key = m.provider;
+        if (!byProviderModels[key]) byProviderModels[key] = [];
+        byProviderModels[key].push({ model: m.model, ...(m.resolvedModel ? { resolvedModel: m.resolvedModel } : {}), requests: m.requests, totalTokens: m.totalTokens, inputTokens: m.inputTokens, outputTokens: m.outputTokens, shareRatio: m.shareRatio, ...(m.estimatedCostUsd !== undefined ? { estimatedCostUsd: m.estimatedCostUsd } : {}) });
+      }
+      setUsageModels(byProviderModels);
+      writeSessionListCache(usageCacheKey, { totals: byProvider, models: byProviderModels });
+      setUsageLoading(false);
+    }, 0);
+    return () => { cancelled = true; window.clearTimeout(timeout); };
+  }, [apiBase, usageCacheKey, usageResource.data, usageResource.loading]);
 
   useEffect(() => {
     let cancelled = false;
-    fetch(`${apiBase}/api/provider-quotas`)
-      .then(r => r.ok ? r.json() : null)
-      .then((data: { reports?: Array<{ provider: string; label?: string; source?: string; updatedAt?: number; quota?: unknown }> } | null) => {
-        if (cancelled || !data) return;
-        // Merge so a partial/failed probe cannot wipe a previously good provider row.
-        setQuotaReports(prev => {
-          const next = { ...prev };
-          for (const report of data.reports ?? []) {
-            if (!report?.provider) continue;
-            next[report.provider] = {
-              label: report.label,
-              source: report.source,
-              updatedAt: typeof report.updatedAt === "number" ? report.updatedAt : Date.now(),
-              quota: report.quota,
-            };
-          }
-          return next;
-        });
-      })
-      .catch(() => { /* keep last-good */ });
-    return () => { cancelled = true; };
-  }, [apiBase]);
+    const timeout = window.setTimeout(() => {
+      const cached = readFreshQuotaReportCache(quotasCacheKey);
+      if (!cached || Object.keys(cached).length === 0) setQuotasLoading(true);
+      // A forced bump means a mutation just changed the answer, so the server's TTL has to
+      // be bypassed. The old derived-key effect always read the cached view, which is why a
+      // switch could leave the bars showing the previous account's quota.
+      void fetch(`${apiBase}/api/provider-quotas${quotaForceRefresh ? "?refresh=1" : ""}`)
+        .then(r => readJsonIfOk<{ reports?: Array<{ provider: string; label?: string; source?: string; updatedAt?: number; quota?: unknown; aggregation?: unknown }> }>(r))
+        .then((data) => {
+          if (cancelled || !data) return;
+          // A successful endpoint response is authoritative, including an empty report list.
+          const next = freshQuotaReportsFromResponse(data.reports);
+          setQuotaReports(next);
+          writeSessionListCache(quotasCacheKey, next);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          // Keep last-good only inside the same server freshness bound.
+          setQuotaReports(prev => {
+            const next = freshQuotaReportRecord(prev) ?? {};
+            writeSessionListCache(quotasCacheKey, next);
+            return next;
+          });
+        })
+        .finally(() => { if (!cancelled) setQuotasLoading(false); });
+    }, 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+    // Keyed on the explicit revision: account arrival is silent, real mutations re-read.
+  }, [apiBase, quotaRefreshEpoch, quotaForceRefresh, quotasCacheKey]);
 
   useEffect(() => {
     if (!filterOpen) return;
@@ -263,11 +343,15 @@ export default function ProviderWorkspaceShell({
   const duplicateDisplayNames = useMemo(() => {
     const counts = new Map<string, number>();
     for (const item of allItems) {
-      const label = formatProviderDisplayName(item.name);
+      const label = formatProviderDisplayName(item.name, t);
       counts.set(label, (counts.get(label) ?? 0) + 1);
     }
-    return new Set([...counts.entries()].filter(([, n]) => n > 1).map(([label]) => label));
-  }, [allItems]);
+    const dups = new Set<string>();
+    for (const [label, n] of counts.entries()) {
+      if (n > 1) dups.add(label);
+    }
+    return dups;
+  }, [allItems, t]);
 
   if (allItems.length === 0) {
     return <WorkspaceEmptyState onAddProvider={onAddProvider} />;
@@ -312,18 +396,18 @@ export default function ProviderWorkspaceShell({
               className={`pws-filter-btn${filterActive || filterOpen ? " pws-filter-btn--active" : ""}`}
               onClick={() => setFilterOpen(open => !open)}
               aria-label={t("pws.filterAria")}
-              aria-haspopup="menu"
               aria-expanded={filterOpen}
+              aria-controls="pws-provider-filters"
             >
               <IconFilter width={18} height={18} aria-hidden="true" />
               {filterActive && <span className="pws-filter-dot" aria-hidden="true" />}
             </button>
             {filterOpen && (
-              <div className="pws-filter-menu" role="menu" aria-label={t("pws.providerFiltersAria")}>
+              <div id="pws-provider-filters" className="pws-filter-menu" role="group" aria-label={t("pws.providerFiltersAria")}>
                 <div className="pws-filter-title">{t("pws.filters")}</div>
                 <div className="pws-filter-head">{t("pws.filterStatus")}</div>
                 {statusFilterOptions.map(({ key, label, count }) => (
-                  <label key={key} className="pws-filter-option" role="menuitemcheckbox" aria-checked={statusFilter[key]}>
+                  <label key={key} className="pws-filter-option">
                     <input
                       type="checkbox"
                       checked={statusFilter[key]}
@@ -334,12 +418,12 @@ export default function ProviderWorkspaceShell({
                   </label>
                 ))}
                 <div className="pws-filter-head">{t("pws.pricing")}</div>
-                <label className="pws-filter-option" role="menuitemcheckbox" aria-checked={pricingFilter.free}>
+                <label className="pws-filter-option">
                   <input type="checkbox" checked={pricingFilter.free} onChange={() => setPricingFilter(prev => ({ ...prev, free: !prev.free }))} />
                   <span className="pws-filter-label">{t("modal.badge.free")}</span>
                   <span className="pws-filter-count">{freeCount}</span>
                 </label>
-                <label className="pws-filter-option" role="menuitemcheckbox" aria-checked={pricingFilter.paid}>
+                <label className="pws-filter-option">
                   <input type="checkbox" checked={pricingFilter.paid} onChange={() => setPricingFilter(prev => ({ ...prev, paid: !prev.paid }))} />
                   <span className="pws-filter-label">{t("pws.paid")}</span>
                   <span className="pws-filter-count">{paidCount}</span>
@@ -351,7 +435,7 @@ export default function ProviderWorkspaceShell({
                   { key: "selfHosted" as const, label: t("pws.type.selfHosted"), count: typeCounts.selfHosted },
                   { key: "login" as const, label: t("pws.type.login"), count: typeCounts.login },
                 ]).map(({ key, label, count }) => (
-                  <label key={key} className="pws-filter-option" role="menuitemcheckbox" aria-checked={typeFilter[key]}>
+                  <label key={key} className="pws-filter-option">
                     <input
                       type="checkbox"
                       checked={typeFilter[key]}
@@ -430,7 +514,7 @@ export default function ProviderWorkspaceShell({
                       tabbable={railTabbableName === item.name}
                       modelCount={modelCounts[item.name]}
                       isDefault={defaultProvider === item.name}
-                      showConfigId={duplicateDisplayNames.has(formatProviderDisplayName(item.name))}
+                      showConfigId={duplicateDisplayNames.has(formatProviderDisplayName(item.name, t))}
                       onClick={() => onSelect(item.name)}
                       onFocus={() => setRailFocusName(item.name)}
                     />
@@ -476,28 +560,31 @@ export default function ProviderWorkspaceShell({
             modelUsage: usageModels[selectedItem.name],
             quotaReport: quotaReports[selectedItem.name],
             availableModels: availableModels[selectedItem.name] ?? [],
+            hasLiveModels: (liveModelCounts[selectedItem.name] ?? 0) > 0,
             selectedModels: selectedModels[selectedItem.name] ?? [],
             modelsLoading,
             modelsLoadFailed,
             onRetryModels: retryModels,
           }) ?? (
             <div className="pws-detail-placeholder">
-              <h3>{formatProviderDisplayName(selectedItem.name)}</h3>
+              <h3>{formatProviderDisplayName(selectedItem.name, t)}</h3>
               <p className="muted">{t("pws.detailComingSoon")}</p>
               <button type="button" className="btn btn-ghost btn-sm" onClick={() => onSelect(null)}>
                 {t("modal.back")}
               </button>
             </div>
           )
-        ) : allItems.length > 0 ? (
+        ) : (
           <ProviderOverviewDashboard
             sections={sections}
             quotaReports={quotaReports}
             usageTotals={usageTotals}
+            usageLoading={usageLoading}
+            quotasLoading={quotasLoading}
             onSelectProvider={(name) => onSelect(name)}
             onEditConfig={onEditConfig}
           />
-        ) : null}
+        )}
         </main>
       </div>
     </div>

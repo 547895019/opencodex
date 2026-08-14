@@ -1,12 +1,17 @@
 import { createHash } from "node:crypto";
 import type { IncomingMeta, ProviderAdapter } from "./base";
-import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig, OcxUsage } from "../types";
+import { namespacedToolName, type AdapterEvent, type OcxParsedRequest, type OcxProviderConfig, type OcxUsage } from "../types";
 import { catalogModelSupportsReasoningSummaries } from "../codex/catalog";
 import { COMPACT_PROMPT, decodeCompactionSummary, SUMMARY_PREFIX } from "../responses/compaction";
+import { collectResponsesToolGroups } from "../responses/tool-groups";
+import { isHostedToolUnsupportedForModel } from "../responses/hosted-tool-policy";
 import { decodeServerSentEvents } from "../lib/sse-decoder";
-import { isCanonicalOpenAiForwardProvider } from "../providers/openai-tiers";
+import { CODEX_FORWARD_BASE_URL, isCanonicalOpenAiForwardProvider } from "../providers/openai-tiers";
 import { OCX_REASONING_PREFIX } from "../responses/reasoning-envelope";
 import { modelRecordValue } from "../reasoning-effort";
+import type { TranslatorBudget } from "../lib/translator-budget";
+import { rewriteRoutedCustomToolsForUpstream } from "../responses/custom-tool-compat";
+import { openaiResponsesUrl } from "./openai-responses-url";
 
 // Headers relayed verbatim from the caller in OAuth-passthrough ("forward") mode.
 // Exported so the web-search sidecar reuses the exact same forwarded-auth set for its ChatGPT call.
@@ -30,7 +35,10 @@ export const FORWARD_HEADERS = [
   "x-responsesapi-include-timing-metrics",
 ];
 
-export function sanitizeReasoningInputContent(body: unknown): unknown {
+export function sanitizeReasoningInputContent(
+  body: unknown,
+  opts?: { preserveRawReasoningContent?: boolean },
+): unknown {
   if (!body || typeof body !== "object" || Array.isArray(body)) return body;
   const raw = body as Record<string, unknown>;
   if (!Array.isArray(raw.input)) return body;
@@ -45,13 +53,23 @@ export function sanitizeReasoningInputContent(body: unknown): unknown {
     // backend cannot decrypt them and would reject the request. Strip regardless of content shape.
     const hasOcxEnvelope = typeof rec.encrypted_content === "string" && rec.encrypted_content.startsWith(OCX_REASONING_PREFIX);
     if (!hasRawContent && !hasOcxEnvelope) return item;
-    changed = true;
+    if (hasOcxEnvelope) {
+      changed = true;
+      const next: Record<string, unknown> = { ...rec };
+      delete next.encrypted_content;
+      if (!opts?.preserveRawReasoningContent) next.content = [];
+      return next;
+    }
     // Routed models can produce raw `reasoning_text` output items. Codex echoes those in later
     // native GPT requests, but ChatGPT's Responses backend accepts reasoning input only with empty
     // `content`; keep summaries/ids and drop the raw content so native passthrough does not 400.
-    const next: Record<string, unknown> = { ...rec, content: [] };
-    if (hasOcxEnvelope) delete next.encrypted_content;
-    return next;
+    // DeepSeek's Responses API instead ACCEPTS plaintext reasoning replay (its compatibility
+    // guide merges reasoning items into the adjacent assistant message), so providers flagged
+    // `preserveResponsesReasoningContent` keep it — deleting valid replay content there breaks
+    // continuations after tool calls (issue #875 family).
+    if (opts?.preserveRawReasoningContent) return item;
+    changed = true;
+    return { ...rec, content: [] };
   });
 
   return changed ? { ...raw, input } : body;
@@ -147,18 +165,6 @@ function scrubOcxCompactionItems(body: unknown): unknown {
 }
 
 /**
- * Hosted (OpenAI-executed) tool types that specific native slugs reject at request time. Codex
- * attaches these for app skills (e.g. `image_generation` for imagegen) regardless of the target
- * model, and the passthrough path forwards the raw body untouched — so a slug that doesn't support
- * the tool 400s (`Tool 'image_generation' is not supported with gpt-5.3-codex-spark.`). Each entry
- * maps a model-slug matcher to the hosted tool types that must be stripped before forwarding.
- * Extend this when another native slug rejects a hosted tool (e.g. `code_interpreter`).
- */
-const UNSUPPORTED_HOSTED_TOOLS: ReadonlyArray<{ match: (model: string) => boolean; tools: ReadonlySet<string> }> = [
-  { match: model => model.includes("codex-spark"), tools: new Set(["image_generation", "tool_search"]) },
-];
-
-/**
  * Strip unsupported `reasoning` sub-parameters for native slugs that reject them (e.g. Spark).
  * codex-rs injects `reasoning.context` and `reasoning.summary` based on catalog flags; Spark's
  * backend rejects both. The catalog fix prevents `use_responses_lite` from being set, but this
@@ -216,6 +222,28 @@ function stripDisabledReasoningSummaries(
     ...(isPlainObject(reasoning) && Object.keys(reasoning).length > 0
       ? { reasoning }
       : { reasoning: undefined }),
+  };
+}
+
+/**
+ * Normalize only the delivery enum Codex already emitted. Do not inject a field into callers that
+ * did not request summaries, and leave every unconfigured provider/model byte-for-byte unchanged.
+ */
+function normalizeConfiguredReasoningSummaryDelivery(
+  body: unknown,
+  provider: OcxProviderConfig,
+  modelId: string,
+): unknown {
+  const delivery = modelRecordValue(provider.modelReasoningSummaryDelivery, modelId);
+  if (delivery === undefined || !isPlainObject(body) || !isPlainObject(body.stream_options)) return body;
+  if (!Object.hasOwn(body.stream_options, "reasoning_summary_delivery")) return body;
+  if (body.stream_options.reasoning_summary_delivery === delivery) return body;
+  return {
+    ...body,
+    stream_options: {
+      ...body.stream_options,
+      reasoning_summary_delivery: delivery,
+    },
   };
 }
 
@@ -331,6 +359,153 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
+function normalizeFunctionToolSchema(tool: unknown): unknown {
+  if (!isPlainObject(tool) || tool.type !== "function") return tool;
+  if (isPlainObject(tool.parameters) && tool.parameters.type === "object") return tool;
+  return {
+    ...tool,
+    parameters: { ...(isPlainObject(tool.parameters) ? tool.parameters : {}), type: "object" },
+  };
+}
+
+function normalizeToolSchemas(body: unknown): unknown {
+  if (!isPlainObject(body)) return body;
+
+  const normalizeTools = (tools: unknown[]): unknown[] => {
+    let changed = false;
+    const normalized = tools.map((tool) => {
+      const fixed = normalizeFunctionToolSchema(tool);
+      if (fixed !== tool) changed = true;
+      return fixed;
+    });
+    return changed ? normalized : tools;
+  };
+
+  let normalizedBody = body;
+  if (Array.isArray(body.tools)) {
+    const tools = normalizeTools(body.tools);
+    if (tools !== body.tools) normalizedBody = { ...normalizedBody, tools };
+  }
+  if (Array.isArray(normalizedBody.input)) {
+    let inputChanged = false;
+    const input = normalizedBody.input.map((item) => {
+      if (!isPlainObject(item) || item.type !== "additional_tools" || !Array.isArray(item.tools)) return item;
+      const tools = normalizeTools(item.tools);
+      if (tools === item.tools) return item;
+      inputChanged = true;
+      return { ...item, tools };
+    });
+    if (inputChanged) normalizedBody = { ...normalizedBody, input };
+  }
+  return normalizedBody;
+}
+
+function activateDeferredTool(tool: Record<string, unknown>): Record<string, unknown> {
+  const { defer_loading: _, ...activeTool } = tool;
+  if (tool.type !== "namespace" || !Array.isArray(tool.tools)) return activeTool;
+  return {
+    ...activeTool,
+    tools: tool.tools.map(inner => isPlainObject(inner) ? activateDeferredTool(inner) : inner),
+  };
+}
+
+function mergeLoadedTools(declaredTools: unknown[], loadedTools: unknown[]): unknown[] {
+  const merged = [...declaredTools];
+  let changed = false;
+
+  for (const candidate of loadedTools) {
+    if (!isPlainObject(candidate) || typeof candidate.name !== "string") continue;
+    const loaded = activateDeferredTool(candidate);
+    if (loaded.type === "namespace" && Array.isArray(loaded.tools)) {
+      const namespaceIndex = merged.findIndex(tool =>
+        isPlainObject(tool) && tool.type === "namespace" && tool.name === loaded.name
+      );
+      if (namespaceIndex < 0) {
+        merged.push(loaded);
+        changed = true;
+        continue;
+      }
+
+      const namespace = merged[namespaceIndex];
+      if (!isPlainObject(namespace)) continue;
+      const namespaceTools = Array.isArray(namespace.tools) ? namespace.tools : [];
+      const nextNamespaceTools = [...namespaceTools];
+      let namespaceChanged = "defer_loading" in namespace;
+      for (const tool of loaded.tools) {
+        if (!isPlainObject(tool) || typeof tool.name !== "string") continue;
+        const declaredIndex = nextNamespaceTools.findIndex(declared =>
+          isPlainObject(declared) && declared.name === tool.name
+        );
+        if (declaredIndex < 0) {
+          nextNamespaceTools.push(tool);
+          namespaceChanged = true;
+          continue;
+        }
+        const declared = nextNamespaceTools[declaredIndex];
+        if (isPlainObject(declared) && "defer_loading" in declared) {
+          nextNamespaceTools[declaredIndex] = activateDeferredTool(declared);
+          namespaceChanged = true;
+        }
+      }
+      if (!namespaceChanged) continue;
+      const { defer_loading: _, ...activeNamespace } = namespace;
+      merged[namespaceIndex] = { ...activeNamespace, tools: nextNamespaceTools };
+      changed = true;
+      continue;
+    }
+
+    const declaredIndex = merged.findIndex(tool =>
+      isPlainObject(tool) && tool.type !== "namespace" && tool.name === loaded.name
+    );
+    if (declaredIndex < 0) {
+      merged.push(loaded);
+      changed = true;
+    } else {
+      const declared = merged[declaredIndex];
+      if (isPlainObject(declared) && "defer_loading" in declared) {
+        merged[declaredIndex] = activateDeferredTool(declared);
+        changed = true;
+      }
+    }
+  }
+
+  return changed ? merged : declaredTools;
+}
+
+/**
+ * Client-executed tool search only changes Codex's parsed tool context. Routed passthrough keeps
+ * serializing the raw request, so activate those returned definitions for upstreams that do not
+ * implement the native deferred-loading handshake themselves.
+ */
+function promoteClientLoadedTools(body: unknown): unknown {
+  if (!isPlainObject(body) || !Array.isArray(body.input)) return body;
+
+  const loadedTools = body.input.flatMap(item =>
+    isPlainObject(item) && item.type === "tool_search_output" && Array.isArray(item.tools)
+      ? item.tools
+      : []
+  );
+  if (loadedTools.length === 0) return body;
+
+  if (Array.isArray(body.tools)) {
+    const tools = mergeLoadedTools(body.tools, loadedTools);
+    return tools === body.tools ? body : { ...body, tools };
+  }
+
+  const additionalToolsIndex = body.input.findIndex(item =>
+    isPlainObject(item) && item.type === "additional_tools" && Array.isArray(item.tools)
+  );
+  if (additionalToolsIndex < 0) return { ...body, tools: mergeLoadedTools([], loadedTools) };
+
+  const additionalTools = body.input[additionalToolsIndex];
+  if (!isPlainObject(additionalTools) || !Array.isArray(additionalTools.tools)) return body;
+  const tools = mergeLoadedTools(additionalTools.tools, loadedTools);
+  if (tools === additionalTools.tools) return body;
+  const input = [...body.input];
+  input[additionalToolsIndex] = { ...additionalTools, tools };
+  return { ...body, input };
+}
+
 const MAX_RESPONSES_CALL_ID_LENGTH = 64;
 const REPAIRED_CALL_ID_PREFIX = "call_ocx_";
 const REPAIRED_CALL_ID_DIGEST_LENGTH = MAX_RESPONSES_CALL_ID_LENGTH - REPAIRED_CALL_ID_PREFIX.length;
@@ -406,6 +581,33 @@ function toolOutputText(output: unknown): string {
  *   reasoning chain is intact and must be preserved.
  * Runs on every forward request; with intact pairs it returns the original reference.
  */
+/**
+ * Backfill `queries` on a replayed single-query `web_search_call`.
+ *
+ * `webSearchAction()` in the bridge now emits both keys, but that only helps items
+ * created after the fix. A conversation that already recorded
+ * `{type:"search", query:"..."}` replays that stored item on every subsequent turn, and
+ * DeepSeek's native Responses parser requires `queries` — so upgrading alone leaves
+ * those threads permanently 400ing with `missing field 'queries'` (#930).
+ *
+ * Runs on every Responses request, on both `input` items and the `action` nested inside
+ * them. Returns the original reference when nothing needs repair, so the common path
+ * allocates nothing.
+ */
+function backfillWebSearchQueries(body: unknown): unknown {
+  if (!isPlainObject(body) || !Array.isArray(body.input)) return body;
+  let changed = false;
+  const input = body.input.map(item => {
+    if (!isPlainObject(item) || item.type !== "web_search_call") return item;
+    const action = item.action;
+    if (!isPlainObject(action) || action.type !== "search") return item;
+    if (typeof action.query !== "string" || Array.isArray(action.queries)) return item;
+    changed = true;
+    return { ...item, action: { ...action, queries: [action.query] } };
+  });
+  return changed ? { ...body, input } : body;
+}
+
 function repairOrphanedInputItems(body: unknown, dropReasoning: boolean): unknown {
   if (!isPlainObject(body) || !Array.isArray(body.input)) return body;
   const input = body.input;
@@ -445,6 +647,107 @@ function repairOrphanedInputItems(body: unknown, dropReasoning: boolean): unknow
 }
 
 /**
+ * Make unambiguous Responses tool batches contiguous for upstream parsers that require it.
+ *
+ * [Decision Log]
+ * - 목적과 의도: Keep Codex hook-injected developer context without splitting a parallel tool-call turn away from its reasoning or making a strict upstream reject matching results.
+ * - 기존 구현 및 제약 조건: The orphan repair verifies only pair presence, while the original pair-by-pair reorder turned `reasoning, call A, call B, output A, output B` into two assistant turns and made DeepSeek reject call B for missing reasoning (#1477).
+ * - 검토한 주요 대안: Disable parallel calls (DeepSeek always enables them); duplicate reasoning per call; reorder each pair; or normalize the complete unambiguous call batch.
+ * - 선택한 방식: Treat calls emitted before the first matched result as one batch, emit all calls followed by their matched outputs, and preserve intervening non-tool items immediately after the batch.
+ * - 다른 대안 대신 이 방식을 선택한 이유: Batch normalization matches the Responses parallel-call shape without fabricating reasoning, while the provider gate and unique-pair requirement keep the blast radius narrow.
+ * - 장점, 단점 및 영향: DeepSeek keeps one reasoning-bearing assistant turn for parallel calls and still accepts hook-interleaved single calls; tolerant providers stay byte/order equivalent, and duplicate, missing, or backwards call/result pairs are not guessed.
+ */
+function normalizeResponsesToolResultAdjacency(body: unknown): unknown {
+  if (!isPlainObject(body) || !Array.isArray(body.input)) return body;
+  const input = body.input;
+  const calls = new Map<string, number[]>();
+  const outputs = new Map<string, number[]>();
+
+  const appendIndex = (map: Map<string, number[]>, key: string, index: number): void => {
+    const existing = map.get(key);
+    if (existing) existing.push(index);
+    else map.set(key, [index]);
+  };
+
+  for (let index = 0; index < input.length; index += 1) {
+    const item = input[index];
+    if (!isPlainObject(item) || typeof item.call_id !== "string" || item.call_id.length === 0) continue;
+    if (item.type === "function_call" || item.type === "local_shell_call") {
+      appendIndex(calls, `function:${item.call_id}`, index);
+    } else if (item.type === "custom_tool_call") {
+      appendIndex(calls, `custom:${item.call_id}`, index);
+    } else if (item.type === "function_call_output") {
+      appendIndex(outputs, `function:${item.call_id}`, index);
+    } else if (item.type === "custom_tool_call_output") {
+      appendIndex(outputs, `custom:${item.call_id}`, index);
+    }
+  }
+
+  const pairs: Array<{ callIndex: number; outputIndex: number }> = [];
+  for (const [key, callIndices] of calls) {
+    const outputIndices = outputs.get(key);
+    if (!outputIndices) return body;
+    if (callIndices.length !== 1 || outputIndices.length !== 1) return body;
+    const callIndex = callIndices[0]!;
+    const outputIndex = outputIndices[0]!;
+    if (outputIndex <= callIndex) return body;
+    pairs.push({ callIndex, outputIndex });
+  }
+  // Reject any collected output that lacks exactly one matching call. A lone or
+  // duplicated output is ambiguous, and normalizing on top of it could sever a
+  // result from the reasoning-bearing call turn it belongs to.
+  for (const [key, outputIndices] of outputs) {
+    const callIndices = calls.get(key);
+    if (!callIndices || callIndices.length !== 1 || outputIndices.length !== 1) return body;
+  }
+  pairs.sort((left, right) => left.callIndex - right.callIndex);
+
+  const movedIndices = new Set<number>();
+  const batchAt = new Map<number, unknown[]>();
+  for (let cursor = 0; cursor < pairs.length;) {
+    const group = [pairs[cursor]!];
+    let firstOutputIndex = pairs[cursor]!.outputIndex;
+    let next = cursor + 1;
+    while (next < pairs.length && pairs[next]!.callIndex < firstOutputIndex) {
+      group.push(pairs[next]!);
+      firstOutputIndex = Math.min(firstOutputIndex, pairs[next]!.outputIndex);
+      next += 1;
+    }
+
+    // Within one reasoning turn the outputs must appear in the same order as their
+    // calls. If they are reversed, normalizing would fabricate a new output order;
+    // leave the ambiguous history untouched instead.
+    for (let groupIndex = 1; groupIndex < group.length; groupIndex += 1) {
+      if (group[groupIndex]!.outputIndex < group[groupIndex - 1]!.outputIndex) return body;
+    }
+
+    const batch = [
+      ...group.map(pair => input[pair.callIndex]),
+      ...group.map(pair => input[pair.outputIndex]),
+    ];
+    const anchor = group[0]!.callIndex;
+    const alreadyContiguous = batch.every((item, offset) => input[anchor + offset] === item);
+    if (!alreadyContiguous) {
+      batchAt.set(anchor, batch);
+      for (const pair of group) {
+        movedIndices.add(pair.callIndex);
+        movedIndices.add(pair.outputIndex);
+      }
+    }
+    cursor = next;
+  }
+  if (batchAt.size === 0) return body;
+
+  const normalized: unknown[] = [];
+  for (let index = 0; index < input.length; index += 1) {
+    const batch = batchAt.get(index);
+    if (batch) normalized.push(...batch);
+    if (!movedIndices.has(index)) normalized.push(input[index]);
+  }
+  return { ...body, input: normalized };
+}
+
+/**
  * Remove `previous_response_id` before forwarding. Two triggers:
  * - the proxy expanded the request into a full input replay (the id is now redundant), or
  * - the target is the ChatGPT backend (`authMode: "forward"`), whose Codex REST endpoint
@@ -462,43 +765,457 @@ function stripPreviousResponseId(body: unknown, strip: boolean): unknown {
 }
 
 /**
- * Hosted tool types whose server-side function names collide with the client tools Codex
- * declares for the matching app skill. Codex sends BOTH (e.g. hosted `image_generation` plus a
- * declared `image_gen.imagegen` function/namespace tool for the imagegen skill). The ChatGPT
- * backend tolerates the pair, but the platform `/v1/responses` rejects it:
- * `Invalid Value: 'tools'. Function 'image_gen.imagegen' conflicts with a hosted tool in the
- * same request.` Keyed hosted-type → conflicting client tool-name prefix; the hosted entry is
- * dropped (the declared tool wins — Codex executes the skill client-side either way).
+ * Drop request parameters a stateless Responses upstream cannot implement, and pin
+ * `store` false.
+ *
+ * `previous_response_id` is listed here as well as in `stripPreviousResponseId`
+ * because that helper's strip is conditional on replay expansion, and it keeps the
+ * field for API-key providers on the premise that the platform offers real
+ * server-side storage. DeepSeek documents the opposite: "the API is stateless:
+ * responses and conversations are not stored on the server", so the field can never
+ * be honoured regardless of expansion state.
+ *
+ * `prompt` is a reference to a server-stored prompt template — the most stateful
+ * field in the accepted schema.
+ *
+ * `service_tier` is deliberately NOT dropped: the server writes it for fast mode
+ * (`responses/core.ts`), and silently deleting a configured knob inside an adapter is
+ * worse than forwarding a parameter the upstream ignores.
+ *
+ * MUST run before the composed sanitize chain below: `stripItemIdsWhenUnstored` keys
+ * off `store === false`, and a stateless upstream cannot resolve a stored item id.
+ * Returns a copy, so `parsed._rawBody` keeps the client's original `store` value and
+ * the local replay cache still records the turn.
  */
-const HOSTED_TOOL_NAME_CONFLICTS: ReadonlyArray<{ hostedType: string; namePrefix: string }> = [
-  { hostedType: "image_generation", namePrefix: "image_gen" },
-];
+function stripStatefulResponsesParams(body: unknown): unknown {
+  if (!isPlainObject(body)) return body;
+  const drop = ["previous_response_id", "conversation", "background", "metadata", "prompt"] as const;
+  const present = drop.some(key => Object.prototype.hasOwnProperty.call(body, key));
+  if (!present && body.store === false) return body;
+  const next: Record<string, unknown> = { ...body };
+  for (const key of drop) delete next[key];
+  next.store = false;
+  return next;
+}
 
 /**
- * Drop hosted tools whose names collide with declared function/namespace tools (see
- * HOSTED_TOOL_NAME_CONFLICTS). Only applies on the API-key platform path: the ChatGPT backend
- * ("forward" mode) accepts the pair, and stripping there would disable native imagegen. No-op
- * (returns the original reference) when nothing matches.
+ * Remove top-level parameters the ChatGPT backend (`authMode: "forward"`) rejects
+ * with `{"detail":"Unsupported parameter: …"}` (strict allowlist). Codex CLI never
+ * sends these — it controls output length via `reasoning.effort` — but third-party
+ * Responses API clients (GJC, SDK wrappers) include `max_output_tokens` per the
+ * public spec. `metadata` is likewise absent from the allowlist. No-op when the
+ * body carries neither field, keeping the common Codex path allocation-free.
  */
-function stripConflictingHostedTools(body: unknown): unknown {
-  if (!isPlainObject(body) || !Array.isArray(body.tools)) return body;
-  const allTools = body.tools;
+function stripUnsupportedForwardParams(body: unknown): unknown {
+  if (!isPlainObject(body)) return body;
+  const hasMot = Object.prototype.hasOwnProperty.call(body, "max_output_tokens");
+  const hasMeta = Object.prototype.hasOwnProperty.call(body, "metadata");
+  if (!hasMot && !hasMeta) return body;
+  const { max_output_tokens: _mot, metadata: _meta, ...rest } = body;
+  return rest;
+}
 
-  const conflicting = HOSTED_TOOL_NAME_CONFLICTS.filter(c =>
-    allTools.some(t => {
-      if (!isPlainObject(t) || typeof t.name !== "string") return false;
-      if (t.type === "namespace") return t.name === c.namePrefix;
-      return t.name === c.namePrefix || t.name.startsWith(`${c.namePrefix}.`);
-    }),
-  );
-  if (conflicting.length === 0) return body;
+const IMAGE_GEN_NAMESPACE = "image_gen";
+const HOSTED_IMAGE_GENERATION_TOOL = "image_generation";
+const IMAGE_GEN_DOTTED_PREFIX = `${IMAGE_GEN_NAMESPACE}.`;
+const IMAGE_GEN_WIRE_PREFIX = `${IMAGE_GEN_NAMESPACE}__`;
 
-  const tools = allTools.filter(t => {
-    const type = isPlainObject(t) && typeof t.type === "string" ? t.type : undefined;
-    if (!type) return true;
-    return !conflicting.some(c => c.hostedType === type);
+/** Remove a supported client prefix before constructing the canonical image-gen wire alias. */
+function imageGenLocalName(name: string): string {
+  if (name.startsWith(IMAGE_GEN_DOTTED_PREFIX)) return name.slice(IMAGE_GEN_DOTTED_PREFIX.length);
+  if (name.startsWith(IMAGE_GEN_WIRE_PREFIX)) return name.slice(IMAGE_GEN_WIRE_PREFIX.length);
+  return name;
+}
+
+/** Build the flat public-Responses name used only on the upstream wire. */
+function imageGenWireName(name: string): string {
+  return namespacedToolName(IMAGE_GEN_NAMESPACE, imageGenLocalName(name));
+}
+
+/** Match client image-gen declarations across namespace, legacy dotted, and canonical wire forms. */
+function isImageGenClientName(name: string): boolean {
+  return name === IMAGE_GEN_NAMESPACE
+    || name.startsWith(IMAGE_GEN_DOTTED_PREFIX)
+    || name.startsWith(IMAGE_GEN_WIRE_PREFIX);
+}
+
+/** Identify declarations that should activate image-gen request normalization. */
+function declaresImageGenClientTool(tool: unknown): boolean {
+  if (!isPlainObject(tool) || typeof tool.name !== "string") return false;
+  if (tool.type === "namespace") return tool.name === IMAGE_GEN_NAMESPACE;
+  return isImageGenClientName(tool.name);
+}
+
+/** Rewrite client image-gen selectors to the hosted tool without widening caller restrictions. */
+function preferHostedImageGenToolChoice(toolChoice: unknown): unknown {
+  if (!isPlainObject(toolChoice)) return toolChoice;
+  if ((toolChoice.type === "function" || toolChoice.type === "custom") && typeof toolChoice.name === "string") {
+    return isImageGenClientName(toolChoice.name) ? { type: HOSTED_IMAGE_GENERATION_TOOL } : toolChoice;
+  }
+  if (toolChoice.type !== "allowed_tools" || !Array.isArray(toolChoice.tools)) return toolChoice;
+  const hasHostedImageTool = toolChoice.tools.some(tool => isPlainObject(tool) && tool.type === HOSTED_IMAGE_GENERATION_TOOL);
+  let changed = false;
+  let addedHostedImageTool = false;
+  const tools: unknown[] = [];
+  for (const tool of toolChoice.tools) {
+    const isClientImageTool = isPlainObject(tool)
+      && (tool.type === "function" || tool.type === "custom")
+      && typeof tool.name === "string"
+      && isImageGenClientName(tool.name);
+    if (!isClientImageTool) {
+      tools.push(tool);
+      continue;
+    }
+    changed = true;
+    if (!hasHostedImageTool && !addedHostedImageTool) {
+      tools.push({ type: HOSTED_IMAGE_GENERATION_TOOL });
+      addedHostedImageTool = true;
+    }
+  }
+  return changed ? { ...toolChoice, tools } : toolChoice;
+}
+
+/**
+ * Some Responses-compatible gateways reserve the hosted image namespace even when the request
+ * does not explicitly declare `image_generation`. For an explicitly configured model, remove only
+ * colliding client declarations so the gateway's hosted tool can take precedence.
+ */
+function preferConfiguredHostedTools(
+  body: unknown,
+  provider: OcxProviderConfig,
+  modelId: string,
+  selectedModelId?: string,
+): unknown {
+  // A virtual model's advertised id takes precedence over its resolved wire-model id.
+  // Read own properties only: a routed model id of `constructor`/`toString` would
+  // otherwise resolve to an inherited Object.prototype function and throw on the
+  // membership test below, failing the request before it is dispatched.
+  const preferenceMap = provider.modelPreferHostedTools;
+  const ownPreference = (key: string | undefined): string[] | undefined => {
+    if (!key || !preferenceMap || !Object.prototype.hasOwnProperty.call(preferenceMap, key)) return undefined;
+    const entry = preferenceMap[key];
+    return Array.isArray(entry) ? entry : undefined;
+  };
+  const preferredTools = ownPreference(selectedModelId) ?? ownPreference(modelId);
+  if (!preferredTools?.includes(HOSTED_IMAGE_GENERATION_TOOL) || !isPlainObject(body)) return body;
+
+  const stripGroup = (tools: unknown[]): unknown[] => {
+    const filtered = tools.filter(tool => !declaresImageGenClientTool(tool));
+    return filtered.length === tools.length ? tools : filtered;
+  };
+
+  let changed = false;
+  let tools = body.tools;
+  let strippedTopLevelImageGenTool = false;
+  if (Array.isArray(body.tools)) {
+    tools = stripGroup(body.tools);
+    strippedTopLevelImageGenTool = tools !== body.tools;
+    changed ||= strippedTopLevelImageGenTool;
+  }
+
+  let input = body.input;
+  const strippedAdditionalToolsIndices = new Set<number>();
+  if (Array.isArray(body.input)) {
+    let nestedChanged = false;
+    const mappedInput = body.input.map((item, index) => {
+      if (!isPlainObject(item) || item.type !== "additional_tools" || !Array.isArray(item.tools)) return item;
+      const nestedTools = stripGroup(item.tools);
+      if (nestedTools === item.tools) return item;
+      strippedAdditionalToolsIndices.add(index);
+      nestedChanged = true;
+      return { ...item, tools: nestedTools };
+    });
+    if (nestedChanged) {
+      input = mappedInput;
+      changed = true;
+    }
+  }
+
+  const hasToolChoice = Object.hasOwn(body, "tool_choice");
+  const toolChoice = hasToolChoice ? preferHostedImageGenToolChoice(body.tool_choice) : body.tool_choice;
+  const toolChoiceChanged = hasToolChoice && toolChoice !== body.tool_choice;
+  const hasHostedImageGenTool = (toolGroup: unknown): boolean => Array.isArray(toolGroup)
+    && toolGroup.some(tool => isPlainObject(tool) && tool.type === HOSTED_IMAGE_GENERATION_TOOL);
+  const hasHostedImageGenDeclaration = hasHostedImageGenTool(tools)
+    || (Array.isArray(input) && input.some(item => isPlainObject(item)
+      && item.type === "additional_tools"
+      && hasHostedImageGenTool(item.tools)));
+  if ((strippedTopLevelImageGenTool || strippedAdditionalToolsIndices.size > 0) && !hasHostedImageGenDeclaration) {
+    if (strippedTopLevelImageGenTool && Array.isArray(tools)) {
+      tools = [...tools, { type: HOSTED_IMAGE_GENERATION_TOOL }];
+    } else if (strippedAdditionalToolsIndices.size > 0 && Array.isArray(input)) {
+      // Restore into the FIRST stripped container only. Tool declarations are
+      // request-scoped, not container-scoped — the containers are separate carriers for
+      // one tool set, so a single hosted declaration covers the request. An earlier
+      // revision restored into every stripped container and put `image_generation` on
+      // the wire twice; review caught it.
+      const firstStripped = Math.min(...strippedAdditionalToolsIndices);
+      input = input.map((item, index) => index === firstStripped
+        && isPlainObject(item)
+        && Array.isArray(item.tools)
+        ? { ...item, tools: [...item.tools, { type: HOSTED_IMAGE_GENERATION_TOOL }] }
+        : item);
+    }
+  }
+  changed ||= toolChoiceChanged;
+  if (!changed) return body;
+  const next: Record<string, unknown> = {
+    ...body,
+    ...(Array.isArray(body.tools) ? { tools } : {}),
+    ...(Array.isArray(body.input) ? { input } : {}),
+  };
+  if (toolChoiceChanged) next.tool_choice = toolChoice;
+  return next;
+}
+
+/**
+ * Lower one complete Codex image-gen namespace to public Responses function tools.
+ *
+ * The public API reserves the `image_gen` namespace and restricts function names to a flat safe
+ * alphabet. `image_gen__<tool>` is therefore an upstream-only alias; client-facing responses are
+ * restored to explicit `{ namespace: "image_gen", name: "<tool>" }` calls by the server. Only a
+ * non-empty namespace containing named function tools is safe to lower. Malformed, empty, and
+ * future namespace shapes stay untouched instead of silently losing client capabilities.
+ */
+function flattenImageGenNamespace(tool: unknown): Record<string, unknown>[] | undefined {
+  if (
+    !isPlainObject(tool)
+    || tool.type !== "namespace"
+    || tool.name !== IMAGE_GEN_NAMESPACE
+    || !Array.isArray(tool.tools)
+    || tool.tools.length === 0
+  ) return undefined;
+
+  for (const innerTool of tool.tools) {
+    if (
+      !isPlainObject(innerTool)
+      || innerTool.type !== "function"
+      || typeof innerTool.name !== "string"
+      || innerTool.name.length === 0
+    ) return undefined;
+  }
+
+  return tool.tools.map(innerTool => {
+    const functionTool = innerTool as Record<string, unknown> & { name: string };
+    return {
+      ...functionTool,
+      name: imageGenWireName(functionTool.name),
+    };
   });
-  return tools.length === allTools.length ? body : { ...body, tools };
+}
+
+/** Convert a legacy dotted function declaration while preserving all other function metadata. */
+function normalizeFlatImageGenFunction(tool: unknown): unknown {
+  if (
+    !isPlainObject(tool)
+    || tool.type !== "function"
+    || typeof tool.name !== "string"
+    || !tool.name.startsWith(IMAGE_GEN_DOTTED_PREFIX)
+  ) return tool;
+  return { ...tool, name: imageGenWireName(tool.name) };
+}
+
+/** Return the image-gen function name used for stable cross-container deduplication. */
+function imageGenFunctionName(tool: unknown): string | undefined {
+  if (!isPlainObject(tool) || tool.type !== "function" || typeof tool.name !== "string") {
+    return undefined;
+  }
+  return isImageGenClientName(tool.name) ? tool.name : undefined;
+}
+
+/** True only when a declaration can yield a callable upstream-safe image-gen function alias. */
+function declaresUsableImageGenAlias(tool: unknown): boolean {
+  if (flattenImageGenNamespace(tool)) return true;
+  if (!isPlainObject(tool) || tool.type !== "function" || typeof tool.name !== "string") {
+    return false;
+  }
+  if (tool.name.startsWith(IMAGE_GEN_DOTTED_PREFIX)) {
+    return tool.name.length > IMAGE_GEN_DOTTED_PREFIX.length;
+  }
+  return tool.name.startsWith(IMAGE_GEN_WIRE_PREFIX)
+    && tool.name.length > IMAGE_GEN_WIRE_PREFIX.length;
+}
+
+/** Collect client tool-choice names and the exact upstream aliases declared for them. */
+function imageGenToolChoiceAliases(toolGroups: unknown[][]): Map<string, string> {
+  const aliases = new Map<string, string>();
+
+  for (const group of toolGroups) {
+    for (const tool of group) {
+      const flattened = flattenImageGenNamespace(tool);
+      if (flattened) {
+        for (const candidate of flattened) {
+          const wireName = candidate.name as string;
+          aliases.set(`${IMAGE_GEN_DOTTED_PREFIX}${imageGenLocalName(wireName)}`, wireName);
+          aliases.set(wireName, wireName);
+        }
+        continue;
+      }
+      if (!isPlainObject(tool) || tool.type !== "function" || typeof tool.name !== "string") {
+        continue;
+      }
+      if (
+        tool.name.startsWith(IMAGE_GEN_DOTTED_PREFIX)
+        && tool.name.length > IMAGE_GEN_DOTTED_PREFIX.length
+      ) {
+        aliases.set(tool.name, imageGenWireName(tool.name));
+      } else if (
+        tool.name.startsWith(IMAGE_GEN_WIRE_PREFIX)
+        && tool.name.length > IMAGE_GEN_WIRE_PREFIX.length
+      ) {
+        aliases.set(tool.name, tool.name);
+      }
+    }
+  }
+
+  return aliases;
+}
+
+/** Rewrite function selectors only when their corresponding declaration receives a wire alias. */
+function normalizeImageGenToolChoice(
+  toolChoice: unknown,
+  aliases: ReadonlyMap<string, string>,
+): unknown {
+  if (!isPlainObject(toolChoice)) return toolChoice;
+
+  if (toolChoice.type === "function" && typeof toolChoice.name === "string") {
+    const alias = aliases.get(toolChoice.name);
+    return alias && alias !== toolChoice.name ? { ...toolChoice, name: alias } : toolChoice;
+  }
+
+  if (toolChoice.type !== "allowed_tools" || !Array.isArray(toolChoice.tools)) return toolChoice;
+  let changed = false;
+  const tools = toolChoice.tools.map(tool => {
+    if (!isPlainObject(tool) || tool.type !== "function" || typeof tool.name !== "string") {
+      return tool;
+    }
+    const alias = aliases.get(tool.name);
+    if (!alias || alias === tool.name) return tool;
+    changed = true;
+    return { ...tool, name: alias };
+  });
+  return changed ? { ...toolChoice, tools } : toolChoice;
+}
+
+/** Identify replayed image-gen calls that require upstream wire encoding. */
+function declaresImageGenFunctionCall(item: unknown): boolean {
+  if (!isPlainObject(item) || item.type !== "function_call" || typeof item.name !== "string") {
+    return false;
+  }
+  return item.namespace === IMAGE_GEN_NAMESPACE || isImageGenClientName(item.name);
+}
+
+/** Encode native or legacy replay calls to the same flat name used by tool declarations. */
+function normalizeImageGenFunctionCall(item: unknown): unknown {
+  if (!declaresImageGenFunctionCall(item) || !isPlainObject(item) || typeof item.name !== "string") {
+    return item;
+  }
+  if (item.namespace === IMAGE_GEN_NAMESPACE) {
+    const { namespace: _namespace, ...rest } = item;
+    return { ...rest, name: imageGenWireName(item.name) };
+  }
+  if (item.name.startsWith(IMAGE_GEN_DOTTED_PREFIX)) {
+    return { ...item, name: imageGenWireName(item.name) };
+  }
+  return item;
+}
+
+/**
+ * Normalize Codex's private image-gen tool declaration for API-key Responses providers.
+ *
+ * A complete `image_gen` namespace is flattened to safe `image_gen__<tool>` aliases even when it is
+ * the only image tool in the request. Replayed client calls are encoded to the same alias, including
+ * legacy dotted calls from older compatibility attempts. When a usable alias replaces a client
+ * image-gen declaration, the duplicate hosted `image_generation` entry is removed. Duplicate aliases
+ * are resolved in stable container order: top-level tools first, then Responses Lite
+ * `additional_tools` entries.
+ *
+ * This function is called only on the API-key path. ChatGPT forward mode understands the private
+ * namespace and must keep it. Copy-on-write preserves the original request reference when no
+ * namespace is flattened, hosted tool removed, or duplicate function discarded.
+ */
+function normalizeImageGenClientTools(body: unknown): unknown {
+  if (!isPlainObject(body)) return body;
+
+  const toolGroups = collectResponsesToolGroups(body);
+  const hasImageGenClientTool = toolGroups.some(group => group.some(declaresImageGenClientTool))
+    || (Array.isArray(body.input) && body.input.some(declaresImageGenFunctionCall));
+  if (!hasImageGenClientTool) return body;
+  const hasUsableImageGenAlias = toolGroups.some(group => group.some(declaresUsableImageGenAlias));
+  const toolChoiceAliases = imageGenToolChoiceAliases(toolGroups);
+
+  const seenFunctionNames = new Set<string>();
+  const normalizeGroup = (tools: unknown[]): unknown[] => {
+    const normalized: unknown[] = [];
+    let groupChanged = false;
+
+    for (const tool of tools) {
+      if (
+        hasUsableImageGenAlias
+        && isPlainObject(tool)
+        && tool.type === HOSTED_IMAGE_GENERATION_TOOL
+      ) {
+        groupChanged = true;
+        continue;
+      }
+
+      const flattened = flattenImageGenNamespace(tool);
+      const candidates = flattened ?? [tool];
+      if (flattened) groupChanged = true;
+
+      for (const candidate of candidates) {
+        const normalizedCandidate = normalizeFlatImageGenFunction(candidate);
+        if (normalizedCandidate !== candidate) groupChanged = true;
+        const functionName = imageGenFunctionName(normalizedCandidate);
+        if (functionName && seenFunctionNames.has(functionName)) {
+          groupChanged = true;
+          continue;
+        }
+        if (functionName) seenFunctionNames.add(functionName);
+        normalized.push(normalizedCandidate);
+      }
+    }
+
+    return groupChanged ? normalized : tools;
+  };
+
+  let changed = false;
+  let tools = body.tools;
+  if (Array.isArray(body.tools)) {
+    tools = normalizeGroup(body.tools);
+    changed ||= tools !== body.tools;
+  }
+
+  let input = body.input;
+  if (Array.isArray(body.input)) {
+    let nestedChanged = false;
+    const mappedInput = body.input.map(item => {
+      if (isPlainObject(item) && item.type === "additional_tools" && Array.isArray(item.tools)) {
+        const nestedTools = normalizeGroup(item.tools);
+        if (nestedTools === item.tools) return item;
+        nestedChanged = true;
+        return { ...item, tools: nestedTools };
+      }
+      const normalizedCall = normalizeImageGenFunctionCall(item);
+      if (normalizedCall !== item) nestedChanged = true;
+      return normalizedCall;
+    });
+    if (nestedChanged) {
+      input = mappedInput;
+      changed = true;
+    }
+  }
+
+  const toolChoice = normalizeImageGenToolChoice(body.tool_choice, toolChoiceAliases);
+  changed ||= toolChoice !== body.tool_choice;
+
+  if (!changed) return body;
+  return {
+    ...body,
+    ...(Array.isArray(body.tools) ? { tools } : {}),
+    ...(Array.isArray(body.input) ? { input } : {}),
+    ...(Object.prototype.hasOwnProperty.call(body, "tool_choice") ? { tool_choice: toolChoice } : {}),
+  };
 }
 
 /**
@@ -509,13 +1226,9 @@ function stripConflictingHostedTools(body: unknown): unknown {
 function stripUnsupportedHostedTools(body: unknown): unknown {
   if (!isPlainObject(body) || !Array.isArray(body.tools)) return body;
   const model = typeof body.model === "string" ? body.model : "";
-  const unsupported = UNSUPPORTED_HOSTED_TOOLS.filter(e => e.match(model));
-  if (unsupported.length === 0) return body;
-
   const tools = body.tools.filter(t => {
     const type = isPlainObject(t) && typeof t.type === "string" ? t.type : undefined;
-    if (!type) return true;
-    return !unsupported.some(e => e.tools.has(type));
+    return !type || !isHostedToolUnsupportedForModel(model, type);
   });
   return tools.length === body.tools.length ? body : { ...body, tools };
 }
@@ -544,7 +1257,8 @@ function stripInputImagesDeep(value: unknown): unknown {
  */
 function buildRoutedCompactionBody(body: unknown): unknown {
   if (!isPlainObject(body)) return body;
-  const { tools: _tools, tool_choice: _toolChoice, parallel_tool_calls: _parallel, ...rest } = body;
+  // `text` goes with the tool fields: the summary must be prose, not schema-constrained JSON.
+  const { tools: _tools, tool_choice: _toolChoice, parallel_tool_calls: _parallel, text: _text, ...rest } = body;
   const input = Array.isArray(body.input) ? body.input : [];
   const kept = input.filter(item => !isPlainObject(item)
     // `additional_tools` is how Codex Desktop's responses-lite shape carries tools;
@@ -600,34 +1314,44 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
     name: "openai-responses",
     passthrough: true as const,
 
-    buildRequest(parsed: OcxParsedRequest, incoming?: IncomingMeta) {
+    buildRequest(parsed: OcxParsedRequest, incoming: IncomingMeta) {
+      const translatorBudget = incoming.translatorBudget;
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       let url: string;
 
       if (provider.authMode === "forward") {
+        const mayForwardCallerCredentials = isCanonicalOpenAiForwardProvider(provider);
         // OAuth passthrough: ChatGPT backend path is `${baseUrl}/responses` (no /v1).
-        url = `${provider.baseUrl}/responses`;
+        const baseUrl = mayForwardCallerCredentials
+          ? CODEX_FORWARD_BASE_URL
+          : provider.baseUrl.replace(/\/+$/, "");
+        url = `${baseUrl}/responses`;
         if (provider.headers) Object.assign(headers, provider.headers); // static headers first…
         const runtimeProvider = provider as {
           _codexAccountOverride?: { accessToken: string; chatgptAccountId: string };
           _codexAccountRequired?: boolean;
         };
-        if (runtimeProvider._codexAccountRequired && !runtimeProvider._codexAccountOverride) {
+        if (
+          mayForwardCallerCredentials
+          && runtimeProvider._codexAccountRequired
+          && !runtimeProvider._codexAccountOverride
+        ) {
           throw new Error("Codex pool account auth is required but unavailable");
         }
-        for (const h of FORWARD_HEADERS) {
-          const v = incoming?.headers.get(h);
-          if (v) headers[h] = v;                                        // …so forwarded auth always wins.
+        if (mayForwardCallerCredentials) {
+          for (const h of FORWARD_HEADERS) {
+            const v = incoming?.headers.get(h);
+            if (v) headers[h] = v;                                      // …so forwarded auth always wins.
+          }
         }
         const override = runtimeProvider._codexAccountOverride;
-        if (override) {
+        if (override && mayForwardCallerCredentials) {
           headers["authorization"] = `Bearer ${override.accessToken}`;
           headers["chatgpt-account-id"] = override.chatgptAccountId;
         }
       } else {
         if (provider.responsesPath === undefined) {
-          const base = provider.baseUrl.replace(/\/v1\/?$/, "");
-          url = `${base}/v1/responses`;
+          url = openaiResponsesUrl(provider.baseUrl);
         } else {
           const base = provider.baseUrl.replace(/\/$/, "");
           url = `${base}${provider.responsesPath}`;
@@ -642,54 +1366,106 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         parsed._rawBody,
         forward || parsed._previousResponseInputExpanded === true,
       );
-      if (forward) {
+      const stateless = provider.statelessResponses === true;
+      if (stateless) outBody = stripStatefulResponsesParams(outBody);
+      // A replay miss can leave a function_call_output whose paired function_call sat
+      // in the prefix that was never expanded. A stateless upstream cannot resolve the
+      // pair from its own storage either, so it needs the same repair the forward
+      // backend gets — dropping previous_response_id is not much use if the body that
+      // reaches the wire is unparseable.
+      if (forward || stateless) {
         outBody = repairOrphanedInputItems(outBody, unexpandedMiss);
       }
-      else outBody = stripConflictingHostedTools(outBody);
+      if (provider.requiresAdjacentResponsesToolResults === true) {
+        outBody = normalizeResponsesToolResultAdjacency(outBody);
+      }
+      if (forward) {
+        outBody = stripUnsupportedForwardParams(outBody);
+      } else {
+        outBody = preferConfiguredHostedTools(
+          outBody,
+          provider,
+          parsed.modelId,
+          parsed._openAiVirtualSelectedModelId,
+        );
+        outBody = normalizeImageGenClientTools(outBody);
+      }
       if (forward || parsed._previousResponseInputExpanded === true) {
         outBody = repairOversizedReplayCallIds(outBody);
       }
       outBody = stripUnsupportedReasoningSummaryDelivery(outBody, parsed.modelId);
+      // Repair stored history from before the bridge emitted both keys: a conversation
+      // that already recorded a single-query web_search_call replays it every turn, and
+      // a strict parser rejects the whole request over it (#930).
+      outBody = backfillWebSearchQueries(outBody);
       // Same predicate as the routedCompaction gate in handleResponses(): an
       // authMode check would let a noncanonical custom forward provider skip this
       // rewrite while the server still routes it as a summarizer turn (#422).
       if (parsed._compactionRequest === true && !isCanonicalOpenAiForwardProvider(provider)) {
         outBody = buildRoutedCompactionBody(outBody);
       }
+      if (!isCanonicalOpenAiForwardProvider(provider)) {
+        outBody = promoteClientLoadedTools(outBody);
+      }
+      if (provider.authMode !== "forward") {
+        outBody = rewriteRoutedCustomToolsForUpstream(outBody).body;
+      }
+      const sanitizedBody = normalizeToolSchemas(stripSparkCompatibility(stripUnsupportedReasoningParams(stripItemIdsWhenUnstored(stripInvalidItemIds(stripUnsupportedHostedTools(sanitizeReasoningInputContent(scrubOcxCompactionItems(outBody), { preserveRawReasoningContent: provider.preserveResponsesReasoningContent === true })))))));
+      const body = JSON.stringify(stripDisabledReasoningSummaries(
+        normalizeConfiguredReasoningSummaryDelivery(sanitizedBody, provider, parsed.modelId),
+        provider,
+        parsed.modelId,
+      ));
+      const releaseBodyObservation = translatorBudget.observeExternallyCapped(
+        "passthrough_serialization",
+        new TextEncoder().encode(body).byteLength,
+      );
       return {
         url,
         method: "POST",
         headers,
-        body: JSON.stringify(stripDisabledReasoningSummaries(
-          stripSparkCompatibility(stripUnsupportedReasoningParams(stripItemIdsWhenUnstored(stripInvalidItemIds(stripUnsupportedHostedTools(sanitizeReasoningInputContent(scrubOcxCompactionItems(outBody))))))),
-          provider,
-          parsed.modelId,
-        )),
+        body,
+        releaseBodyObservation,
       };
     },
 
     // The passthrough normally relays the upstream stream verbatim and never parses.
     // The exception is a routed compaction turn: the server drives this adapter like
     // an ordinary one so the bridge can build the single compaction item (#422).
-    async *parseStream(response: Response): AsyncGenerator<AdapterEvent> {
+    async *parseStream(response: Response, budget: TranslatorBudget): AsyncGenerator<AdapterEvent> {
       if (!response.body) {
         yield { type: "error", message: "passthrough adapter received no response body" };
         return;
       }
+      const budgetEncoder = new TextEncoder();
       let deltas = "";
       let doneText = "";
       let snapshot = "";
       let usage: OcxUsage | undefined;
-      for await (const event of decodeServerSentEvents(response.body)) {
+      for await (const event of decodeServerSentEvents(response.body, { translatorBudget: budget })) {
         let payload: unknown;
         try { payload = JSON.parse(event.data); } catch { continue; }
         if (!isPlainObject(payload)) continue;
         switch (payload.type) {
           case "response.output_text.delta":
-            if (typeof payload.delta === "string") deltas += payload.delta;
+            if (typeof payload.delta === "string") {
+              const next = deltas + payload.delta;
+              const previousBytes = budgetEncoder.encode(deltas).byteLength;
+              const reservation = budget.reserveTransient(budgetEncoder.encode(next).byteLength, { kind: "retained_collectors" });
+              deltas = next;
+              reservation.commitRetained();
+              budget.releaseRetained(previousBytes, { kind: "retained_collectors" });
+            }
             break;
           case "response.output_text.done":
-            if (typeof payload.text === "string") doneText += payload.text;
+            if (typeof payload.text === "string") {
+              const next = doneText + payload.text;
+              const previousBytes = budgetEncoder.encode(doneText).byteLength;
+              const reservation = budget.reserveTransient(budgetEncoder.encode(next).byteLength, { kind: "retained_collectors" });
+              doneText = next;
+              reservation.commitRetained();
+              budget.releaseRetained(previousBytes, { kind: "retained_collectors" });
+            }
             break;
           case "response.failed":
           case "error":
@@ -699,7 +1475,14 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
             yield { type: "incomplete", reason: responsesErrorMessage(payload.response ?? payload) };
             return;
           case "response.completed":
-            snapshot = responsesPayloadText(payload.response);
+            {
+              const next = responsesPayloadText(payload.response);
+              const previousBytes = budgetEncoder.encode(snapshot).byteLength;
+              const reservation = budget.reserveTransient(budgetEncoder.encode(next).byteLength, { kind: "retained_collectors" });
+              snapshot = next;
+              reservation.commitRetained();
+              budget.releaseRetained(previousBytes, { kind: "retained_collectors" });
+            }
             usage = usageFromResponsesPayload(payload.response);
             break;
         }
@@ -708,14 +1491,16 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
       // completed snapshot so text is never double-counted.
       const text = snapshot || doneText || deltas;
       if (text) yield { type: "text_delta", text };
+      budget.releaseRetained(budgetEncoder.encode(deltas).byteLength + budgetEncoder.encode(doneText).byteLength + budgetEncoder.encode(snapshot).byteLength, { kind: "retained_collectors" });
       yield { type: "done", ...(usage ? { usage } : {}) };
     },
 
-    async parseResponse(response: Response): Promise<AdapterEvent[]> {
+    async parseResponse(response: Response, budget: TranslatorBudget): Promise<AdapterEvent[]> {
       let payload: unknown;
       try { payload = await response.json(); } catch {
         return [{ type: "error", message: "malformed upstream compaction response" }];
       }
+      budget.chargeRetained(new TextEncoder().encode(JSON.stringify(payload)).byteLength, { kind: "retained_collectors" });
       if (!isPlainObject(payload)) {
         return [{ type: "error", message: "malformed upstream compaction response" }];
       }

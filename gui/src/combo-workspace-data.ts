@@ -3,15 +3,61 @@
  * No network — transforms GET /api/combos rows into rail groups + attention.
  */
 
+import { SUPPORTED_NATIVE_OPENAI_SLUGS } from "../../src/codex/catalog/native-models";
+
+export { SUPPORTED_NATIVE_OPENAI_SLUGS };
+
 export type ComboStrategy = "failover" | "round-robin";
 export type ComboEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 export const COMBO_EFFORTS: ComboEffort[] = ["low", "medium", "high", "xhigh", "max", "ultra"];
 
+/**
+ * Intersection of advertised effort ladders for picker availability.
+ * Unknown ladders are wildcards here only; runtime injection remains fail-closed.
+ */
+export function intersectComboEfforts(
+  targets: readonly ComboTarget[],
+  modelEfforts: ReadonlyMap<string, readonly string[] | undefined>,
+): ComboEffort[] {
+  const complete = targets.filter((t) => t.provider.trim() && t.model.trim());
+  if (complete.length === 0) return [...COMBO_EFFORTS];
+  const effortSet = new Set<string>(COMBO_EFFORTS);
+  let common: string[] | null = null;
+  for (const target of complete) {
+    const key = `${target.provider.trim()}/${target.model.trim()}`;
+    const listed = modelEfforts.get(key);
+    if (listed === undefined) continue;
+    const member = listed.filter((effort) => effortSet.has(effort));
+    if (common === null) {
+      common = member;
+    } else {
+      const memberSet = new Set(member);
+      common = common.filter((effort) => memberSet.has(effort));
+    }
+  }
+  if (common === null) return [...COMBO_EFFORTS];
+  const commonSet = new Set(common);
+  return COMBO_EFFORTS.filter((effort) => commonSet.has(effort));
+}
+
 export interface ComboTarget {
   provider: string;
   model: string;
   weight?: number;
+  /** UI-only stable key for React lists; never sent to the API. */
+  clientKey?: string;
+}
+
+let comboTargetKeySeq = 0;
+
+export function newComboTarget(partial: Partial<ComboTarget> = {}): ComboTarget {
+  return {
+    provider: partial.provider ?? "",
+    model: partial.model ?? "",
+    ...(partial.weight !== undefined ? { weight: partial.weight } : {}),
+    clientKey: partial.clientKey ?? `ct-${++comboTargetKeySeq}`,
+  };
 }
 
 export interface ComboItem {
@@ -20,6 +66,10 @@ export interface ComboItem {
   model: string;
   /** Optional public model name replacing the default combo/<id> slug; null = default. */
   alias: string | null;
+  /** Explicit takeover of a bare OpenAI-native alias. */
+  nativeAlias: boolean;
+  /** Display-only catalog label used by native aliases. */
+  displayName: string | null;
   strategy: ComboStrategy;
   stickyLimit: number;
   defaultEffort: ComboEffort | null;
@@ -34,7 +84,7 @@ export interface ComboSections {
 export interface ComboAttentionItem {
   id: string;
   model: string;
-  reason: "few-targets" | "empty-targets";
+  reason: "few-targets" | "empty-targets" | "catalog-omitted";
 }
 
 export const COMBO_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
@@ -54,6 +104,19 @@ export function comboModelId(id: string): string {
 export function comboPublicModelId(id: string, alias: string | null | undefined): string {
   const trimmed = typeof alias === "string" ? alias.trim() : "";
   return trimmed || comboModelId(id);
+}
+
+/** Apply an alias-field edit and discard hidden native-alias metadata once it becomes ordinary. */
+export function updateComboAliasDraft(item: ComboItem, rawAlias: string): ComboItem {
+  const trimmed = rawAlias.trim();
+  const leavesNativeAliasFamily = item.nativeAlias
+    && (!trimmed || trimmed.includes("/") || !NATIVE_OPENAI_FAMILY_RE.test(trimmed));
+  return {
+    ...item,
+    alias: trimmed ? rawAlias : null,
+    model: comboPublicModelId(item.id, rawAlias),
+    ...(leavesNativeAliasFamily ? { nativeAlias: false, displayName: null } : {}),
+  };
 }
 
 function normalizeAlias(raw: unknown): string | null {
@@ -101,7 +164,7 @@ export function parseComboList(payload: unknown): ComboItem[] {
       const model = typeof tr.model === "string" ? tr.model.trim() : "";
       if (!provider || !model) continue;
       const weight = normalizeWeight(tr.weight);
-      targets.push(weight !== undefined ? { provider, model, weight } : { provider, model });
+      targets.push(weight !== undefined ? newComboTarget({ provider, model, weight }) : newComboTarget({ provider, model }));
     }
     out.push({
       id,
@@ -109,6 +172,8 @@ export function parseComboList(payload: unknown): ComboItem[] {
         ? r.model.trim()
         : comboPublicModelId(id, normalizeAlias(r.alias)),
       alias: normalizeAlias(r.alias),
+      nativeAlias: r.nativeAlias === true,
+      displayName: normalizeAlias(r.displayName),
       strategy: normalizeStrategy(r.strategy),
       stickyLimit: normalizeStickyLimit(r.stickyLimit),
       defaultEffort: normalizeDefaultEffort(r.defaultEffort),
@@ -140,13 +205,23 @@ export function filterCombos(items: ComboItem[], query: string): ComboItem[] {
   });
 }
 
-export function buildComboAttention(items: ComboItem[]): ComboAttentionItem[] {
+export function buildComboAttention(
+  items: ComboItem[],
+  options: { cataloguedComboIds?: ReadonlySet<string> } = {},
+): ComboAttentionItem[] {
   const out: ComboAttentionItem[] = [];
+  const catalogued = options.cataloguedComboIds;
   for (const item of items) {
     if (item.targets.length === 0) {
       out.push({ id: item.id, model: item.model, reason: "empty-targets" });
     } else if (item.targets.length < 2) {
       out.push({ id: item.id, model: item.model, reason: "few-targets" });
+    }
+    // Configured combos missing from the live catalog (usually incomplete member
+    // contextWindow / modality intersection) still route by alias, but never appear
+    // in Codex's picker — flag that gap (#484).
+    if (catalogued && item.targets.length > 0 && !catalogued.has(item.id)) {
+      out.push({ id: item.id, model: item.model, reason: "catalog-omitted" });
     }
   }
   return out;
@@ -156,6 +231,8 @@ export function draftEquals(a: ComboItem, b: ComboItem): boolean {
   if (
     a.id !== b.id
     || a.alias !== b.alias
+    || a.nativeAlias !== b.nativeAlias
+    || a.displayName !== b.displayName
     || a.strategy !== b.strategy
     || a.stickyLimit !== b.stickyLimit
     || a.defaultEffort !== b.defaultEffort
@@ -176,6 +253,8 @@ export function toPutBody(item: ComboItem, options: { renameFrom?: string } = {}
     stickyLimit?: number;
     defaultEffort: ComboEffort | null;
     alias?: string;
+    nativeAlias?: true;
+    displayName?: string;
   };
 } {
   return {
@@ -189,6 +268,8 @@ export function toPutBody(item: ComboItem, options: { renameFrom?: string } = {}
       defaultEffort: item.defaultEffort,
       ...(item.strategy === "round-robin" ? { stickyLimit: item.stickyLimit } : {}),
       ...(item.alias && item.alias.trim() ? { alias: item.alias.trim() } : {}),
+      ...(item.nativeAlias ? { nativeAlias: true } : {}),
+      ...(item.displayName && item.displayName.trim() ? { displayName: item.displayName.trim() } : {}),
     },
   };
 }
@@ -202,6 +283,9 @@ export type ComboDraftError =
   | "invalidAlias"
   | "aliasReservedNamespace"
   | "aliasNativeFamily"
+  | "unsupportedNativeAlias"
+  | "missingNativeAliasDisplayName"
+  | "invalidDisplayName"
   | "duplicateAlias"
   | "noTargets"
   | "incompleteTarget"
@@ -231,12 +315,23 @@ export function validateComboDraft(
   if (Object.hasOwn(options.providers, id)) return "providerCollision";
 
   const alias = item.alias?.trim() ?? "";
+  const displayName = item.displayName?.trim() ?? "";
   if (alias) {
     if (!COMBO_ALIAS_RE.test(alias)) return "invalidAlias";
     if (alias === "combo" || alias.startsWith("combo/")) return "aliasReservedNamespace";
-    if (!alias.includes("/") && NATIVE_OPENAI_FAMILY_RE.test(alias)) return "aliasNativeFamily";
+    if (!alias.includes("/") && NATIVE_OPENAI_FAMILY_RE.test(alias) && !item.nativeAlias) return "aliasNativeFamily";
     if ((options.existingAliases ?? []).includes(alias)) return "duplicateAlias";
   }
+  const displayNameHasControlCharacter = [...(item.displayName ?? "")].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 0x1f || codePoint === 0x7f;
+  });
+  if (item.displayName !== null
+    && (displayName.length > 128 || displayNameHasControlCharacter)) {
+    return "invalidDisplayName";
+  }
+  if (item.nativeAlias && !SUPPORTED_NATIVE_OPENAI_SLUGS.has(alias)) return "unsupportedNativeAlias";
+  if (item.nativeAlias && !displayName) return "missingNativeAliasDisplayName";
   if (item.targets.length < 1) return "noTargets";
 
   for (const t of item.targets) {
@@ -272,9 +367,11 @@ export function emptyDraft(id = ""): ComboItem {
     id,
     model: id ? comboModelId(id) : "combo/",
     alias: null,
+    nativeAlias: false,
+    displayName: null,
     strategy: "failover",
     stickyLimit: 1,
     defaultEffort: null,
-    targets: [{ provider: "", model: "" }],
+    targets: [newComboTarget()],
   };
 }

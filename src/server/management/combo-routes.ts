@@ -10,7 +10,7 @@ import {
   multiAgentGuidanceEnabled,
   providerBaseUrlConfigError,
   providerHeadersConfigError,
-  saveConfig,
+  saveConfigPreservingClaudeCode,
 } from "../../config";
 import {
   clearLoginState,
@@ -29,11 +29,14 @@ import { providerCodexAccountMode } from "../../providers/registry";
 import { routedSlug, slugEquals } from "../../providers/slug-codec";
 import { clearProviderQuotaCache, fetchProviderQuotaReports } from "../../providers/quota";
 import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
+import {
+  CODEX_ACCOUNT_NAMESPACE_COMBO_ALIAS_COLLISION_ERROR,
+  codexAccountNamespaceForModel,
+} from "../../codex/account-namespace-match";
 import { clearThreadAccountMap } from "../../codex/routing";
 import { primeCodexPoolQuotas } from "../../codex/auth-api";
 import { DEFAULT_PROVIDER_CONTEXT_CAP, globalContextCapValue, providerContextCap, providerContextCaps, setAllProviderContextCaps, setGlobalContextCapValue, setProviderContextCap } from "../../providers/context-cap";
 import { resolveCodexHomeDir } from "../../codex/home";
-import { scanStorage } from "../../storage/scanner";
 import { readUsageEntries } from "../../usage/log";
 import { getUsageDebugLogEntries } from "../../usage/debug";
 import { parseRange, parseUsageSurface, summarizeUsage } from "../../usage/summary";
@@ -50,6 +53,7 @@ import {
 } from "../../lib/debug-settings";
 import type { OcxClaudeCodeConfig, OcxConfig, OcxCustomModel, OcxProviderConfig } from "../../types";
 import { drainAndShutdown } from "../lifecycle";
+import { reconcileLiveStateStores } from "../../lib/state-store-registrations";
 import { filterRequestLogs, getRequestLogEntries, type RequestLogEntry } from "../request-log";
 import { estimateComboCost, estimateRequestCost, normalizeCostTokens, tokensPerSecond } from "../../usage/cost";
 import type { PersistedUsageAttempt } from "../../usage/log";
@@ -59,9 +63,10 @@ import { applySystemEnvToggle } from "../system-env";
 import { isPlainRecord, parseDebugLogQuery, tokPerSecondResult, unavailableCostReason, costResult, requestLogDto, stripRegistryOnlyStaticHeaders, fetchAllModels } from "./shared";
 import type { MetricUnavailableReason, TokPerSecondResult, CostEstimateReason, CostResult, MetricSource } from "./shared";
 import type { ManagementContext } from "./context";
+import { readManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
 
 export async function handleComboRoutes(ctx: ManagementContext): Promise<Response | null> {
-  const { req, url, config, deps, refreshCodexCatalogBestEffort, syncClaudeAgentDefsBestEffort } = ctx;
+  const { req, url, config, deps, convergeCodexCatalog, syncClaudeAgentDefsBestEffort } = ctx;
 
   if (url.pathname === "/api/combos" && req.method === "GET") {
     const { comboPublicModelId, getCombo, listComboIds } = await import("../../combos");
@@ -77,7 +82,7 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
 
   if (url.pathname === "/api/combos" && req.method === "PUT") {
     let rawBody: unknown;
-    try { rawBody = await req.json(); } catch { return jsonResponse({ error: "invalid JSON body" }, 400); }
+    try { rawBody = await readManagementJsonBody(req); } catch (error) { rethrowManagementBodyTooLarge(error); return jsonResponse({ error: "invalid JSON body" }, 400); }
     if (!isPlainRecord(rawBody)) {
       return jsonResponse({ error: "request body must be an object" }, 400);
     }
@@ -106,6 +111,8 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
       clearComboSelectionState,
       clearComboTargetCooldowns,
       comboConfigError,
+      comboDisabledModelId,
+      comboDisabledModelSelectors,
       comboModelId,
       comboPublicModelId,
       normalizeComboConfig,
@@ -117,48 +124,68 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
     });
     if (error) return jsonResponse({ error }, 400);
     const normalized = normalizeComboConfig(body.combo as import("../../types").OcxComboConfig);
-    const stored: import("../../types").OcxComboConfig = normalized.alias === null
-      ? (({ alias: _alias, ...rest }) => rest)(normalized)
-      : normalized;
+    const {
+      alias: normalizedAlias,
+      nativeAlias: normalizedNativeAlias,
+      displayName: normalizedDisplayName,
+      ...normalizedBase
+    } = normalized;
+    const stored: import("../../types").OcxComboConfig = {
+      ...normalizedBase,
+      ...(normalizedAlias ? { alias: normalizedAlias } : {}),
+      ...(normalizedNativeAlias ? { nativeAlias: true } : {}),
+      ...(normalizedDisplayName ? { displayName: normalizedDisplayName } : {}),
+    };
     const sourceId = renameFrom ?? id;
     const previous = config.combos?.[sourceId];
     const oldPublicModel = previous ? comboPublicModelId(sourceId, previous) : null;
     const newPublicModel = comboPublicModelId(id, normalized);
+    const disabledIdentityChanged = previous !== undefined && (
+      renameFrom !== undefined
+      || oldPublicModel !== newPublicModel
+      || (previous.nativeAlias === true) !== normalized.nativeAlias
+    );
+    const oldDisabledSelectors = disabledIdentityChanged
+      ? new Set(comboDisabledModelSelectors(sourceId, previous))
+      : new Set<string>();
+    const newDisabledModel = comboDisabledModelId(id, normalized);
+    if (codexAccountNamespaceForModel(config.codexAccountNamespaces, newPublicModel)) {
+      return jsonResponse({ error: CODEX_ACCOUNT_NAMESPACE_COMBO_ALIAS_COLLISION_ERROR }, 409);
+    }
     const nextCombos = { ...(config.combos ?? {}) };
     if (renameFrom) delete nextCombos[renameFrom];
     nextCombos[id] = stored;
     config.combos = nextCombos;
     let shouldSyncClaudeAgentDefs = false;
-    const migratedModels = new Set<string>();
-    if (oldPublicModel && oldPublicModel !== newPublicModel) {
-      migratedModels.add(oldPublicModel);
+    const migratedModels = new Map<string, string>();
+    if (oldPublicModel && oldPublicModel !== newPublicModel && previous?.nativeAlias !== true) {
+      migratedModels.set(oldPublicModel, newPublicModel);
     }
-    if (renameFrom) migratedModels.add(comboModelId(renameFrom));
-    if (migratedModels.size > 0) {
-      const migrateReference = (model: string): string => (
-        migratedModels.has(model) ? newPublicModel : model
+    if (renameFrom) {
+      // A bare native id is ambiguous after the alias changes. Preserve it as a native route,
+      // while the unambiguous canonical combo reference follows the renamed combo.
+      migratedModels.set(
+        comboModelId(renameFrom),
+        previous?.nativeAlias === true ? comboModelId(id) : newPublicModel,
       );
+    }
+    if (migratedModels.size > 0) {
+      const migrateReference = (model: string): string => migratedModels.get(model) ?? model;
       const migrateAgentReference = (model: string): string => {
         const migrated = migrateReference(model);
         if (migrated !== model) shouldSyncClaudeAgentDefs = true;
         return migrated;
       };
-      const migrateReferences = (models: string[]): string[] => [
-        ...new Set(models.map(migrateReference)),
-      ];
-      if (config.disabledModels) {
-        config.disabledModels = migrateReferences(config.disabledModels);
-      }
       if (config.subagentModels) {
         config.subagentModels = [...new Set(config.subagentModels.map(migrateAgentReference))];
       }
       if (config.injectionModel && migratedModels.has(config.injectionModel)) {
-        config.injectionModel = newPublicModel;
+        config.injectionModel = migrateReference(config.injectionModel);
       }
       if (config.shadowCallIntercept?.model && migratedModels.has(config.shadowCallIntercept.model)) {
         config.shadowCallIntercept = {
           ...config.shadowCallIntercept,
-          model: newPublicModel,
+          model: migrateReference(config.shadowCallIntercept.model),
         };
       }
       if (config.claudeCode) {
@@ -179,16 +206,22 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
         config.claudeCode = claudeCode;
       }
     }
-    saveConfig(config);
+    if (oldDisabledSelectors.size > 0 && config.disabledModels) {
+      config.disabledModels = [...new Set(config.disabledModels.map(model => (
+        oldDisabledSelectors.has(model) ? newDisabledModel : model
+      )))];
+    }
+    saveConfigPreservingClaudeCode(config);
+    reconcileLiveStateStores();
     clearComboSelectionState(id);
     clearComboTargetCooldowns(id);
     if (renameFrom) {
       clearComboSelectionState(renameFrom);
       clearComboTargetCooldowns(renameFrom);
     }
-    await refreshCodexCatalogBestEffort();
+    const catalogRefresh = await convergeCodexCatalog();
     if (shouldSyncClaudeAgentDefs) await syncClaudeAgentDefsBestEffort();
-    return jsonResponse({ success: true, id, model: newPublicModel, combo: normalized });
+    return jsonResponse({ success: true, id, model: newPublicModel, combo: stored, catalogRefresh });
   }
 
   if (url.pathname === "/api/combos" && req.method === "DELETE") {
@@ -200,11 +233,12 @@ export async function handleComboRoutes(ctx: ManagementContext): Promise<Respons
     const { clearComboSelectionState, clearComboTargetCooldowns } = await import("../../combos");
     delete config.combos![id];
     if (Object.keys(config.combos!).length === 0) delete config.combos;
-    saveConfig(config);
+    saveConfigPreservingClaudeCode(config);
+    reconcileLiveStateStores();
     clearComboSelectionState(id);
     clearComboTargetCooldowns(id);
-    await refreshCodexCatalogBestEffort();
-    return jsonResponse({ success: true, id });
+    const catalogRefresh = await convergeCodexCatalog();
+    return jsonResponse({ success: true, id, catalogRefresh });
   }
   return null;
 }

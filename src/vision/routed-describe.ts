@@ -8,6 +8,7 @@ import { sidecarEnter } from "../lib/sidecar-tracker";
 import { redactSecretString } from "../lib/redact";
 import { fetchWithResetRetry } from "../lib/upstream-retry";
 import { getValidAccessToken } from "../oauth";
+import { createTranslatorBudget } from "../lib/translator-budget";
 import { validateImageUrl, type DescribeOutcome, type VisionSettings } from "./describe";
 
 const DESCRIBE_INSTRUCTION =
@@ -87,9 +88,10 @@ export async function describeImageRouted(
   }
 
   // 4. buildRequest (may be async; may throw on missing apiKey — becomes an error outcome).
+  const translatorBudget = createTranslatorBudget();
   let request;
   try {
-    request = await adapter.buildRequest(parsed, { headers: new Headers() });
+    request = await adapter.buildRequest(parsed, { headers: new Headers(), translatorBudget });
   } catch (e) {
     return { text: "", error: `routed vision sidecar buildRequest: ${e instanceof Error ? e.message : String(e)}` };
   }
@@ -124,7 +126,7 @@ export async function describeImageRouted(
     let text = "";
     let errMsg = "";
     try {
-      for await (const ev of adapter.parseStream(res)) {
+      for await (const ev of adapter.parseStream(res, translatorBudget)) {
         if (ev.type === "text_delta") text += ev.text;
         else if (ev.type === "error") errMsg = ev.message;
         else if (ev.type === "incomplete") errMsg = ev.reason || "incomplete";

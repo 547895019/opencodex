@@ -219,6 +219,8 @@ describe("supportedLadderFor (real routeModel routes)", () => {
     } as Partial<OcxConfig>);
     const route = routeModel(config, "xai/grok-4.5");
     expect(supportedLadderFor(route)).toEqual(["low", "medium", "high"]);
+    const grok46 = routeModel(config, "xai/grok-4.6");
+    expect(supportedLadderFor(grok46)).toEqual(["low", "medium", "high", "xhigh"]);
     const noReasoning = routeModel(config, "xai/grok-composer-2.5-fast");
     expect(supportedLadderFor(noReasoning)).toEqual([]);
   });
@@ -467,3 +469,4 @@ describe("/api/effort-caps", () => {
     expect(config.subagentEffortCap).toBe("low");
   });
 });
+import { ManagementRequest as Request } from "./helpers/management-auth";

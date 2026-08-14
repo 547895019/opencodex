@@ -54,12 +54,17 @@ ocx claude
 работать в той же сессии через алиасы селектора.
 
 **Обработка заголовков:** hop-by-hop-заголовки, а также `host`, `content-length`,
-`accept-encoding`, `x-opencodex-api-key` и `origin` удаляются перед пересылкой. Все остальные
-заголовки (включая `anthropic-beta` и `anthropic-version`) проходят без изменений.
+`accept-encoding`, `x-opencodex-api-key` и `origin` всегда удаляются перед пересылкой. На
+non-loopback bind нативный passthrough также требует валидный proxy credential именно в
+`x-opencodex-api-key`; после этого `Authorization` и `x-api-key` принадлежат только Anthropic.
+Proxy admission secret в любом provider-заголовке удаляется, а настоящий provider credential в
+другом заголовке сохраняется. Неоднозначные credential-заголовки, объединённые запятыми, не
+пересылаются.
 
-Проброс срабатывает, когда выполнены **все четыре** условия: `nativePassthrough` не равен `false`;
-имя модели начинается с `claude` или `anthropic`; bearer или `x-api-key` начинается с `sk-ant-`;
-и разрешение алиасов и карты моделей возвращает ту же модель без изменений. Это также означает,
+Проброс срабатывает, когда выполнены **все** условия: `nativePassthrough` не равен `false`;
+имя модели начинается с `claude` или `anthropic`; bearer-токен или `x-api-key` начинается с `sk-ant-`;
+разрешение алиасов и карты моделей возвращает ту же модель без изменений; а на non-loopback bind
+валиден dedicated proxy admission-header. Это также означает,
 что предупреждение «claude.ai connectors are disabled» с `ocx claude` больше не появляется.
 
 Отключается параметром `claudeCode.nativePassthrough: false`; другой адрес задаётся через
@@ -74,7 +79,7 @@ Claude Code 2.1.129+ обнаруживает модели шлюза через
 
 | Интерфейс | Формат | Пример |
 | --- | --- | --- |
-| Claude Code CLI | `claude-ocx-<provider>--<model>` | `claude-ocx-native--gpt-5.6-sol` |
+| Claude Code CLI | `claude-ocx-<provider>--<model>` (plain) или `claude-ocx2-…` (escaped) | `claude-ocx-native--gpt-5.6-sol` |
 | Claude Desktop 3P | `claude-opus-4-8-<code>` (3-символьный base36-хеш) | `claude-opus-4-8-ncb` |
 
 Прокси выбирает семейство для каждого запроса: приоритет у `?ids=cli` или `?ids=desktop`; иначе
@@ -82,10 +87,19 @@ user-agent `claude-code/*` получает читаемую CLI-форму, а 
 семейства декодируются бессрочно — модель, сохранённая в `settings.json` в любой из форм,
 продолжает работать.
 
+Если нижний селектор Claude Desktop не переключает модель в уже запущенном 3P-диалоге,
+используйте `/model <id>` внутри этого диалога. OpenCodex не видит состояние селектора и
+маршрутизирует id модели из каждого запроса. Результат можно проверить в **Logs → requestedModel**.
+
 **Правила грамматики алиасов:** provider не может содержать `/` или `--` и не может быть равен
-`native`; model не может содержать `/`. Маршруты, которые невозможно выразить читаемой формой,
-откатываются на хешированный алиас. Id моделей МОГУТ содержать `--` (при разрешении деление
-происходит только по первому `--`); нативные слаги с `--` откатываются на хешированную форму.
+`native`. Обычные id моделей (без `/` и `~`) остаются с префиксом v1 `claude-ocx-…`. Id с `/`
+или `~` выпускаются с префиксом v2 `claude-ocx2-…` и экранированием (`/` → `~s`, `~` → `~t`),
+например `openrouter/anthropic/claude-opus-4-8` →
+`claude-ocx2-openrouter--anthropic~sclaude-opus-4-8`. Алиасы v1 декодируются литерально (исторические
+двухсимвольные последовательности `~s` / `~t` в id модели сохраняются); алиасы v2 раскрывают
+экранирование. Маршруты, которые невозможно выразить читаемой формой, откатываются на
+хешированный алиас. Id моделей МОГУТ содержать `--` (при разрешении разбиение выполняется только
+по первому `--`); нативные слаги с `--` откатываются на хешированную форму.
 
 **Порядок разрешения модели:** удаление маркера `[1m]` → декодирование читаемого алиаса →
 декодирование Desktop-хеша → точное совпадение в `modelMap` → совпадение без даты (удаляется
@@ -257,7 +271,7 @@ Claude Code — это лишь учётные данные для доступ�
 | --- | --- |
 | `thinking.type: "adaptive"` + `output_config.effort` | Уровень передаётся напрямую (`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`\|`ultra`) |
 | `thinking.type: "enabled"` + `budget_tokens` | ≤4096→`low`, ≤16384→`medium`, выше→`high` |
-| `thinking.type: "disabled"` | Параметры рассуждений полностью опускаются |
+| `thinking.type: "disabled"` | Явно передаётся `reasoning: { effort: "none" }`, а `summary` опускается |
 
 Итоговое значение отображается в столбце **Reasoning effort** журнала запросов.
 
@@ -275,7 +289,7 @@ Claude Code — это лишь учётные данные для доступ�
 | `tool_result` пользователя | `function_call_output` (`is_error` → префикс `[tool error]`) |
 | Повтор `thinking` / `redacted_thinking` | Отбрасывается |
 | Function-инструменты | `{type: "function"}` (`web_search*` → `{type: "web_search"}`) |
-| `tool_choice` | `auto`→`auto`, `none`→`none`, `any`→`required`, именованный→`{type:"function",name}` |
+| `tool_choice` | `auto`→`auto`, `none`→`none`, `any`→`required`, именованная функция→`{type:"function",name}`, размещённый WebSearch/web_search→`{type:"web_search"}` |
 | `max_tokens` | `max_output_tokens` |
 | `stop_sequences` | `stop` |
 

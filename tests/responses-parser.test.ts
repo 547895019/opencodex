@@ -1,7 +1,36 @@
 import { describe, expect, test } from "bun:test";
 import { parseRequest } from "../src/responses/parser";
+import { buildToolBridgeMaps } from "../src/server/responses";
 
 describe("Responses parser", () => {
+  test("normalizes function tool schemas to an object root without corrupting valid schemas (#745)", () => {
+    const validParameters = {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+      additionalProperties: false,
+    };
+    const parsed = parseRequest({
+      model: "test-model",
+      input: "test",
+      tools: [
+        { type: "function", name: "missing_parameters" },
+        { type: "function", name: "missing_root_type", parameters: { properties: { query: { type: "string" } } } },
+        { type: "function", name: "valid_schema", parameters: validParameters },
+      ],
+    });
+
+    expect(parsed.context.tools).toEqual([
+      { name: "missing_parameters", description: "", parameters: { type: "object" } },
+      {
+        name: "missing_root_type",
+        description: "",
+        parameters: { type: "object", properties: { query: { type: "string" } } },
+      },
+      { name: "valid_schema", description: "", parameters: validParameters },
+    ]);
+  });
+
   test("describes the exact apply_patch freeform envelope", () => {
     const parsed = parseRequest({
       model: "xai/grok-4.5",
@@ -65,6 +94,61 @@ describe("Responses parser", () => {
     expect(parsed.options.toolChoice).toEqual({ allowedTools: ["web_search"], mode: "required" });
   });
 
+  test("restores only namespace, freeform, and tool-search calls allowed by tool_choice", () => {
+    const parsed = parseRequest({
+      model: "umans/umans-kimi-k2.7",
+      input: "use the safe tool",
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp__tools",
+          tools: [
+            { type: "function", name: "safe", parameters: { type: "object" } },
+            { type: "function", name: "secret", parameters: { type: "object" } },
+          ],
+        },
+        { type: "custom", name: "apply_patch", description: "Apply" },
+        { type: "tool_search" },
+      ],
+      tool_choice: {
+        type: "allowed_tools",
+        mode: "required",
+        tools: [
+          { type: "function", name: "mcp__tools.safe" },
+          { type: "custom", name: "apply_patch" },
+        ],
+      },
+    });
+
+    let maps = buildToolBridgeMaps(parsed);
+    expect([...maps.toolNsMap]).toEqual([
+      ["mcp__tools__safe", { namespace: "mcp__tools", name: "safe" }],
+    ]);
+    expect([...maps.declaredToolNames]).toEqual(["mcp__tools__safe", "apply_patch"]);
+    expect([...maps.freeformToolNames]).toEqual(["apply_patch"]);
+    expect([...maps.toolSearchToolNames]).toEqual([]);
+
+    parsed.options.toolChoice = { allowedTools: ["mcp__tools__safe"], mode: "required" };
+    maps = buildToolBridgeMaps(parsed);
+    expect([...maps.toolNsMap.keys()]).toEqual(["mcp__tools__safe"]);
+    expect([...maps.declaredToolNames]).toEqual(["mcp__tools__safe"]);
+    expect([...maps.freeformToolNames]).toEqual([]);
+
+    parsed.options.toolChoice = { name: "tool_search" };
+    maps = buildToolBridgeMaps(parsed);
+    expect([...maps.toolNsMap]).toEqual([]);
+    expect([...maps.declaredToolNames]).toEqual(["tool_search"]);
+    expect([...maps.freeformToolNames]).toEqual([]);
+    expect([...maps.toolSearchToolNames]).toEqual(["tool_search"]);
+
+    parsed.options.toolChoice = "none";
+    maps = buildToolBridgeMaps(parsed);
+    expect([...maps.toolNsMap]).toEqual([]);
+    expect([...maps.declaredToolNames]).toEqual([]);
+    expect([...maps.freeformToolNames]).toEqual([]);
+    expect([...maps.toolSearchToolNames]).toEqual([]);
+  });
+
   test("maps hosted allowed_tools entries to their synthetic routed tool names", () => {
     const parsed = parseRequest({
       model: "umans/umans-kimi-k2.7",
@@ -79,6 +163,18 @@ describe("Responses parser", () => {
 
     expect(parsed._webSearch).toEqual({ type: "web_search", search_context_size: "medium" });
     expect(parsed.options.toolChoice).toEqual({ allowedTools: ["web_search"], mode: "required" });
+  });
+
+  test("maps type-only hosted image_generation tool_choice to required image_gen", () => {
+    const parsed = parseRequest({
+      model: "claude-opus-4-6",
+      input: "draw a cat",
+      tools: [{ type: "image_generation" }],
+      tool_choice: { type: "image_generation" },
+    });
+
+    expect(parsed._imageGeneration?.toolNames.has("image_generation")).toBe(true);
+    expect(parsed.options.toolChoice).toEqual({ name: "image_gen" });
   });
 
   test("preserves requested service_tier for request logging", () => {
@@ -101,6 +197,44 @@ describe("Responses parser", () => {
     });
 
     expect(parsed.options.promptCacheKey).toBe("project-cache-v1");
+  });
+
+  test("carries text.format json_schema into options.textFormat and flags structured output", () => {
+    const parsed = parseRequest({
+      model: "gpt-5.5",
+      input: "structured",
+      stream: true,
+      text: { format: { type: "json_schema", name: "answer", description: "shape", schema: { type: "object" }, strict: true } },
+    });
+
+    expect(parsed.options.textFormat).toEqual({
+      type: "json_schema",
+      name: "answer",
+      description: "shape",
+      schema: { type: "object" },
+      strict: true,
+    });
+    expect(parsed._structuredOutput).toBe(true);
+  });
+
+  test("carries text.format json_object and ignores the plain text format", () => {
+    const jsonObject = parseRequest({
+      model: "gpt-5.5",
+      input: "structured",
+      stream: true,
+      text: { format: { type: "json_object" } },
+    });
+    const plain = parseRequest({
+      model: "gpt-5.5",
+      input: "prose",
+      stream: true,
+      text: { format: { type: "text" } },
+    });
+
+    expect(jsonObject.options.textFormat).toEqual({ type: "json_object" });
+    expect(jsonObject._structuredOutput).toBe(true);
+    expect(plain.options.textFormat).toBeUndefined();
+    expect(plain._structuredOutput).toBeUndefined();
   });
 
   test("preserves input_image blocks from function_call_output", () => {
@@ -281,6 +415,20 @@ describe("codex-rs compat surface (260707)", () => {
   test("still drops unknown reasoning efforts instead of forwarding them", () => {
     const parsed = parseRequest({ model: "p/m", input: "hi", reasoning: { effort: "banana" } });
     expect(parsed.options.reasoning).toBeUndefined();
+  });
+
+  test("detects image_generation hosted tool arriving via additional_tools (responses_lite WS shape)", () => {
+    // Codex Desktop responses_websockets lite path: NO body.tools; the hosted tool spec rides
+    // inside an input item {type:"additional_tools", tools:[...]}. extractHostedImageGeneration
+    // must still see it so the image bridge activates.
+    const parsed = parseRequest({
+      model: "p/m",
+      input: [
+        { type: "additional_tools", tools: [{ type: "image_generation" }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "draw a cat" }] },
+      ],
+    });
+    expect(parsed._imageGeneration?.toolNames.has("image_generation")).toBe(true);
   });
 
   test("current parser ignores null empty and unknown string efforts", () => {

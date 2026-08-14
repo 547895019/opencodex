@@ -7,6 +7,33 @@ opencodex serves `POST /v1/messages` (plus `count_tokens`) alongside `/v1/respon
 Code can use every routed provider — OAuth logins, account pools, key failover and sidecars
 included — with zero extra auth work.
 
+## Claude OAuth account pool (experimental)
+
+You can log in multiple Claude accounts via the Providers dashboard (`ocx login anthropic` /
+add-account). By default every request uses the **active** account only.
+
+An **experimental, opt-in** Claude account pool (`anthropicAccountPool.enabled`) adds sticky
+session affinity and 429 cooldown failover across those OAuth accounts. For **new** sessions
+only, `anthropicAccountPool.strategy` selects among eligible accounts: `quota` (default) picks
+lowest known 5-hour usage when above `autoSwitchThreshold`; `round-robin` spreads evenly
+(`stickyLimit`, default `1`); `fill-first` drains the active account until cooldown,
+reauthentication, or threshold, then advances. It is **off by default**, shows a GUI warning,
+and is not battle-tested — Anthropic may restrict accounts that look like automated rotation;
+rotation does not protect against provider enforcement.
+
+Operational contract when enabled:
+
+- Upstream **429** cools that account using `Retry-After` when present (else a default backoff),
+  clears its affinities, and may rotate to another eligible account within the same request
+  (bounded).
+- Affinity is **process-local** (lost on proxy restart).
+- **401/403** credential failures quarantine the account (`needsReauth`) so it is excluded from
+  selection until re-authenticated.
+- If every eligible account is cooling, the proxy returns **429** (not 401) with `Retry-After`
+  when known.
+
+See [Configuration](/reference/configuration/#anthropicaccountpool-experimental).
+
 ## Quickstart
 
 ```bash
@@ -28,7 +55,85 @@ ocx claude
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` / `DISABLE_COMPACT` | Legacy context override when `maxContextTokens` is set (conditional) |
 Variables you export yourself always win. Extra arguments pass through: `ocx claude -p "hello"`.
 
+One exception is about *where* a variable comes from, not about precedence. The bundled Bun
+runtime auto-loads a project `.env` / `.env.local`, so a stray `ANTHROPIC_API_KEY` in the
+directory you happen to launch from used to look identical to a deliberate export — and it
+silently disabled a healthy claude.ai subscription in favour of API billing. `ocx claude` now
+ignores Anthropic credentials that only a project dotenv introduced. A value you exported in
+your shell still wins, in every auth mode. To use an API key deliberately, export it
+(`export ANTHROPIC_API_KEY=...`) rather than leaving it in a project file.
+
+## Auth mode
+
+Claude Code needs a token in `ANTHROPIC_AUTH_TOKEN` to talk to a gateway, but setting that
+variable also disables your claude.ai login and its connectors. Which of the two you want
+depends on something opencodex can look up, so by default it does.
+
+Leave **Auth mode** on **Auto** (the default) in **Claude → Claude Code** and opencodex
+decides at each launch:
+
+| What it finds | What it does |
+| --- | --- |
+| A Claude login (`~/.claude.json` OAuth account, `.credentials.json`, the macOS keychain, or an exported `ANTHROPIC_API_KEY`) | Leaves the token unset, so your subscription and connectors keep working |
+| No Claude auth at all | Injects a placeholder token, so Claude Code stops asking you to log in and routes through the proxy |
+| It cannot tell (unreadable keychain, corrupt file) | Assumes subscription and prints a warning — it never moves a paying subscriber onto the proxy on a failed read |
+
+This is recomputed every launch, not remembered, so logging in or out is picked up on the
+next `ocx claude` with nothing to reconfigure.
+
+Pick **Subscription** or **Proxy** explicitly when you want it fixed. An explicit choice is
+stored in `claudeCode.authMode` and detection never overrides it — including after you log
+in or out later. Switch back to Auto to hand the decision back.
+
+On macOS, auto-connect (`claudeCode.systemEnv`) follows the same resolution, so a plain
+`claude` launched outside `ocx` behaves the same way. That file is a snapshot refreshed when
+the proxy starts or you save settings, while `ocx claude` always resolves live.
+
 ## System environment integration (macOS)
+
+## Claude Desktop profile
+
+Claude Desktop uses a separate profile from Claude Code. Open **Claude → Desktop** in the
+dashboard to place each available route in one of four families: Opus, Fable, Sonnet, or Haiku.
+All routes start in Opus on a new profile. The first Opus route becomes the initial overall
+default, and every non-empty family always has one family default.
+
+Drag a row to another family if you like. Dragging is optional: every row also has a visible move
+control that works with a mouse, touch, or keyboard. Use **Make default** to choose a family's
+default, then select **Save and apply to Desktop**. Empty families are allowed. If a saved default
+is temporarily unavailable, the first available route in that family is used until it returns.
+
+You can also manage the same profile from the command line:
+
+```bash
+ocx claude desktop [apply]
+ocx claude desktop show [--json]
+ocx claude desktop move <route> <opus|fable|sonnet|haiku> [--default]
+ocx claude desktop default <opus|fable|sonnet|haiku> <route|none>
+ocx claude desktop export <path|->
+ocx claude desktop import <path> [--apply]
+```
+
+`ocx claude desktop` and `apply` both write the current profile to Claude Desktop. `show` gives a
+readable summary; add `--json` for scripts. `export -` writes versioned JSON to standard output.
+Import validates the complete file before saving, so an invalid file leaves the current profile
+unchanged. Add `--apply` to write a valid imported profile to Desktop immediately. Use `none` only
+for an empty family; every non-empty family must keep one default.
+
+Apply writes to Claude Desktop's real Electron user-data `configLibrary`: `~/Library/Application
+Support/Claude/configLibrary` on macOS, `%APPDATA%\Claude\configLibrary` on Windows, and
+`${XDG_CONFIG_HOME:-~/.config}/Claude/configLibrary` on Linux. Set
+`OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR` for an explicit library override or
+`CLAUDE_USER_DATA_DIR` for an alternate Desktop user-data root. The legacy `Claude-3p` directory is
+not read or deleted automatically.
+
+Non-Anthropic routes receive stable aliases such as `claude-opus-4-8-2026MMDD`. The date-looking
+part is a synthetic route slot, not the model's release date. Real Anthropic Claude routes keep
+their real ids. New routes default to the Opus family, but moving a route does not change the
+provider or model it calls. The legacy apply flags `--static`, `--hybrid`, and `--discovery-only`
+remain available for existing scripts.
+
+## System Environment Integration
 
 When `claudeCode.systemEnv` is set to `true` (default: **off**), `ocx start` uses `launchctl setenv`
 to inject `ANTHROPIC_BASE_URL` and the related Claude Code environment variables system-wide.
@@ -51,12 +156,16 @@ caching and billing identity stay fully native, and routed models keep working i
 via the picker aliases.
 
 **Header handling:** hop-by-hop headers plus `host`, `content-length`, `accept-encoding`,
-`x-opencodex-api-key`, and `origin` are stripped before forwarding. All other headers (including
-`anthropic-beta` and `anthropic-version`) pass through.
+`x-opencodex-api-key`, and `origin` are always stripped before forwarding. On a non-loopback bind,
+native passthrough also requires a valid proxy credential in `x-opencodex-api-key`; `Authorization`
+and `x-api-key` then belong only to Anthropic. A proxy admission secret found in either provider
+header is removed, while a genuine provider credential in the other header is preserved. Ambiguous
+comma-joined credential headers are not forwarded.
 
-The passthrough fires when **all four** conditions are met: `nativePassthrough` is not `false`;
-the model begins with `claude` or `anthropic`; the bearer or `x-api-key` starts with `sk-ant-`;
-and alias/model-map resolution returns the same model unchanged. This also means the
+The passthrough fires when all of these conditions are met: `nativePassthrough` is not `false`;
+the model begins with `claude` or `anthropic`; the bearer token or `x-api-key` starts with `sk-ant-`;
+alias/model-map resolution returns the same model unchanged; and, on a non-loopback bind, the
+dedicated proxy admission header is valid. This also means the
 "claude.ai connectors are disabled" warning no longer appears with `ocx claude`.
 
 Disable with `claudeCode.nativePassthrough: false`; point elsewhere with
@@ -70,16 +179,38 @@ with `claude` or `anthropic`, opencodex exposes routed models as stable, reversi
 
 | Surface | Format | Example |
 | --- | --- | --- |
-| Claude Code CLI | `claude-ocx-<provider>--<model>` | `claude-ocx-native--gpt-5.6-sol` |
+| Claude Code CLI | `claude-ocx-<provider>--<model>` (plain) or `claude-ocx2-…` (escaped) | `claude-ocx-native--gpt-5.6-sol` |
 | Claude Desktop 3P | `claude-opus-4-8-<code>` (3-char base36 hash) | `claude-opus-4-8-ncb` |
 
 The proxy picks the family per request: `?ids=cli` or `?ids=desktop` wins; otherwise the
 `claude-code/*` user-agent gets the readable CLI form and other clients get the Desktop hash.
 Both families decode forever — a model saved in `settings.json` under either form keeps working.
+Each entry carries an honest display name such as `gemini-3-pro (gemini)`, plus full model
+capabilities (reasoning-effort ladder, thinking types) in the official ModelInfo shape so Claude
+Desktop's third-party gateway mode can offer its effort selector. Real Anthropic models keep their
+canonical ids. The synthetic 2026 date is an internal slot, not a release date. Legacy hash aliases
+and `claude-ocx-<provider>--<model>` ids from older configs still resolve.
 
-**Alias grammar rules:** provider must not contain `/` or `--` or equal `native`; model must not
-contain `/`. Routes the readable form cannot express fall back to the hashed alias. Model ids
-MAY contain `--` (resolution splits on the first `--` only); native slugs containing `--` fall back to the hashed form.
+If Claude Desktop's footer picker does not change the model for an already-running 3P
+conversation, use `/model <id>` in that conversation. OpenCodex cannot observe picker state; it
+routes the model id carried by each request. Confirm the result under **Logs → requestedModel**.
+
+Models with an authoritative 1M context window get an extra `…[1m]` picker row: selecting it makes
+Claude Code account a full 1M context for that model (auto-compaction stays on) — the proxy strips
+the marker before routing.
+Selecting one persists it to Claude Code's `settings.json` `model` field; inbound requests resolve
+the alias back to the routed model. On older Claude Code versions the picker stays native — set
+slots via
+`ANTHROPIC_MODEL` or type any routed id with `/model` (Claude Code passes strings through).
+
+**Alias grammar rules:** provider must not contain `/` or `--` or equal `native`.
+Plain model ids (no `/` or `~`) keep the v1 prefix `claude-ocx-…`. Model ids that contain `/` or
+`~` mint the v2 prefix `claude-ocx2-…` with escapes (`/` → `~s`, `~` → `~t`), e.g.
+`openrouter/anthropic/claude-opus-4-8` → `claude-ocx2-openrouter--anthropic~sclaude-opus-4-8`.
+v1 aliases decode literally (so a historical model id that contained the two-char sequences
+`~s` / `~t` is preserved); v2 aliases expand the escapes. Routes that the readable form cannot
+express fall back to the hashed alias. Model ids MAY contain `--` (resolution splits on the first
+`--` only); native slugs containing `--` fall back to the hashed form.
 
 **Model resolution order:** `[1m]` marker stripped → readable alias decoded → Desktop hashed
 alias decoded → `modelMap` exact match → date-stripped match (`-20250514` removed) → passthrough.
@@ -244,7 +375,7 @@ Claude Code's `/effort` setting is preserved across the adapter:
 | --- | --- |
 | `thinking.type: "adaptive"` + `output_config.effort` | Effort passed directly (`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`\|`ultra`) |
 | `thinking.type: "enabled"` + `budget_tokens` | ≤4096→`low`, ≤16384→`medium`, above→`high` |
-| `thinking.type: "disabled"` | Reasoning parameters omitted entirely |
+| `thinking.type: "disabled"` | `reasoning: { effort: "none" }`; summary omitted |
 
 The resolved value appears in the request log's **Reasoning effort** column.
 
@@ -262,7 +393,7 @@ The proxy translates every Anthropic Messages API request into the Codex Respons
 | User `tool_result` | `function_call_output` (`is_error` → `[tool error]` prefix) |
 | `thinking` / `redacted_thinking` replay | Dropped |
 | Function tools | `{type: "function"}` (`web_search*` → `{type: "web_search"}`) |
-| `tool_choice` | `auto`→`auto`, `none`→`none`, `any`→`required`, named→`{type:"function",name}` |
+| `tool_choice` | `auto`→`auto`, `none`→`none`, `any`→`required`, named function→`{type:"function",name}`, hosted WebSearch/web_search→`{type:"web_search"}` |
 | `max_tokens` | `max_output_tokens` |
 | `stop_sequences` | `stop` |
 
