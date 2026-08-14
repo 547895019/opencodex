@@ -41,6 +41,7 @@ const ZH_TW_KEEP_ENGLISH: ReadonlySet<string> = new Set([
   "provider.name.volcengineCodingPlan",
   // Backend/brand names
   "dash.backendAnthropic",
+  "dash.backendOllama",
   "dash.backendOpenAI",
   // Claude app labels
   "claude.pageTitle",
