@@ -8,11 +8,15 @@ import { DataSurfaceSkeleton } from "../components/data-surface";
 import { readSessionListCache, writeSessionListCache } from "../session-list-cache";
 import { DebugClaudeInboundPanel } from "./debug-claude-inbound-panel";
 import { DebugLogViewer } from "./debug-log-viewer";
+import { DebugPromptCapturePanel } from "./debug-prompt-capture-panel";
 import { DebugPageHeader, DebugSettingsPanel } from "./debug-settings-panel";
 import {
   DEBUG_STREAMS,
+  type DebugFlag,
   type DebugSettings,
   type LogStream,
+  type PromptCaptureEntry,
+  type PromptCaptureRedaction,
   isStreamEnabled,
 } from "./debug-shared";
 
@@ -68,6 +72,64 @@ export default function Debug({ apiBase, embedded, active = true }: { apiBase: s
     { pollMs: 2000, enabled: active && !!debug?.claude },
   );
   const claudeEntries = claudePoll.data ?? [];
+
+  const [promptEntries, setPromptEntries] = useState<PromptCaptureEntry[]>([]);
+  const [promptRedaction, setPromptRedaction] = useState<PromptCaptureRedaction>("secrets");
+  const [promptMaxEntries, setPromptMaxEntries] = useState<number>(20);
+  const [promptBusy, setPromptBusy] = useState(false);
+
+  useEffect(() => {
+    if (!debug?.promptCapture) {
+      setPromptEntries([]);
+      return;
+    }
+    const fetchPrompt = async () => {
+      try {
+        const res = await fetch(`${apiBase}/api/debug/prompt-capture`);
+        if (res.ok) {
+          const data = await res.json() as {
+            redaction?: PromptCaptureRedaction;
+            maxEntries?: number;
+            entries?: PromptCaptureEntry[];
+          };
+          if (data.redaction) setPromptRedaction(data.redaction);
+          if (typeof data.maxEntries === "number") setPromptMaxEntries(data.maxEntries);
+          setPromptEntries(Array.isArray(data.entries) ? data.entries : []);
+        }
+      } catch { /* ignore */ }
+    };
+    void fetchPrompt();
+    const interval = setInterval(() => void fetchPrompt(), 2000);
+    return () => clearInterval(interval);
+  }, [apiBase, debug?.promptCapture]);
+
+  const putPromptOptions = async (opts: { redaction?: PromptCaptureRedaction; maxEntries?: number }) => {
+    setPromptBusy(true);
+    try {
+      const res = await fetch(`${apiBase}/api/debug/prompt-capture`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(opts),
+      });
+      if (res.ok) {
+        const data = await res.json() as { redaction?: PromptCaptureRedaction; maxEntries?: number };
+        if (data.redaction) setPromptRedaction(data.redaction);
+        if (typeof data.maxEntries === "number") setPromptMaxEntries(data.maxEntries);
+      }
+    } catch { /* ignore */ } finally {
+      setPromptBusy(false);
+    }
+  };
+
+  const clearPromptEntries = async () => {
+    setPromptBusy(true);
+    try {
+      await fetch(`${apiBase}/api/debug/prompt-capture/clear`, { method: "POST" });
+      setPromptEntries([]);
+    } catch { /* ignore */ } finally {
+      setPromptBusy(false);
+    }
+  };
 
   // eslint-disable-next-line react-hooks/incompatible-library -- known useVirtualizer limitation
   const lineVirtualizer = useVirtualizer({
@@ -193,7 +255,7 @@ export default function Debug({ apiBase, embedded, active = true }: { apiBase: s
     }
   };
 
-  const setDebugFlag = async (flag: "debug" | "usage" | "injection" | "claude", enabled: boolean) => {
+  const setDebugFlag = async (flag: DebugFlag, enabled: boolean) => {
     await runDebugMutation({ [flag]: enabled });
   };
 
@@ -241,6 +303,17 @@ export default function Debug({ apiBase, embedded, active = true }: { apiBase: s
       {debug && debugState.showError && <Notice tone="err">{t("debug.loadFailed")}</Notice>}
 
       {debug?.claude && <DebugClaudeInboundPanel entries={claudeEntries} />}
+
+      {debug?.promptCapture && (
+        <DebugPromptCapturePanel
+          entries={promptEntries}
+          redaction={promptRedaction}
+          maxEntries={promptMaxEntries}
+          busy={promptBusy}
+          onSetOptions={putPromptOptions}
+          onClear={() => void clearPromptEntries()}
+        />
+      )}
 
       <DebugLogViewer
         debug={!!debug}

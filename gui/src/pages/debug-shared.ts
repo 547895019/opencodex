@@ -1,10 +1,13 @@
+export type DebugFlag = "debug" | "usage" | "injection" | "claude" | "promptCapture";
+
 export interface DebugSettings {
   enabled: boolean;
   usage: boolean;
   injection: boolean;
   claude: boolean;
-  runtimeOverride: Partial<Record<"debug" | "usage" | "injection" | "claude", boolean>>;
-  env: Record<"debug" | "usage" | "injection" | "claude", boolean>;
+  promptCapture: boolean;
+  runtimeOverride: Partial<Record<DebugFlag, boolean>>;
+  env: Record<DebugFlag, boolean>;
 }
 
 export interface DebugLogEntry {
@@ -32,6 +35,19 @@ export interface ClaudeInboundEntry {
   systemTag?: string;
 }
 
+export type PromptCaptureRedaction = "none" | "secrets" | "secrets-pii";
+
+export interface PromptCaptureEntry {
+  at: number;
+  surface: string;
+  model: string;
+  resolvedModel?: string;
+  redaction: PromptCaptureRedaction;
+  bodySize: number;
+  body: unknown;
+  headers?: Record<string, string>;
+}
+
 export type LogStream = "provider" | "usage" | "injection";
 
 export const DEBUG_STREAMS = ["provider", "usage", "injection"] as const;
@@ -49,5 +65,5 @@ export function isStreamEnabled(debug: DebugSettings | null, stream: LogStream):
 }
 
 export function isDebugFlagEnabled(debug: DebugSettings, flag: keyof DebugSettings["env"]): boolean {
-  return flag === "debug" ? debug.enabled : flag === "usage" ? debug.usage : flag === "injection" ? debug.injection : debug.claude;
+  return flag === "debug" ? debug.enabled : flag === "usage" ? debug.usage : flag === "injection" ? debug.injection : flag === "claude" ? debug.claude : debug.promptCapture;
 }

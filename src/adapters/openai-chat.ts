@@ -1128,9 +1128,13 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
               logInvalidToolCalls("stream", rawToolCalls);
               return yield* terminateWithError(invalidToolCallsEvent(pendingUsage));
             }
-            for (const rawToolCall of rawToolCalls) {
+            // Filter out null/undefined items: some OpenAI-compatible providers emit
+            // stream padding with null entries in the tool_calls array (e.g., Z.AI, Kimi).
+            // The old version silently skipped these; the new version must tolerate them.
+            const validToolCalls = rawToolCalls.filter(tc => tc !== null && tc !== undefined);
+            for (const rawToolCall of validToolCalls) {
               if (!isRecord(rawToolCall)) {
-                logInvalidToolCalls("stream", rawToolCalls);
+                logInvalidToolCalls("stream", validToolCalls);
                 return yield* terminateWithError(invalidToolCallsEvent(pendingUsage));
               }
               const tc = rawToolCall as {
@@ -1322,9 +1326,12 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
             logInvalidToolCalls("response", rawToolCalls);
             return [invalidToolCallsEvent(usage)];
           }
-          for (const rawToolCall of rawToolCalls) {
+          // Filter out null/undefined items: some OpenAI-compatible providers emit
+          // null entries in the tool_calls array (e.g., Z.AI, Kimi).
+          const validToolCalls = rawToolCalls.filter(tc => tc !== null && tc !== undefined);
+          for (const rawToolCall of validToolCalls) {
             if (!isRecord(rawToolCall) || !isRecord(rawToolCall.function)) {
-              logInvalidToolCalls("response", rawToolCalls);
+              logInvalidToolCalls("response", validToolCalls);
               return [invalidToolCallsEvent(usage)];
             }
             const id = rawToolCall.id;
