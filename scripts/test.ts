@@ -21,6 +21,21 @@ export function createIsolatedTestEnvironment(
     root,
     env: {
       ...baseEnv,
+      // ChatGPT-forward tests mock chatgpt.com via globalThis.fetch; the real
+      // wss:// WS transport bypasses that mock and blackholes on network-blocked
+      // boxes (10s upgrade deadline > the 5s test timeout). Keep tests on SSE.
+      OPENCODEX_DISABLE_WS_UPSTREAM: "1",
+      // Strip machine proxy settings: the Lab live sandbox rejects proxy env
+      // outright (harness_failure), and a dead local proxy turns loopback fetches
+      // into instant "Unable to connect" failures. Tests never need a proxy.
+      http_proxy: undefined,
+      https_proxy: undefined,
+      all_proxy: undefined,
+      HTTP_PROXY: undefined,
+      HTTPS_PROXY: undefined,
+      ALL_PROXY: undefined,
+      no_proxy: undefined,
+      NO_PROXY: undefined,
       // Captured BEFORE HOME is overwritten: once the child starts with a rewritten
       // HOME, `homedir()` returns the sandbox, so this hand-off is the only way the
       // real-home write guard can still know which path to protect.

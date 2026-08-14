@@ -19,7 +19,19 @@ const WS_BETA = "responses_websockets=2026-02-06";
 // the caller's connect timeout (default 200s) would fire.
 const UPGRADE_DEADLINE_MS = 10_000;
 
+/**
+ * Env kill-switch for the WS transport. Tests that mock chatgpt.com through
+ * globalThis.fetch cannot intercept a real wss:// dial, and on boxes where the
+// network to chatgpt.com is blocked the 10s upgrade deadline exceeds the test
+ * runner's 5s timeout. `OPENCODEX_DISABLE_WS_UPSTREAM=1` keeps every turn on the
+// HTTP/SSE path; production never sets it.
+ */
+function wsUpstreamDisabled(): boolean {
+  return process.env.OPENCODEX_DISABLE_WS_UPSTREAM === "1";
+}
+
 export function shouldUseCodexWsUpstream(url: string, init?: RequestInit): boolean {
+  if (wsUpstreamDisabled()) return false;
   if (url !== CODEX_RESPONSES_HTTP_URL) return false;
   if ((init?.method ?? "GET").toUpperCase() !== "POST") return false;
   const body = init?.body;

@@ -19,6 +19,7 @@ import {
   type ServerResourceOwnerLease,
 } from "../lib/server-resource-ownership";
 import {
+  getActiveMemoryWatchdog,
   startMemoryWatchdog,
   type MemoryWatchdog,
 } from "./memory-watchdog";
@@ -76,6 +77,10 @@ function stopProcessLoops(): void {
   loops?.stateStoreSweeper.stop();
   stopStorageCleanupScheduler();
   setLivePolicyOwner(null);
+  // startServer() also calls startMemoryWatchdog() directly (index.ts:574),
+  // which may have replaced the lifecycle-tracked instance. Stop any remaining
+  // active watchdog to avoid leaking intervals after all leases are released.
+  getActiveMemoryWatchdog()?.stop();
 }
 
 async function stopStoragePolicyWorker(): Promise<void> {

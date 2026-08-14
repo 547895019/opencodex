@@ -1938,7 +1938,10 @@ async function handleResponsesInner(
           parsed.options.reasoning = mapped;
           const raw = parsed._rawBody as { reasoning?: { effort?: string } } | undefined;
           if (raw?.reasoning && typeof raw.reasoning === "object") raw.reasoning.effort = mapped;
-          logCtx.requestedEffort = `${logCtx.requestedEffort ?? requested}->${mapped}`;
+          // Combo attempts record their own requestedEffort; don't overwrite it here.
+          if (!options.comboAttempt) {
+            logCtx.requestedEffort = `${logCtx.requestedEffort ?? requested}->${mapped}`;
+          }
         }
       }
     }
@@ -3689,6 +3692,10 @@ async function handleResponsesInner(
         visionMarkAttempted = true;
         markModelNoVision(config, route, route.modelId);
         stripImagesInPlace(parsed);
+        // parsed is mutated in place (same object ref), so the sameTarget replay cache would
+        // rebuild identity and replay the ORIGINAL image request — bump transportToken so
+        // rebuildAndRefetch rebuilds from the stripped parsed instead.
+        invalidateSameTargetRequest();
         try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
         const result = await rebuildAndRefetch("vision-mark-400");
         if ("failed" in result) return result.failed;
@@ -3724,8 +3731,14 @@ async function handleResponsesInner(
             parsed.options.reasoning = mapped;
             const raw = parsed._rawBody as { reasoning?: { effort?: string } } | undefined;
             if (raw?.reasoning && typeof raw.reasoning === "object") raw.reasoning.effort = mapped;
-            logCtx.requestedEffort = `${logCtx.requestedEffort ?? requested}->${mapped}`;
+            // Combo attempts record their own requestedEffort; don't overwrite it here.
+            if (!options.comboAttempt) {
+              logCtx.requestedEffort = `${logCtx.requestedEffort ?? requested}->${mapped}`;
+            }
           }
+          // Same identity caveat as the vision-mark branch above: parsed is mutated in place,
+          // so invalidate the sameTarget replay cache or the retry re-sends the ORIGINAL effort.
+          invalidateSameTargetRequest();
           try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
           const result = await rebuildAndRefetch("reasoning-clamp-400");
           if ("failed" in result) return result.failed;
