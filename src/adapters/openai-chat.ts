@@ -6,7 +6,7 @@ import { debugProviderDiagnostic } from "../lib/debug";
 import { sseFieldValue } from "../lib/sse-decoder";
 import { isDebugEnabled } from "../lib/debug-settings";
 import { isCyberPolicyCode } from "../lib/errors";
-import { redactSecretString } from "../lib/redact";
+import { redactSecretString, redactSecrets } from "../lib/redact";
 import { contentPartsToText } from "./image";
 import { identifyRoutedModel } from "./identity";
 import { peekReasoningForCall } from "../responses/reasoning-replay-cache";
@@ -250,14 +250,14 @@ function diagnoseInvalidToolCalls(
             valueType: Array.isArray(streamFunction) ? "array" : typeof streamFunction,
           };
         }
-        if (streamFunction.name !== undefined && typeof streamFunction.name !== "string") {
+        if (streamFunction.name !== undefined && streamFunction.name !== null && typeof streamFunction.name !== "string") {
           return { reason: "tool_call_function_name_invalid", callIndex, valueType: typeof streamFunction.name };
         }
-        if (streamFunction.arguments !== undefined && typeof streamFunction.arguments !== "string") {
+        if (streamFunction.arguments !== undefined && streamFunction.arguments !== null && typeof streamFunction.arguments !== "string") {
           return { reason: "tool_call_function_arguments_invalid", callIndex, valueType: typeof streamFunction.arguments };
         }
       }
-      if (rawToolCall.id !== undefined && typeof rawToolCall.id !== "string") {
+      if (rawToolCall.id !== undefined && rawToolCall.id !== null && typeof rawToolCall.id !== "string") {
         return { reason: "tool_call_id_invalid", callIndex, valueType: typeof rawToolCall.id };
       }
       continue;
@@ -295,7 +295,31 @@ function diagnoseInvalidToolCalls(
 
 function logInvalidToolCalls(mode: "stream" | "response", rawToolCalls: unknown): void {
   const diagnostic = diagnoseInvalidToolCalls(rawToolCalls, mode);
-  if (diagnostic) debugProviderDiagnostic("openai-chat", "invalid-tool-calls", { mode, ...diagnostic });
+  if (!diagnostic) return;
+  debugProviderDiagnostic("openai-chat", "invalid-tool-calls", { mode, ...diagnostic });
+  // Companion dump of the offending entry itself (truncated + secret-redacted) so a
+  // malformed wire shape can be characterized without a separate raw capture run.
+  // Only the failing call is logged, never arguments — a name/id shape is the target.
+  const offending = Array.isArray(rawToolCalls) ? rawToolCalls[diagnostic.callIndex ?? 0] : undefined;
+  if (offending === undefined) return;
+  let dumped: string;
+  try {
+    // id and arguments are correlation handles / model output — only their shape is
+    // diagnostic, matching the scalar-only privacy contract of the base diagnostic.
+    dumped = JSON.stringify(redactSecrets(offending), (key, value) => {
+      if (key === "arguments") return `"<${typeof value === "string" ? value.length : "non-string"} chars>"`;
+      if (key === "id") return `"<${typeof value === "string" ? value.length : String(value)} id>"`;
+      return value;
+    }) ?? "<unserializable>";
+  } catch {
+    dumped = "<unserializable>";
+  }
+  debugProviderDiagnostic("openai-chat", "invalid-tool-calls-dump", {
+    mode,
+    callIndex: diagnostic.callIndex ?? 0,
+    reason: diagnostic.reason,
+    raw: dumped.slice(0, 2048),
+  });
 }
 
 function developerSystemText(message: OcxMessage): string | undefined {
@@ -1154,13 +1178,17 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
                 }
                 const rawName = rawFunction.name;
                 const rawArguments = rawFunction.arguments;
-                if ((rawName !== undefined && typeof rawName !== "string")
-                  || (rawArguments !== undefined && typeof rawArguments !== "string")) {
+                // `null` on a present field is treated as absent, not invalid: the MiMo
+                // token-plan gateway streams a first fragment with id/name as literal null
+                // alongside a started arguments delta, and later fragments carry the real
+                // values. Non-string non-null values stay a hard failure (#1325).
+                if ((rawName !== undefined && rawName !== null && typeof rawName !== "string")
+                  || (rawArguments !== undefined && rawArguments !== null && typeof rawArguments !== "string")) {
                   logInvalidToolCalls("stream", rawToolCalls);
                   return yield* terminateWithError(invalidToolCallsEvent(pendingUsage));
                 }
               }
-              if (tc.id !== undefined && typeof tc.id !== "string") {
+              if (tc.id !== undefined && tc.id !== null && typeof tc.id !== "string") {
                 logInvalidToolCalls("stream", rawToolCalls);
                 return yield* terminateWithError(invalidToolCallsEvent(pendingUsage));
               }

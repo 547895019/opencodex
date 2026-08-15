@@ -206,3 +206,29 @@ describe("openai-chat parallel tool call stream assembly", () => {
     expect(assembled(events)).toEqual([{ id: "call_b", name: "read", args: "{\"p\":\"x\"}" }]);
   });
 });
+
+describe("openai-chat null-field tool call fragments (MiMo token plan)", () => {
+  // The MiMo token-plan gateway streams a first fragment with id/name as literal null
+  // while arguments already start, and later fragments carry the real values. Null on a
+  // present field is stream padding, not a malformed shape — it must assemble.
+  test("null id/name first fragment then named continuation assembles", async () => {
+    const events = await collect(sse([
+      chunkOf([{ index: 0, id: null, function: { name: null, arguments: "{\"cmd\"" } }]),
+      chunkOf([{ index: 0, id: "call_mimo", function: { name: "shell", arguments: ":\"ls\"}" } }]),
+      chunkOf([], "tool_calls"),
+    ]));
+    expect(assembled(events)).toEqual([{ id: "call_mimo", name: "shell", args: "{\"cmd\":\"ls\"}" }]);
+  });
+
+  test("null fields only, name never arrives, fails closed as unnamed", async () => {
+    const events = await collect(sse([
+      chunkOf([{ index: 0, id: null, function: { name: null, arguments: "{}" } }]),
+      chunkOf([], "tool_calls"),
+    ]));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "error",
+      message: expect.stringContaining("without a function name"),
+    }));
+    expect(events.some(e => e.type === "done")).toBe(false);
+  });
+});
