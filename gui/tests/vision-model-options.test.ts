@@ -68,9 +68,8 @@ test("a server-supplied vision backend wins when the catalog cannot identify its
     { value: model, label: model, backend: "anthropic" },
   ], [], undefined);
 
-  // This documents the old save-path result: catalog inference alone defaults
-  // to OpenAI when there is no matching model row.
-  expect(sidecarBackendForModel([], model)).toBe("openai");
+  // Catalog inference defaults to "routed" when there is no matching model row.
+  expect(sidecarBackendForModel([], model)).toBe("routed");
   expect(visionSidecarBackendForModel([], options, model)).toBe("anthropic");
 });
 
@@ -78,12 +77,12 @@ test("an older server with no option list cannot rewrite the persisted anthropic
   const model = "claude-grandfathered";
   // The compatibility path: a server that predates visionModels sends nothing, and the
   // configured model is absent from the catalog. Without the persisted backend travelling
-  // with the grandfathered entry, the next save would silently downgrade it to openai.
+  // with the grandfathered entry, the next save would silently downgrade it to routed.
   const options = visionModelOptions(undefined, [], model, "anthropic");
 
   expect(options[0]).toMatchObject({ value: model, backend: "anthropic" });
   expect(visionSidecarBackendForModel([], options, model)).toBe("anthropic");
-  expect(sidecarBackendForModel([], model)).toBe("openai");
+  expect(sidecarBackendForModel([], model)).toBe("routed");
 });
 
 test("an authoritative empty list still keeps the configured model and its backend", () => {
