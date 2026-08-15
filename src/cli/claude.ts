@@ -247,7 +247,8 @@ export function buildClaudeEnv(
  * (no [1m] marking, conservative).
  */
 export async function fetchClaudeContextWindows(config: OcxConfig, port: number, timeoutMs = 3_000): Promise<Record<string, number>> {
-  const token = process.env.OPENCODEX_API_AUTH_TOKEN || config.apiKeys?.[0]?.key || configuredAdminToken();
+  // Management endpoint: prefer admin token, then fall back to data token
+  const token = configuredAdminToken() || process.env.OPENCODEX_API_AUTH_TOKEN || config.apiKeys?.[0]?.key;
   const headers = new Headers();
   if (token) headers.set("x-opencodex-api-key", token);
   const url = `http://127.0.0.1:${port}/api/claude-code`;
