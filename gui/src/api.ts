@@ -44,6 +44,10 @@ const LEGACY_TOKEN_KEY = "opencodex-api-token";
 let memoryToken: string | null = null;
 let memoryCsrfToken: string | null = null;
 let memorySessionOrigin: string | null = null;
+/** Unix-ms epoch when the current gui session expires; null for admin tokens (no TTL). */
+let memorySessionExpiresAt: number | null = null;
+/** Renew when less than this remains, so background pollers never take an expiry 401. */
+const SESSION_RENEWAL_LEEWAY_MS = 60_000;
 
 function readToken(): string | null {
   return memoryToken;
@@ -57,6 +61,7 @@ function clearToken(): void {
   memoryToken = null;
   memoryCsrfToken = null;
   memorySessionOrigin = null;
+  memorySessionExpiresAt = null;
 }
 
 function takeMetaContent(name: string): string | null {
@@ -70,7 +75,7 @@ function loadInjectedSession(): void {
   const token = takeMetaContent("opencodex-session-token");
   const csrfToken = takeMetaContent("opencodex-session-csrf");
   const origin = takeMetaContent("opencodex-session-origin");
-  storeSession(token, csrfToken, origin);
+  storeSession(token, csrfToken, origin, takeMetaContent("opencodex-session-expires-at"));
 }
 
 /** Clear memory only when it still holds `expected` (avoid wiping a newer concurrent store). */
@@ -79,11 +84,13 @@ function clearTokenIfCurrent(expected: string | null): void {
 }
 
 /** Validate and store a server-minted GUI session; rejects anything bound to another origin. */
-function storeSession(token: string | null, csrfToken: string | null, origin: string | null): boolean {
+function storeSession(token: string | null, csrfToken: string | null, origin: string | null, expiresAtRaw: string | null): boolean {
   if (!token?.startsWith("ocx_session_") || !csrfToken || origin !== window.location.origin) return false;
   memoryToken = token;
   memoryCsrfToken = csrfToken;
   memorySessionOrigin = origin;
+  const parsedExpiry = expiresAtRaw !== null ? Number(expiresAtRaw) : NaN;
+  memorySessionExpiresAt = Number.isFinite(parsedExpiry) && parsedExpiry > 0 ? parsedExpiry : null;
   return true;
 }
 
@@ -115,6 +122,7 @@ async function reBootstrapSessionToken(): Promise<string | null> {
       metaContentFromHtml(html, "opencodex-session-token"),
       metaContentFromHtml(html, "opencodex-session-csrf"),
       metaContentFromHtml(html, "opencodex-session-origin"),
+      metaContentFromHtml(html, "opencodex-session-expires-at"),
     );
     return stored ? readToken() : null;
   } catch {
@@ -199,7 +207,17 @@ export function installApiAuthFetch(): void {
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     if (!needsApiAuth(input)) return originalFetch(input, init);
 
-    const token = readToken();
+    // Proactive renewal: a gui session inside the renewal window is swapped BEFORE the
+    // request goes out, so a background poller never surfaces the once-per-TTL expiry
+    // 401 in the console. Concurrent requests share one renewal via resolutionInFlight;
+    // a failed renewal falls through to the normal request path (the eventual 401 there
+    // remains the recovery signal). Admin tokens carry no expiry and skip this.
+    let token = readToken();
+    if (token && memorySessionExpiresAt !== null && Date.now() > memorySessionExpiresAt - SESSION_RENEWAL_LEEWAY_MS) {
+      const renewed = await resolveTokenAfter401(token);
+      if (renewed) token = renewed;
+    }
+
     const [firstInput, firstInit] = token ? withToken(input, init, token) : [input, init];
     const response = await originalFetch(firstInput, firstInit);
     if (response.status !== 401) return response;
@@ -231,6 +249,7 @@ export function resetApiAuthFetchForTests(adminTokenPrompt: AdminTokenPrompt = p
   memoryToken = null;
   memoryCsrfToken = null;
   memorySessionOrigin = null;
+  memorySessionExpiresAt = null;
   resolutionInFlight = null;
   rawFetch = null;
   promptCancelled = false;

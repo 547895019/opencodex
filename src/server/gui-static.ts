@@ -71,6 +71,9 @@ function sessionBootstrapMeta(session: GuiSessionBootstrap): string {
     `<meta name="opencodex-session-token" content="${escapeHtmlAttribute(session.token)}">`,
     `<meta name="opencodex-session-csrf" content="${escapeHtmlAttribute(session.csrfToken)}">`,
     `<meta name="opencodex-session-origin" content="${escapeHtmlAttribute(session.origin)}">`,
+    // Unix-ms epoch expiry so the GUI can proactively renew before the 5-minute TTL
+    // lapses, instead of letting a poller take one 401 per TTL window.
+    `<meta name="opencodex-session-expires-at" content="${session.expiresAt}">`,
   ].join("");
 }
 
