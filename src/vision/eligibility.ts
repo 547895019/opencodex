@@ -34,7 +34,7 @@ export type VisionSidecarBackend = "openai" | "anthropic" | "routed";
  * whenever its side is enabled, and withheld only when that provider explicitly lists it as a
  * model the sidecar describes FOR — never merely because a metadata table stayed silent.
  */
-export const BASELINE_VISION_MODELS: Record<VisionSidecarBackend, string> = {
+export const BASELINE_VISION_MODELS: Record<Exclude<VisionSidecarBackend, "routed">, string> = {
   openai: "gpt-5.6-luna",
   anthropic: "claude-haiku-4-5",
 };
@@ -178,7 +178,7 @@ export function visionBackendForCandidate(
 }
 
 function baselineCandidate(
-  backend: VisionSidecarBackend,
+  backend: Exclude<VisionSidecarBackend, "routed">,
   anthropicProviderName: string | undefined,
 ): VisionCandidateModel {
   return {
