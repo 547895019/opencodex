@@ -36,6 +36,9 @@ export function enabledVisionBackends(
   // provider keyed "openai" — same predicate the runtime sidecar resolver uses.
   if (listOpenAiForwardSidecarCandidates(config).length > 0) backends.push("openai");
   if (anthropicSidecar) backends.push("anthropic");
+  // The routed backend lets any configured provider/model describe images. It is
+  // enabled when the operator has explicitly selected it in the sidecar config.
+  if (config.visionSidecar?.backend === "routed") backends.push("routed");
   // Neither side resolvable (fresh install, no login): fall back to both so the
   // picker is populated rather than empty, matching the permissive-unknown rule.
   return backends.length > 0 ? backends : ["openai", "anthropic"];
@@ -65,6 +68,7 @@ export function visionModelOptionsFrom(
     candidates,
     enabledVisionBackends(config, anthropicSidecar),
     anthropicSidecar?.providerName,
+    config.visionSidecar?.backend === "routed" ? config.visionSidecar?.model : undefined,
   );
 }
 

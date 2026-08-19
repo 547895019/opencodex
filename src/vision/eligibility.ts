@@ -26,8 +26,8 @@ import { nativeInputModalities } from "../codex/catalog/metadata";
 import { SUPPORTED_NATIVE_OPENAI_SLUGS } from "../codex/catalog/native-models";
 import { enrichProviderFromRegistry } from "../providers/derive";
 
-/** The two wire protocols `planVisionSidecar` can actually dispatch to. */
-export type VisionSidecarBackend = "openai" | "anthropic";
+/** The wire protocols `planVisionSidecar` can actually dispatch to. */
+export type VisionSidecarBackend = "openai" | "anthropic" | "routed";
 
 /**
  * Default entry per backend: cheap, image-capable, and present in every deployment. Offered
@@ -203,6 +203,7 @@ export function visionEligibleModelOptions(
   candidates: readonly VisionCandidateModel[],
   enabledBackends: readonly VisionSidecarBackend[],
   anthropicProviderName?: string,
+  routedModelId?: string,
 ): VisionModelOption[] {
   const enabled = new Set(enabledBackends);
   const byValue = new Map<string, VisionModelOption>();
@@ -223,7 +224,14 @@ export function visionEligibleModelOptions(
     byValue.set(candidate.id, { value: candidate.id, label: candidate.id, backend });
   }
 
+  // The routed backend lets any configured provider/model describe images. The
+  // user's chosen model from the vision sidecar config is surfaced directly — it
+  // is not a catalog discovery and has no baseline, but must appear in the picker.
+  if (enabled.has("routed") && routedModelId && !byValue.has(routedModelId)) {
+    byValue.set(routedModelId, { value: routedModelId, label: routedModelId, backend: "routed" });
+  }
+
   const order = (option: VisionModelOption) =>
-    (option.backend === "openai" ? 0 : 2) + (option.baseline ? 0 : 1);
+    (option.backend === "openai" ? 0 : option.backend === "routed" ? 1 : 2) + (option.baseline ? 0 : 1);
   return [...byValue.values()].sort((a, b) => order(a) - order(b) || a.value.localeCompare(b.value));
 }
