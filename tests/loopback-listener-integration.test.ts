@@ -398,13 +398,22 @@ describe("unauthenticated loopback listener", () => {
       expect(sharedTimers.length).toBeGreaterThanOrEqual(3);
       const newer = startServer(0);
       // Singleton loops are process-scoped: the second live server acquires the
-      // same lease instead of replacing the watchdog and sweeper intervals.
-      expect(started).toEqual(sharedTimers);
+      // same lease instead of replacing the sweeper intervals. The memory
+      // watchdog is the exception — startServer() calls startMemoryWatchdog()
+      // directly (src/server/index.ts), which stops the prior instance and
+      // starts a fresh timer. The old timer is cleared (moved to `cleared`)
+      // and a new one is pushed to `started`, so the raw `started` array only
+      // ever grows and cannot be compared by identity. The property under test
+      // is about the LIVE timers (started but not yet cleared): the newer
+      // server's live set must survive the older's stop and be cleared by its
+      // own stop. Snapshot the live set after the second start.
+      const liveTimers = started.filter(timer => !cleared.has(timer));
+      expect(liveTimers.length).toBeGreaterThanOrEqual(3);
 
       await older.stop(true);
-      newerTimersSurvivedOlderStop = sharedTimers.every(timer => !cleared.has(timer));
+      newerTimersSurvivedOlderStop = liveTimers.every(timer => !cleared.has(timer));
       await newer.stop(true);
-      newerTimersClearedOnOwnStop = sharedTimers.every(timer => cleared.has(timer));
+      newerTimersClearedOnOwnStop = liveTimers.every(timer => cleared.has(timer));
     } finally {
       for (const timer of started) nativeClearInterval(timer);
       Object.defineProperty(globalThis, "setInterval", {

@@ -1,9 +1,21 @@
-import { afterEach, describe, expect, jest, test } from "bun:test";
+import { afterEach, afterAll, beforeAll, describe, expect, jest, test } from "bun:test";
 import { providerFetch } from "../src/server/responses/fetch-helpers";
 import { codexWsUpstreamFetch, shouldUseCodexWsUpstream } from "../src/server/responses/ws-upstream";
 import type { OcxProviderConfig } from "../src/types";
 
 const CODEX_URL = "https://chatgpt.com/backend-api/codex/responses";
+
+// The test preload (tests/preload.ts → scripts/test.ts) sets
+// OPENCODEX_DISABLE_WS_UPSTREAM=1 so network-blocked boxes never blackhole on a
+// real wss:// dial. These routing-predicate tests assert the opposite — that
+// eligible turns SELECT WS — so they clear the kill-switch for their own
+// describe scope and restore the original value on exit.
+const SAVED_WS_UPSTREAM = process.env.OPENCODEX_DISABLE_WS_UPSTREAM;
+function clearWsUpstreamKillSwitch(): void { delete process.env.OPENCODEX_DISABLE_WS_UPSTREAM; }
+function restoreWsUpstreamKillSwitch(): void {
+  if (SAVED_WS_UPSTREAM === undefined) delete process.env.OPENCODEX_DISABLE_WS_UPSTREAM;
+  else process.env.OPENCODEX_DISABLE_WS_UPSTREAM = SAVED_WS_UPSTREAM;
+}
 
 function streamingInit(body: Record<string, unknown> = {}): RequestInit {
   return {
@@ -14,6 +26,9 @@ function streamingInit(body: Record<string, unknown> = {}): RequestInit {
 }
 
 describe("shouldUseCodexWsUpstream", () => {
+  beforeAll(clearWsUpstreamKillSwitch);
+  afterAll(restoreWsUpstreamKillSwitch);
+
   test("matches only streaming POSTs to the Codex backend", () => {
     expect(shouldUseCodexWsUpstream(CODEX_URL, streamingInit())).toBe(true);
     // Non-streaming turns keep HTTP: the WS path only speaks the event protocol.
@@ -100,6 +115,9 @@ function installFake(script: (ws: FakeWebSocket) => void) {
 }
 
 describe("providerFetch routing", () => {
+  beforeAll(clearWsUpstreamKillSwitch);
+  afterAll(restoreWsUpstreamKillSwitch);
+
   test("routes eligible Codex streaming turns to WS and everything else to the base fetch", async () => {
     installFake(ws => {
       ws.emit("open", {});
