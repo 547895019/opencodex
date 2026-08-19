@@ -273,7 +273,7 @@ export function clampVisionReasoningToLadder(
 export function sidecarModelOptions(models: ModelInfo[]) {
   const out: Array<{ value: string; label: string }> = [];
   for (const model of models) {
-    if (model.provider === "openai" || model.provider === "anthropic") {
+    if (model.provider === "openai" || model.provider === "anthropic" || model.provider === "ollama") {
       out.push({ value: model.id, label: `${model.provider}/${model.id}` });
     }
   }
