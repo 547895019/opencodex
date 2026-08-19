@@ -53,6 +53,7 @@ export async function visionCandidateRows(config: OcxConfig): Promise<VisionCand
   return rows.filter(row => row.disabled !== true).map(row => ({
     provider: row.provider,
     id: row.id,
+    ...(row.namespaced ? { namespaced: row.namespaced } : {}),
     ...(row.inputModalities ? { inputModalities: row.inputModalities } : {}),
     ...(row.native ? { native: true } : {}),
   }));
@@ -103,14 +104,21 @@ export function visionDescriberIsProvablyBlind(
 ): boolean {
   // Catalog rows can carry operator-authored modalities. A positive claim from one
   // must not hide another row or canonical metadata that proves this id is blind.
-  if (candidates.some(candidate => candidate.id === requested
+  // Match against both the bare id and the provider-prefixed namespaced form, since
+  // routed models enter with the prefix (e.g. "ollama/kimi-k2.7-code:cloud").
+  if (candidates.some(candidate =>
+    (candidate.id === requested || candidate.namespaced === requested)
     && modelAcceptsImageInput(config, candidate) === false)) return true;
+
+  // Strip a provider prefix before probing the vendor tables — they key on the bare id.
+  const slash = requested.indexOf("/");
+  const bareId = slash > 0 ? requested.slice(slash + 1) : requested;
 
   const hinted: VisionSidecarBackend = backendHint === "anthropic" ? "anthropic" : "openai";
   const probed: VisionSidecarBackend[] = hinted === "anthropic"
     ? ["anthropic", "openai"]
     : ["openai", "anthropic"];
-  return probed.some(provider => modelAcceptsImageInput(config, { provider, id: requested }) === false);
+  return probed.some(provider => modelAcceptsImageInput(config, { provider, id: bareId }) === false);
 }
 
 /** The 400 body both routes return, so the two errors cannot diverge either. */

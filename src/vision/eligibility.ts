@@ -42,6 +42,14 @@ export const BASELINE_VISION_MODELS: Record<VisionSidecarBackend, string> = {
 export interface VisionCandidateModel {
   provider: string;
   id: string;
+  /**
+   * Provider-prefixed routing id (`provider/model`), present for routed/non-native rows.
+   * The picker uses this as the option `value` so `routeModel` can resolve the model at
+   * describe time — a bare id for an ollama/custom provider falls through to the default
+   * provider and never reaches the right host. Baselines and native OpenAI rows carry no
+   * namespaced form and use the bare `id`.
+   */
+  namespaced?: string;
   inputModalities?: string[];
   native?: boolean;
 }
@@ -163,8 +171,10 @@ export function visionBackendForCandidate(
   // executor to name, no catalog row qualifies; the side's baseline is added separately and
   // keeps the picker populated. Narrowing here never widens the write gate, which is a
   // different predicate (`modelAcceptsImageInput`) and still treats unknown as allowed.
-  if (anthropicProviderName === undefined) return undefined;
-  return candidate.provider === anthropicProviderName ? "anthropic" : undefined;
+  if (anthropicProviderName !== undefined && candidate.provider === anthropicProviderName) return "anthropic";
+  // Any other provider (ollama, custom OpenAI-compatible, …) reaches the describer through
+  // the routed backend — the normal routing pipeline resolves the provider-prefixed id.
+  return "routed";
 }
 
 function baselineCandidate(
@@ -220,13 +230,19 @@ export function visionEligibleModelOptions(
     const backend = visionBackendForCandidate(config, candidate, anthropicProviderName);
     if (!backend || !enabled.has(backend)) continue;
     if (!isVisionEligibleModelWithCache(config, candidate, enrichedProviders)) continue;
-    if (byValue.has(candidate.id)) continue;
-    byValue.set(candidate.id, { value: candidate.id, label: candidate.id, backend });
+    // Routed rows (ollama, custom OpenAI-compatible, …) carry a provider-prefixed
+    // namespaced id; that is the form `routeModel` needs at describe time. Baselines
+    // and native OpenAI rows keep the bare id.
+    const value = backend === "routed" && candidate.namespaced ? candidate.namespaced : candidate.id;
+    if (byValue.has(value)) continue;
+    byValue.set(value, { value, label: value, backend });
   }
 
   // The routed backend lets any configured provider/model describe images. The
   // user's chosen model from the vision sidecar config is surfaced directly — it
   // is not a catalog discovery and has no baseline, but must appear in the picker.
+  // For non-openai/anthropic providers (ollama, custom, …) the value must carry
+  // the provider prefix so `routeModel` can resolve it at describe time.
   if (enabled.has("routed") && routedModelId && !byValue.has(routedModelId)) {
     byValue.set(routedModelId, { value: routedModelId, label: routedModelId, backend: "routed" });
   }

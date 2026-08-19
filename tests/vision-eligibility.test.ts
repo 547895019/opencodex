@@ -245,9 +245,10 @@ describe("vision eligibility core", () => {
     expect(matches[0]?.baseline).toBe(true);
   });
 
-  test("8. backend routing excludes image-capable rows with no executor", () => {
-    // cursor has no vision sidecar executor — backend is undefined and the row is absent
-    // from the options list even when it is image-capable.
+  test("8. backend routing excludes image-capable rows when routed is not enabled", () => {
+    // cursor is a non-openai/anthropic provider: it routes through the "routed" backend.
+    // When routed is not in the enabled set, the row is absent from the options list even
+    // when it is image-capable.
     const config = configWithProviders({
       cursor: {
         adapter: "openai-chat",
@@ -259,7 +260,7 @@ describe("vision eligibility core", () => {
       id: "cursor-vision-capable",
       inputModalities: ["text", "image"],
     };
-    expect(visionBackendForCandidate(config, candidate)).toBeUndefined();
+    expect(visionBackendForCandidate(config, candidate)).toBe("routed");
     expect(isVisionEligibleModel(config, candidate)).toBe(true);
     const options = visionEligibleModelOptions(config, [candidate], ["openai", "anthropic"]);
     expect(options.some((o) => o.value === candidate.id)).toBe(false);
