@@ -4,9 +4,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as oauthModule from "../src/oauth";
 
-mock.module("../src/oauth", () => ({ ...oauthModule, getValidAccessToken: async () => "anthropic-vision-token" }));
+mock.module("../src/oauth", () => ({
+  ...oauthModule,
+  getValidAccessToken: async () => "anthropic-vision-token",
+  getValidAccessTokenSnapshot: async () => ({
+    provider: "anthropic",
+    accountId: "00000000-0000-4000-8000-000000000004",
+    generation: "g1",
+    accessToken: "anthropic-vision-token",
+  }),
+}));
 
-import { CLAUDE_CODE_SYSTEM_INSTRUCTION } from "../src/oauth/anthropic";
+import {
+  getAttributionHeader,
+  getClaudeCodeSystemPrefix,
+  getOpenCodexVersion,
+} from "../src/adapters/client-fingerprint";
 import { parseRequest } from "../src/responses/parser";
 import { handleManagementAPI } from "../src/server/management-api";
 import type { OcxConfig, OcxProviderConfig } from "../src/types";
@@ -92,19 +105,24 @@ describe("Anthropic vision executor", () => {
     expect(result).toEqual({ text: "base64 description" });
     expect(captured?.url).toBe("https://api.anthropic.test/v1/messages");
     expect(captured?.headers.get("authorization")).toBe("Bearer anthropic-vision-token");
-    expect(captured?.headers.get("anthropic-beta")).toContain("oauth");
+    expect(captured?.headers.get("anthropic-beta")).toBe("oauth-2025-04-20");
     expect(captured?.headers.get("anthropic-version")).toBe("2023-06-01");
     expect(captured?.headers.get("x-app")).toBe("cli");
     expect(captured?.headers.get("x-claude-code-session-id")).toBeTruthy();
     expect(captured?.headers.get("x-client-request-id")).toBeTruthy();
-    expect(captured?.headers.get("user-agent")).toBe("@anthropic-ai/sdk/0.74.0");
+    expect(captured?.headers.get("user-agent")).toBe(`claude-cli/${getOpenCodexVersion()}`);
 
     expect(captured?.body.model).toBe("claude-sonnet-5");
     expect(captured?.body.max_tokens).toBe(1024);
     expect(captured?.body.thinking).toEqual({ type: "disabled" });
     expect(captured?.body.stream).toBe(true);
     const system = captured?.body.system as Array<{ type: string; text: string }>;
-    expect(system[0]).toEqual({ type: "text", text: CLAUDE_CODE_SYSTEM_INSTRUCTION });
+    expect(system[0].text).toBe(getAttributionHeader("d97"));
+    expect(system[1].text).toBe(getClaudeCodeSystemPrefix());
+    expect(system[2].text).toContain("vision describer");
+    const userId = JSON.parse(captured?.body.metadata.user_id as string) as { device_id: string; account_uuid: string; session_id: string };
+    expect(userId.account_uuid).toBe("00000000-0000-4000-8000-000000000004");
+    expect(userId.session_id).toBe(captured?.headers.get("x-claude-code-session-id"));
     const messages = captured?.body.messages as Array<{ content: Array<Record<string, unknown>> }>;
     expect(messages[0].content[0]).toEqual({ type: "text", text: "The user's request about this image: read the screenshot" });
     expect(messages[0].content[1]).toEqual({

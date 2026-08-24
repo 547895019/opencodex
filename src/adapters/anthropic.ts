@@ -15,13 +15,23 @@ import type {
 } from "../types";
 import { isAllowedToolChoice, namespacedToolName, resolveToolChoiceWireName, toolAllowedByChoice } from "../types";
 import { ANTHROPIC_OAUTH_BETA, CLAUDE_CODE_SYSTEM_INSTRUCTION, applyClaudeToolPrefix, stripClaudeToolPrefix } from "../oauth/anthropic";
+import { getValidAccessTokenSnapshot } from "../oauth";
 import { parseDataUrl } from "./image";
 import { enforceAnthropicImageLimits } from "./anthropic-image-guard";
 import { normalizeAnthropicImages } from "./anthropic-image-normalize";
 import { normalizeAnthropicOutputSchema } from "./anthropic-output-schema";
 import { identifyRoutedModel } from "./identity";
 import { redactSecretString } from "../lib/redact";
-import { CLAUDE_CODE_HEADERS, claudeCodeSessionId } from "./client-fingerprint";
+import {
+  claudeCodeSessionId,
+  computeFingerprint,
+  extractFirstUserMessageText,
+  getAttributionHeader,
+  getClaudeCodeSystemPrefix,
+  getClaudeCodeUserAgent,
+  getOpenCodexVersion,
+  getOrCreateDeviceId,
+} from "./client-fingerprint";
 import { buildNonOpenAIToolCatalogNudgeForTools } from "./tool-catalog-nudge";
 import { decodeServerSentEvents } from "../lib/sse-decoder";
 import { isTranslatorBudgetExceededError, retainTranslatedEventBatch, type TranslatorBudget } from "../lib/translator-budget";
@@ -810,7 +820,7 @@ function normalizeAnthropicInputSchema(schema: unknown): Record<string, unknown>
   return normalized;
 }
 
-export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetention?: "none" | "short" | "long"): ProviderAdapter {
+export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetention?: "none" | "short" | "long", providerName?: string): ProviderAdapter {
   const isOAuth = provider.authMode === "oauth";
   const toolNames = buildToolNameTransforms(provider);
   return {
@@ -819,10 +829,12 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
     formatErrorBody: formatAnthropicErrorBody,
 
     async buildRequest(parsed: OcxParsedRequest, incoming?: IncomingMeta) {
-      if (typeof provider.apiKey !== "string" || provider.apiKey.trim() === "") {
-        if (isOAuth) {
-          throw new Error("anthropic oauth token missing — run ocx login anthropic");
-        }
+      const oauthSnapshot = isOAuth && providerName ? await getValidAccessTokenSnapshot(providerName) : undefined;
+      const accessToken = oauthSnapshot?.accessToken;
+      if (isOAuth && (!accessToken || accessToken.trim() === "")) {
+        throw new Error("anthropic oauth token missing — run ocx login anthropic");
+      }
+      if (!isOAuth && (typeof provider.apiKey !== "string" || provider.apiKey.trim() === "")) {
         throw new Error("anthropic provider requires a non-empty apiKey (authMode: key)");
       }
 
@@ -843,11 +855,24 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
         max_tokens: parsed.options.maxOutputTokens ?? DEFAULT_MAX_TOKENS,
       };
       if (isOAuth) {
-        // Claude OAuth (Pro/Max) requires the first system block to be the Claude Code identity.
+        // Claude OAuth (Pro/Max) first-party fingerprinting:
+        // 1. attribution pseudo-header (contains version+fingerprint and cch placeholder)
+        // 2. CLI system prefix
+        // 3. caller/system content
+        const fingerprint = computeFingerprint(extractFirstUserMessageText(parsed.context.messages), getOpenCodexVersion());
         body.system = [
-          { type: "text", text: CLAUDE_CODE_SYSTEM_INSTRUCTION },
+          { type: "text", text: getAttributionHeader(fingerprint) },
+          { type: "text", text: getClaudeCodeSystemPrefix({ isNonInteractive: false, hasAppendSystemPrompt: false }) },
           ...(system ? [{ type: "text", text: system }] : []),
         ];
+        // First-party request metadata matches the official client shape.
+        body.metadata = {
+          user_id: JSON.stringify({
+            device_id: getOrCreateDeviceId(),
+            account_uuid: oauthSnapshot?.accountId ?? "",
+            session_id: claudeCodeSessionId(),
+          }),
+        };
       } else if (system) {
         body.system = [{ type: "text", text: system }];
       }
@@ -931,20 +956,19 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
         "Content-Type": "application/json",
         "anthropic-version": "2023-06-01",
         "Accept": parsed.stream ? "text/event-stream" : "application/json",
-        "User-Agent": "@anthropic-ai/sdk/0.74.0",
+        "User-Agent": getClaudeCodeUserAgent(),
       };
       if (isOAuth) {
-        headers["Authorization"] = `Bearer ${provider.apiKey}`;
+        headers["Authorization"] = `Bearer ${accessToken}`;
         headers["anthropic-beta"] = ANTHROPIC_OAUTH_BETA;
-        // Match the real Claude Code CLI request fingerprint: a valid OAuth token with an empty
-        // header set is a non-first-party signature. (cch billing-header signing is intentionally
-        // out of scope — brittle and version-coupled.)
-        Object.assign(headers, CLAUDE_CODE_HEADERS);
-        headers["X-Claude-Code-Session-Id"] = claudeCodeSessionId(provider.apiKey);
+        headers["x-app"] = "cli";
+        headers["X-Claude-Code-Session-Id"] = claudeCodeSessionId();
         headers["x-client-request-id"] = crypto.randomUUID();
       } else {
-        if (anthropicKeyUsesBearer(provider)) headers["Authorization"] = `Bearer ${provider.apiKey}`;
-        else headers["x-api-key"] = provider.apiKey;
+        const apiKey = provider.apiKey;
+        if (typeof apiKey !== "string") throw new Error("anthropic provider requires a non-empty apiKey (authMode: key)");
+        if (anthropicKeyUsesBearer(provider)) headers["Authorization"] = `Bearer ${apiKey}`;
+        else headers["x-api-key"] = apiKey;
       }
       if (provider.headers) Object.assign(headers, provider.headers);
 

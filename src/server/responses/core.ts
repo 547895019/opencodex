@@ -552,6 +552,7 @@ async function retryCodexPoolOnAlternateAccount(
   const retryAdapter = resolveAdapter(
     resolveWireProtocolOverride(route.providerName, route.modelId, retryProvider, inboundWire),
     config.cacheRetention,
+    route.providerName,
   );
   bindRouteReasoningReplayScope({
     parsed,
@@ -2065,7 +2066,7 @@ async function handleResponsesInner(
     logCtx.provider = route.providerName;
     delete logCtx.accountLogLabel;
   }
-  const adapter = resolveAdapter(adapterProvider, config.cacheRetention);
+  const adapter = resolveAdapter(adapterProvider, config.cacheRetention, route.providerName);
   bindRouteReasoningReplayScope({
     parsed,
     providerName: route.providerName,
@@ -3054,6 +3055,7 @@ async function handleResponsesInner(
         const rotatedAdapter = resolveAdapter(
           resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
           config.cacheRetention,
+          route.providerName,
         );
         bindRouteReasoningReplayScope({
           parsed,
@@ -3132,6 +3134,7 @@ async function handleResponsesInner(
         const rotatedAdapter = resolveAdapter(
           resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
           config.cacheRetention,
+          route.providerName,
         );
         bindRouteReasoningReplayScope({
           parsed,
@@ -3319,6 +3322,7 @@ async function handleResponsesInner(
         const rotatedAdapter = resolveAdapter(
           resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
           config.cacheRetention,
+          route.providerName,
         );
         bindRouteReasoningReplayScope({
           parsed,
@@ -3539,6 +3543,7 @@ async function handleResponsesInner(
         activeAdapter = resolveAdapter(
           resolveWireProtocolOverride(route.providerName, route.modelId, refreshedProvider, inboundWire),
           config.cacheRetention,
+          route.providerName,
         );
         bindRouteReasoningReplayScope({
           parsed,
@@ -3611,6 +3616,7 @@ async function handleResponsesInner(
         activeAdapter = resolveAdapter(
           resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
           config.cacheRetention,
+          route.providerName,
         );
         bindRouteReasoningReplayScope({
           parsed,
@@ -3648,9 +3654,10 @@ async function handleResponsesInner(
           promoteAnthropicActiveAccount(nextAccountId);
           logCtx.provider = formatAnthropicProviderForLog("anthropic", nextAccountId, config);
           activeAdapter = resolveAdapter(
-            resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
-            config.cacheRetention,
-          );
+          resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
+          config.cacheRetention,
+          route.providerName,
+        );
           sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, activeAdapter.name, logCtx.accountLogLabel);
           const result = await rebuildAndRefetch("anthropic-oauth-429");
           if ("failed" in result) return result.failed;
@@ -3966,9 +3973,10 @@ async function handleResponsesInner(
           route.provider = rotated;
           invalidateSameTargetRequest();
           activeAdapter = resolveAdapter(
-            resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
-            config.cacheRetention,
-          );
+          resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
+          config.cacheRetention,
+          route.providerName,
+        );
           bindRouteReasoningReplayScope({
             parsed,
             providerName: route.providerName,
@@ -4002,9 +4010,10 @@ async function handleResponsesInner(
             promoteAnthropicActiveAccount(nextAccountId);
             logCtx.provider = formatAnthropicProviderForLog("anthropic", nextAccountId, config);
             activeAdapter = resolveAdapter(
-              resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
-              config.cacheRetention,
-            );
+          resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
+          config.cacheRetention,
+          route.providerName,
+        );
             sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, activeAdapter.name, logCtx.accountLogLabel);
             nextContinuationRecoveryKind = "anthropic-oauth-429";
             continue;

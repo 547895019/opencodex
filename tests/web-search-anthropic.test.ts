@@ -3,7 +3,16 @@ import * as oauthModule from "../src/oauth";
 
 // Stub the stored-OAuth token fetch so the anthropic executor request-shape test is deterministic
 // and never touches the real credential store or network (mirrors tests/destination-policy-resolved).
-mock.module("../src/oauth", () => ({ ...oauthModule, getValidAccessToken: async () => "test-token-xyz" }));
+mock.module("../src/oauth", () => ({
+  ...oauthModule,
+  getValidAccessToken: async () => "test-token-xyz",
+  getValidAccessTokenSnapshot: async () => ({
+    provider: "anthropic",
+    accountId: "00000000-0000-4000-8000-000000000003",
+    generation: "g1",
+    accessToken: "test-token-xyz",
+  }),
+}));
 
 import { parseRequest } from "../src/responses/parser";
 import {
@@ -12,7 +21,11 @@ import {
   resolveSidecarBackend,
 } from "../src/web-search";
 import { parseAnthropicSidecarSSE, runAnthropicWebSearch } from "../src/web-search/anthropic-executor";
-import { CLAUDE_CODE_SYSTEM_INSTRUCTION } from "../src/oauth/anthropic";
+import {
+  getAttributionHeader,
+  getClaudeCodeSystemPrefix,
+  getOpenCodexVersion,
+} from "../src/adapters/client-fingerprint";
 import type { OcxConfig, OcxProviderConfig } from "../src/types";
 
 const routedProvider: OcxProviderConfig = { adapter: "openai-chat", baseUrl: "https://routed.test/v1", apiKey: "routed-key" };
@@ -171,7 +184,7 @@ describe("runAnthropicWebSearch request shape", () => {
     let captured: { url: string; headers: Record<string, string>; body: Record<string, unknown> } | null = null;
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       const headers: Record<string, string> = {};
-      new Headers(init?.headers).forEach((v, k) => { headers[k] = v; });
+      new Headers(init?.headers).forEach((v, k) => { headers[k.toLowerCase()] = v; });
       captured = { url: String(url), headers, body: JSON.parse(String(init?.body)) };
       const ok = sseResponse([
         { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
@@ -194,15 +207,21 @@ describe("runAnthropicWebSearch request shape", () => {
     const c = captured!;
     expect(c.url).toBe("https://api.anthropic.com/v1/messages");
     expect(c.headers["authorization"]).toBe("Bearer test-token-xyz");
-    expect(c.headers["anthropic-beta"]).toContain("oauth");
+    expect(c.headers["anthropic-beta"]).toBe("oauth-2025-04-20");
     expect(c.headers["anthropic-version"]).toBe("2023-06-01");
     expect(c.headers["x-app"]).toBe("cli");
+    expect(c.headers["user-agent"]).toBe(`claude-cli/${getOpenCodexVersion()}`);
     expect(c.headers["x-claude-code-session-id"]).toBeDefined();
     expect(c.body.model).toBe("claude-sonnet-5");
     expect(c.body.max_tokens).toBe(8192);
     expect(c.body.thinking).toEqual({ type: "disabled" });
     const system = c.body.system as { type: string; text: string }[];
-    expect(system[0]).toEqual({ type: "text", text: CLAUDE_CODE_SYSTEM_INSTRUCTION });
+    expect(system[0].text).toBe(getAttributionHeader("f48"));
+    expect(system[1].text).toBe(getClaudeCodeSystemPrefix());
+    expect(system[2].text).toContain("web_search");
+    const userId = JSON.parse(c.body.metadata.user_id as string) as { device_id: string; account_uuid: string; session_id: string };
+    expect(userId.account_uuid).toBe("00000000-0000-4000-8000-000000000003");
+    expect(userId.session_id).toBe(c.headers["x-claude-code-session-id"]);
     const tools = c.body.tools as { type: string; name: string; max_uses: number }[];
     expect(tools[0]).toEqual({ type: "web_search_20250305", name: "web_search", max_uses: 3 });
   });

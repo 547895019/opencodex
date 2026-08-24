@@ -82,7 +82,7 @@ export async function describeImageRouted(
   const adapterProvider = resolveWireProtocolOverride(route.providerName, route.modelId, provider);
   let adapter;
   try {
-    adapter = resolveAdapter(adapterProvider, config.cacheRetention);
+    adapter = resolveAdapter(adapterProvider, config.cacheRetention, route.providerName);
   } catch (e) {
     return { text: "", error: `routed vision sidecar: ${e instanceof Error ? e.message : String(e)}` };
   }

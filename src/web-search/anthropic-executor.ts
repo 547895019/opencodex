@@ -1,7 +1,15 @@
 import type { OcxProviderConfig } from "../types";
-import { getValidAccessToken } from "../oauth";
+import { getValidAccessToken, getValidAccessTokenSnapshot } from "../oauth";
 import { ANTHROPIC_OAUTH_BETA, CLAUDE_CODE_SYSTEM_INSTRUCTION } from "../oauth/anthropic";
-import { CLAUDE_CODE_HEADERS, claudeCodeSessionId } from "../adapters/client-fingerprint";
+import {
+  claudeCodeSessionId,
+  computeFingerprint,
+  getAttributionHeader,
+  getClaudeCodeSystemPrefix,
+  getClaudeCodeUserAgent,
+  getOpenCodexVersion,
+  getOrCreateDeviceId,
+} from "../adapters/client-fingerprint";
 import { signalWithTimeout, cancelBodyOnAbort } from "../lib/abort";
 import { redactSecretString } from "../lib/redact";
 import { sidecarEnter } from "../lib/sidecar-tracker";
@@ -124,8 +132,15 @@ export async function runAnthropicWebSearch(
   const base = provider.baseUrl.replace(/\/v1\/?$/, "");
   const url = `${base}/v1/messages`;
   let token: string;
+  let accountId: string | undefined;
   try {
-    token = await getValidAccessToken(providerName);
+    const snapshot = await getValidAccessTokenSnapshot(providerName).catch(() => undefined);
+    if (snapshot?.accessToken) {
+      token = snapshot.accessToken;
+      accountId = snapshot.accountId;
+    } else {
+      token = await getValidAccessToken(providerName);
+    }
   } catch (e) {
     return { text: "", sources: [], error: `anthropic sidecar auth failed: ${e instanceof Error ? e.message : String(e)}` };
   }
@@ -133,29 +148,38 @@ export async function runAnthropicWebSearch(
     "Content-Type": "application/json",
     "anthropic-version": "2023-06-01",
     "Accept": "text/event-stream",
-    "User-Agent": "@anthropic-ai/sdk/0.74.0",
+    "User-Agent": getClaudeCodeUserAgent(),
     "Authorization": `Bearer ${token}`,
     "anthropic-beta": ANTHROPIC_OAUTH_BETA,
-    ...CLAUDE_CODE_HEADERS,
-    "X-Claude-Code-Session-Id": claudeCodeSessionId(token),
+    "x-app": "cli",
+    "X-Claude-Code-Session-Id": claudeCodeSessionId(),
     "x-client-request-id": crypto.randomUUID(),
   };
   if (provider.headers) Object.assign(headers, provider.headers);
 
   const instruction = settings.describeImages ? BASE_INSTRUCTION + IMAGE_INSTRUCTION : BASE_INSTRUCTION;
+  const fingerprint = computeFingerprint(query, getOpenCodexVersion());
   const body = {
     model: settings.model,
     max_tokens: ANTHROPIC_MAX_TOKENS,
     // sonnet-5 defaults to adaptive thinking when omitted; keep the sidecar fast/cheap (audit F2).
     thinking: { type: "disabled" },
-    // OAuth fingerprint requires the Claude Code identity as the FIRST system block (audit F6/anthropic.ts).
+    // First-party fingerprinting: attribution header first, then CLI prefix, then task instruction.
     system: [
-      { type: "text", text: CLAUDE_CODE_SYSTEM_INSTRUCTION },
+      { type: "text", text: getAttributionHeader(fingerprint) },
+      { type: "text", text: getClaudeCodeSystemPrefix({ isNonInteractive: false, hasAppendSystemPrompt: false }) },
       { type: "text", text: instruction },
     ],
     messages: [{ role: "user", content: [{ type: "text", text: query }] }],
     tools: [{ type: "web_search_20250305", name: "web_search", max_uses: ANTHROPIC_MAX_USES }],
     stream: true,
+    metadata: {
+      user_id: JSON.stringify({
+        device_id: getOrCreateDeviceId(),
+        account_uuid: accountId ?? "",
+        session_id: claudeCodeSessionId(),
+      }),
+    },
   };
 
   const linkedSignal = signalWithTimeout(settings.timeoutMs, abortSignal);
