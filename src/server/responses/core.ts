@@ -239,6 +239,7 @@ import { createRoutedCustomToolRestoreBlockRewrite } from "../responses-custom-t
 import { createGithubCopilotResponsesBlockRewrite } from "../github-copilot-responses-repair";
 import { responsesJsonToSseStream } from "../responses-json-events";
 import { guardTerminalEventStream } from "./terminal-guard";
+import { guardUndeclaredToolCalls } from "./undeclared-tool-guard";
 
 /**
  * Adapters whose continuation state must survive Codex's store:false requests.
@@ -4079,15 +4080,24 @@ async function handleResponsesInner(
 
   if (parsed.stream) {
     const initialEventStream = activeAdapter.parseStream(upstreamResponse, translatorBudget);
+    // Undeclared-tool guard: swallow the FIRST hallucinated neighbor-agent tool call
+    // (e.g. Claude Code's "Grep") and re-ask once with a corrective note, instead of
+    // failing the turn closed. Second offense keeps the bridge's fail-closed 502.
+    const guardedStream = guardUndeclaredToolCalls(
+      parsed,
+      toolBridgeMaps.declaredToolNames,
+      initialEventStream,
+      fetchTerminalGuardContinuation,
+    );
     const eventStream = terminalGuardEnabled
       ? guardTerminalEventStream({
           parsed,
-          firstEvents: initialEventStream,
+          firstEvents: guardedStream,
           adapterName: activeAdapter.name,
           maxAutoContinuations: 1,
           continuation: fetchTerminalGuardContinuation,
         })
-      : initialEventStream;
+      : guardedStream;
     const { toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, toolSearchToolNames } = toolBridgeMaps;
     const sseStream = bridgeToResponsesSSE(
       eventStream, parsed._responseModelId ?? parsed.modelId, toolNsMap, freeformToolNames, toolSearchToolNames,
@@ -4135,17 +4145,24 @@ async function handleResponsesInner(
     let events: AdapterEvent[];
     try {
       const initialEvents = await activeAdapter.parseResponse(upstreamResponse, translatorBudget);
+      const guardedEvents = guardUndeclaredToolCalls(
+        parsed,
+        toolBridgeMaps.declaredToolNames,
+        (async function* () { yield* initialEvents; })(),
+        fetchTerminalGuardContinuation,
+      );
       if (terminalGuardEnabled) {
         events = [];
         for await (const event of guardTerminalEventStream({
           parsed,
-          firstEvents: (async function* () { yield* initialEvents; })(),
+          firstEvents: guardedEvents,
           adapterName: activeAdapter.name,
           maxAutoContinuations: 1,
           continuation: fetchTerminalGuardContinuation,
         })) events.push(event);
       } else {
-        events = initialEvents;
+        events = [];
+        for await (const event of guardedEvents) events.push(event);
       }
     } finally {
       cleanupUpstreamAbort();
