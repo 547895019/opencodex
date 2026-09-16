@@ -31,17 +31,23 @@ export function enabledVisionBackends(
   config: OcxConfig,
   anthropicSidecar: AnthropicVisionProvider | undefined,
 ): VisionSidecarBackend[] {
-  const backends: VisionSidecarBackend[] = [];
+  // The routed backend lets any configured provider/model describe images. It is
+  // ALWAYS offered: gating it on `visionSidecar.backend === "routed"` created a
+  // one-way ratchet — picking any OpenAI model rewrote the backend to "openai",
+  // which removed every non-OpenAI row from the picker, so the operator could
+  // never switch back without hand-editing config. Selection still pins the
+  // backend at write time (the GUI sends the option's backend with the model),
+  // so runtime dispatch is unchanged; only suggestion coverage is unconditional.
+  const backends: VisionSidecarBackend[] = ["routed"];
   // The OpenAI describer needs a CANONICAL ChatGPT forward provider, not merely a
   // provider keyed "openai" — same predicate the runtime sidecar resolver uses.
   if (listOpenAiForwardSidecarCandidates(config).length > 0) backends.push("openai");
   if (anthropicSidecar) backends.push("anthropic");
-  // The routed backend lets any configured provider/model describe images. It is
-  // enabled when the operator has explicitly selected it in the sidecar config.
-  if (config.visionSidecar?.backend === "routed") backends.push("routed");
-  // Neither side resolvable (fresh install, no login): fall back to both so the
-  // picker is populated rather than empty, matching the permissive-unknown rule.
-  return backends.length > 0 ? backends : ["openai", "anthropic"];
+  // Neither OpenAI nor Anthropic resolvable (fresh install, no login): still
+  // offer both baselines so the picker is populated rather than empty, matching
+  // the permissive-unknown rule. (Routed alone yields no rows until a describer
+  // model is configured.)
+  return backends.length > 1 ? backends : ["openai", "anthropic", "routed"];
 }
 
 /** Visible catalog rows in the shape the eligibility predicate consumes. */

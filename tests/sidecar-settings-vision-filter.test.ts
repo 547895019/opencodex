@@ -312,4 +312,42 @@ describe("sidecar-settings vision model filter", () => {
     expect(response?.status).toBe(200);
     expect(config.webSearchSidecar?.model).toBe("o3-mini");
   });
+
+  test("15. routed rows stay visible while backend is openai (no one-way ratchet)", async () => {
+    // Regression guard for the picker ratchet: with backend:"openai", the routed
+    // backend used to be disabled, so every non-OpenAI catalog row vanished the
+    // moment an OpenAI model was picked and could never come back through the GUI.
+    // The routed backend is now unconditional; backend selection still happens at
+    // write time (the client sends the option's backend with the model).
+    const rowsSpy = spyOn(modelRows, "listManagementModelRows").mockResolvedValue([
+      {
+        // glm-4.6, not glm-5.3: the zai registry entry lists glm-5.3 in
+        // noVisionModels (it is a consumer of descriptions), which would fail
+        // this test for an unrelated reason.
+        provider: "zai",
+        id: "glm-4.6",
+        namespaced: "zai/glm-4.6",
+        disabled: false,
+        inputModalities: ["text", "image"],
+      },
+    ]);
+    try {
+      const config = emptyConfig({
+        visionSidecar: { model: "gpt-5.6-luna", backend: "openai" },
+        providers: { zai: { adapter: "openai-chat", authMode: "key", baseUrl: "https://api.z.ai" } },
+      });
+      const response = await getSidecarSettings(config);
+      expect(response.status).toBe(200);
+      const body = await response.json() as {
+        vision: { backend?: string };
+        visionModels: Array<{ value: string; backend: string }>;
+      };
+      expect(body.vision.backend).toBe("openai");
+      // A routed row from any configured provider appears even though the active
+      // backend is openai, so the operator can always switch back via the picker.
+      expect(body.visionModels).toContainEqual(expect.objectContaining({ value: "zai/glm-4.6", backend: "routed" }));
+    } finally {
+      rowsSpy.mockRestore();
+    }
+  });
 });
