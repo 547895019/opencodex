@@ -27,7 +27,10 @@ export interface CodexWarmupOptions {
 
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const DEFAULT_MODEL = "gpt-5.4-mini";
-const FALLBACK_MODELS = ["gpt-5.5"];
+// Some accounts reject specific warmup models with 400 (e.g. "The 'gpt-5.5' model is not
+// supported when using Codex with a ChatGPT account"). gpt-5.6-luna is the current Codex
+// helper surface (Codex 0.145.0+ sidecar model), so try it before the older gpt-5.5.
+const FALLBACK_MODELS = ["gpt-5.6-luna", "gpt-5.5"];
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_ERROR_BODY_BYTES = 2048;
 
@@ -171,22 +174,25 @@ async function tryWarmup(options: CodexWarmupOptions, model: string): Promise<vo
 
 export async function warmCodexAccount(options: CodexWarmupOptions): Promise<void> {
   const primaryModel = options.model?.trim() || DEFAULT_MODEL;
-  try {
-    await tryWarmup(options, primaryModel);
-    return;
-  } catch (err) {
-    // Retry with fallback models on 400 (model may not be available for this account).
-    if (!(err instanceof CodexWarmupError) || err.status !== 400) throw err;
-    let lastErr = err;
-    for (const fallback of FALLBACK_MODELS) {
-      if (fallback === primaryModel) continue;
-      try {
-        await tryWarmup(options, fallback);
-        return;
-      } catch (retryErr) {
-        if (retryErr instanceof CodexWarmupError) lastErr = retryErr;
-      }
+  const models = [primaryModel, ...FALLBACK_MODELS.filter(model => model !== primaryModel)];
+  let first400: CodexWarmupError | undefined;
+  const rejections: string[] = [];
+  for (const model of models) {
+    try {
+      await tryWarmup(options, model);
+      return;
+    } catch (err) {
+      // Retry with fallback models on 400 (model may not be available for this account).
+      if (!(err instanceof CodexWarmupError) || err.status !== 400) throw err;
+      first400 ??= err;
+      rejections.push(`${model}: ${err.upstreamDetail ?? err.code}`);
     }
-    throw lastErr;
   }
+  // Every candidate model was rejected with 400. Surface each model's rejection so the
+  // message names what was tried instead of only the last fallback's upstream detail.
+  throw new CodexWarmupError(first400!.code, "Codex warmup was rejected", {
+    status: first400!.status,
+    cause: first400,
+    upstreamDetail: rejections.join("; ").slice(0, 512),
+  });
 }

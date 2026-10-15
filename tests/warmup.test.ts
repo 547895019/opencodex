@@ -74,7 +74,7 @@ describe("codex warmup improvements", () => {
         return new Response(JSON.stringify({ detail: "unknown model" }), { status: 400 });
       }
 
-      if (body.model === "gpt-5.5") return sseResponse();
+      if (body.model === "gpt-5.6-luna") return sseResponse();
       return new Response("unexpected model", { status: 500 });
     });
     const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fetchMock as unknown as typeof fetch);
@@ -86,6 +86,54 @@ describe("codex warmup improvements", () => {
     }
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(parsedBodies.map(body => body.model)).toEqual(["gpt-5.4-mini", "gpt-5.5"]);
+    expect(parsedBodies.map(body => body.model)).toEqual(["gpt-5.4-mini", "gpt-5.6-luna"]);
+  });
+
+  test("warmCodexAccount falls back to gpt-5.5 when gpt-5.6-luna is also rejected with 400", async () => {
+    const parsedBodies: Record<string, unknown>[] = [];
+    const fetchMock = mock(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      parsedBodies.push(body);
+
+      if (body.model === "gpt-5.5") return sseResponse();
+      return new Response(JSON.stringify({
+        error: { message: `The '${body.model}' model is not supported when using Codex with a ChatGPT account.` },
+      }), { status: 400 });
+    });
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fetchMock as unknown as typeof fetch);
+
+    try {
+      await warmCodexAccount({ accessToken: "access-test", chatgptAccountId: "acct-test" });
+    } finally {
+      fetchSpy.mockRestore();
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(parsedBodies.map(body => body.model)).toEqual(["gpt-5.4-mini", "gpt-5.6-luna", "gpt-5.5"]);
+  });
+
+  test("warmCodexAccount aggregates per-model rejections when every candidate gets 400", async () => {
+    const fetchMock = mock(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        error: { message: `The '${body.model}' model is not supported when using Codex with a ChatGPT account.` },
+      }), { status: 400 });
+    });
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fetchMock as unknown as typeof fetch);
+
+    try {
+      await warmCodexAccount({ accessToken: "access-test", chatgptAccountId: "acct-test" });
+      throw new Error("expected warmup to reject");
+    } catch (err) {
+      expect(err).toBeInstanceOf(CodexWarmupError);
+      expect((err as CodexWarmupError).status).toBe(400);
+      const detail = (err as CodexWarmupError).upstreamDetail ?? "";
+      for (const model of ["gpt-5.4-mini", "gpt-5.6-luna", "gpt-5.5"]) {
+        expect(detail).toContain(model);
+      }
+      expect(codexWarmupFailureReason(err)).toContain("gpt-5.6-luna");
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });
