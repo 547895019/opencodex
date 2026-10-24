@@ -1,58 +1,43 @@
 /**
  * First-party client fingerprints.
  *
- * These helpers make opencodex's Anthropic OAuth requests structurally match the real
- * Claude Code CLI's request signature: User-Agent, per-process session id, attribution
- * header (with fingerprint and native-client attestation placeholder), CLI system prefix,
- * and request metadata.
+ * Routed OAuth providers reject — or quietly flag — requests whose header signature doesn't match
+ * the real first-party client that minted the token. Sending a valid OAuth token with an empty
+ * header set (or a giveaway literal UA like "antigravity") is a non-first-party signature. These
+ * constants mirror the headers the real Claude Code CLI and Antigravity CLI send, so the proxy's
+ * request fingerprint matches the credential.
  *
- * The `cch=00000` placeholder in the attribution header is what real Claude Code sends
- * before Bun's native HTTP stack overwrites it with a cryptographic attestation token.
- * opencodex cannot compute the real token, so we send the same placeholder to keep the
- * string-level signature identical.
+ * Pinned versions live HERE (single source) so they're trivial to bump. Values that need a live
+ * manifest fetch (Antigravity auto-updater) or a cryptographic billing signature (Claude cch) are
+ * intentionally NOT modeled — those are brittle and a wrong guess does more harm than the gap.
  */
-import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { execSync } from "node:child_process";
-import { assertNotRealHomeUnderTest } from "../lib/test-home-guard";
-import type { OcxMessage, OcxTextContent, OcxUserMessage } from "../types";
+import { createHash } from "node:crypto";
 
-// ── Version / User-Agent ──
-
-/** Fixed fallback version that matches the first-party Claude Code CLI major family. */
-const CLAUDE_CODE_VERSION_FALLBACK = "2.1.232";
-
-/** Cache for the resolved Claude Code version. */
-let resolvedClaudeCodeVersion: string | undefined;
+// ── Claude Code CLI (matches Claude Code 2.1.63 / @anthropic-ai/sdk 0.74.0) ──
+export const CLAUDE_CODE_HEADERS: Record<string, string> = {
+  "X-App": "cli",
+  "X-Stainless-Retry-Count": "0",
+  "X-Stainless-Runtime": "node",
+  "X-Stainless-Lang": "js",
+  "X-Stainless-Timeout": "600",
+  "X-Stainless-Arch": process.arch,
+  "X-Stainless-OS": process.platform,
+  "X-Stainless-Package-Version": "0.74.0",
+  "X-Stainless-Runtime-Version": process.version.slice(1),
+};
 
 /**
- * Resolve the version used in `cc_version`. Prefer the locally installed `claude` CLI version
- * when available; otherwise fall back to a fixed first-party version.
- *
- * Note: this intentionally does NOT read opencodex's own package.json. The attribution header
- * is meant to match Anthropic's first-party client signature, and a mismatched proxy version
- * would stand out at the API boundary.
+ * Stable per-credential session id, matching Claude Code's `X-Claude-Code-Session-Id`. Real Claude
+ * Code keeps one session id per CLI session; we derive a deterministic UUIDv4-shaped id from the
+ * OAuth token so it stays stable across a conversation's turns without persisting state. The token
+ * itself never leaves this function (only its hash drives the id).
  */
-export function getOpenCodexVersion(): string {
-  if (resolvedClaudeCodeVersion) return resolvedClaudeCodeVersion;
-
-  let version: string | undefined;
-  try {
-    version = execSync("claude --version", { encoding: "utf8", stdio: ["pipe", "pipe", "ignore"], timeout: 2000 }).trim();
-    // The CLI prints either "2.1.232" or "2.1.232 (Claude Code)"; keep the leading numeric part.
-    const match = /^(\d+\.\d+\.\d+)/.exec(version);
-    if (match) version = match[1];
-  } catch {
-    /* fall through */
-  }
-
-  if (!version || !/^\d+\.\d+\.\d+/.test(version)) {
-    version = CLAUDE_CODE_VERSION_FALLBACK;
-  }
-
-  resolvedClaudeCodeVersion = version;
-  return version;
+export function claudeCodeSessionId(token: string | undefined): string {
+  const seed = token && token.length > 0 ? token : "opencodex-anon";
+  const h = createHash("sha256").update(`claude-code-session:${seed}`, "utf8").digest("hex");
+  // Shape the hash into a v4-looking UUID (version nibble 4, variant nibble 8-b).
+  const variant = ((parseInt(h[16], 16) & 0x3) | 0x8).toString(16);
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
 
 // ── Antigravity IDE ──
@@ -60,7 +45,6 @@ export function getOpenCodexVersion(): string {
 export const ANTIGRAVITY_IDE_VERSION = "2.5.5";
 const ANTIGRAVITY_IDE_CLIENT_NAME = "aidev_client";
 const ANTIGRAVITY_IDE_PLATFORM = "windows/amd64";
-
 
 /**
  * Real Antigravity IDE User-Agent format, decompiled from 2.5.5 Go LS (`setHeaders` @ `0x1018fbe00`):

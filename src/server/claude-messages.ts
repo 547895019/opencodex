@@ -33,7 +33,11 @@ import { resolveAlias, claudeCodeNativeAlias, legacyAliasForNative } from "../cl
 import { recordDesktopRequest } from "../claude/desktop-health";
 import { stripOneMillionMarker } from "../claude/context-windows";
 import { captureClaudeInbound } from "../claude/inbound-debug";
-import { capturePromptInbound } from "../lib/prompt-capture";
+import { declaredAnthropicServerTools, replayedAnthropicServerBlocks } from "../claude/inbound-content-options";
+import { claudeCodeForIngress } from "../claude/intercept/model-bindings";
+import { classifyInterceptClient } from "../claude/intercept/client-class";
+import { analyzeClaudeCompatibility, isClaudeCompatibilityMode } from "../claude/compatibility";
+import { carriesMessageThread, messageThreadUnsupportedResponse } from "../claude/message-threads";
 import {
   applyReplayRefusalClientHeaders,
   carryReplayRefusal,
@@ -42,11 +46,6 @@ import {
   REPLAY_REFUSED_STATUS,
   UPSTREAM_RESET_REPLAY_REFUSED_CODE,
 } from "../lib/upstream-retry";
-import { declaredAnthropicServerTools, replayedAnthropicServerBlocks } from "../claude/inbound-content-options";
-import { claudeCodeForIngress } from "../claude/intercept/model-bindings";
-import { classifyInterceptClient } from "../claude/intercept/client-class";
-import { analyzeClaudeCompatibility, isClaudeCompatibilityMode } from "../claude/compatibility";
-import { carriesMessageThread, messageThreadUnsupportedResponse } from "../claude/message-threads";
 import { isClientClosedMessage, recognizedUpstreamError, UNDECLARED_TOOL_CALL_ERROR_CODE } from "../lib/errors";
 import { resolveClientRetryAfter } from "../lib/retry-after";
 import { anthropicRateLimitHeaders } from "./anthropic-rate-limit-headers";
@@ -664,13 +663,6 @@ async function handleClaudeMessagesWithBudget(
         : undefined,
       req.headers.get("anthropic-beta") ?? undefined,
     );
-    capturePromptInbound("claude-messages", anthropicBody, {
-      resolvedModel:
-        isRec(anthropicBody) && typeof anthropicBody.model === "string"
-          ? resolveInboundModel(anthropicBody.model, config.claudeCode)
-          : undefined,
-      headers: req.headers,
-    });
     // Client surface discrimination: Desktop 3P aliases resolve through the
     // desktop registry; Code uses readable aliases or direct model names. The CLI's first-party
     // picker also offers registry aliases, so a CLI-classified User-Agent stays the Code surface.

@@ -177,133 +177,210 @@ function clamp(s: string, max: number): string {
 }
 
 
-/** First enabled Anthropic OAuth provider whose active stored account is not marked for reauth. */
-export function findAnthropicVisionProvider(config: OcxConfig): AnthropicVisionProvider | undefined {
-  for (const [providerName, provider] of Object.entries(config.providers)) {
-    if (provider.disabled === true || provider.adapter !== "anthropic" || provider.authMode !== "oauth") continue;
-    const accountSet = getAccountSet(providerName);
-    const active = accountSet?.accounts.find(account => account.id === accountSet.activeAccountId);
-    if (active && active.needsReauth !== true) return { providerName, provider };
+
+interface ImageJob {
+  imageUrl: string;
+  detail?: string;
+  contextText: string;
+}
+
+/** Render one describe outcome as the replacement text part (clamped to the per-image budget). */
+function renderDescription(out: { text: string; error?: string }): OcxTextContent {
+  return {
+    type: "text",
+    text: out.error
+      ? `[An image was attached but could not be processed: ${out.error}]`
+      : `[Image content — described by a vision model because you cannot see images directly:\n${clamp(out.text.trim(), DESC_MAX_CHARS)}]`,
+  };
+}
+
+
+function sha256(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function normalizedContext(contextText: string): string {
+  return contextText.trim().replace(/\s+/g, " ");
+}
+
+function descriptionIdentity(job: ImageJob, plan: VisionPlan): { key: string; persistent: boolean } {
+  let imageHash: string;
+  let persistent = false;
+  const data = /^data:[^;,]+;base64,(.*)$/s.exec(job.imageUrl);
+  if (data) {
+    imageHash = sha256(Buffer.from(data[1], "base64"));
+    persistent = true;
+  } else {
+    imageHash = sha256(job.imageUrl);
   }
-  return undefined;
+  return {
+    key: JSON.stringify([
+      plan.backend,
+      plan.settings.model,
+      // Explicit identity: the resolved pool and reasoning. Settings that only gate or bound the call
+      // (enabled, timeoutMs, maxDescriptionsPerTurn) never split the cache.
+      ...(plan.backend === "anthropic" ? [plan.anthropicSidecar?.providerName ?? null, plan.settings.reasoning] : []),
+      ...(plan.backend === "openai" ? [plan.settings.reasoning] : []),
+      job.detail ?? "high",
+      imageHash,
+      sha256(normalizedContext(job.contextText)),
+    ]),
+    persistent,
+  };
 }
 
-export function resolveVisionBackend(
-  explicit: "openai" | "anthropic" | "routed" | undefined,
-  anthropicSidecar: AnthropicVisionProvider | undefined,
-): "openai" | "anthropic" | "routed" {
-  if (explicit === "openai" || explicit === "anthropic" || explicit === "routed") return explicit;
-  return anthropicSidecar ? "anthropic" : "openai";
-}
-
-/** Native model used by the OpenAI vision helper, including its bounded default. */
-export function resolveOpenAiVisionModel(config: Pick<OcxConfig, "visionSidecar">): string {
-  return config.visionSidecar?.model || DEFAULT_VISION_MODEL;
-}
-
-/** Effective describer model for the backend `planVisionSidecar` selected. */
-export function resolveEffectiveVisionModel(
-  config: Pick<OcxConfig, "visionSidecar">,
-  backend: "openai" | "anthropic",
-): string {
-  return backend === "anthropic"
-    ? config.visionSidecar?.model || DEFAULT_ANTHROPIC_VISION_MODEL
-    : resolveOpenAiVisionModel(config);
-}
-
-/** A user/developer/toolResult message can carry images (toolResult: e.g. Codex view_image output). */
-function carriesImages(role: string): boolean {
-  return role === "user" || role === "developer" || role === "toolResult";
-}
-
-export function messagesHaveImage(parsed: OcxParsedRequest): boolean {
-  return parsed.context.messages.some(m =>
-    carriesImages(m.role) && Array.isArray(m.content) && (m.content as OcxContentPart[]).some(p => p.type === "image"));
-}
-
-export function shouldResolveOpenAiVisionSidecar(
-  config: OcxConfig,
-  provider: OcxProviderConfig,
-  modelId: string,
-  parsed: OcxParsedRequest,
-): boolean {
-  if (!modelInList(provider.noVisionModels, modelId) || !messagesHaveImage(parsed)) return false;
-  const cfg = config.visionSidecar ?? {};
-  if (cfg.enabled === false) return false;
-  return resolveVisionBackend(cfg.backend, findAnthropicVisionProvider(config)) === "openai";
-}
-
-export interface VisionPlan {
-  backend: "openai" | "anthropic" | "routed";
-  forwardSidecar?: ResolvedOpenAiForwardSidecar;
-  anthropicSidecar?: AnthropicVisionProvider;
-  /** For `backend:"routed"`: the routed model id to describe images through (cfg.model). */
-  routedModel?: string;
-  settings: VisionSettings;
-  maxDescriptionsPerTurn: number;
+async function executeDescription(
+  job: ImageJob,
+  plan: VisionPlan,
+  selectedForwardHeaders: Headers,
+  abortSignal?: AbortSignal,
+  recordSidecarOutcome?: SidecarOutcomeRecorder,
+): Promise<DescribeOutcome> {
+  if (plan.backend === "routed") {
+    if (!plan.routedModel || !plan.routedConfig) return { text: "", error: "routed vision sidecar is unavailable" };
+    return describeImageRouted(
+      job.imageUrl,
+      job.detail,
+      job.contextText,
+      plan.routedModel,
+      plan.routedConfig,
+      plan.settings,
+      abortSignal,
+    );
+  }
+  if (plan.backend === "anthropic") {
+    const sidecar = plan.anthropicSidecar;
+    if (!sidecar) return { text: "", error: "anthropic vision sidecar is unavailable" };
+    return describeImageAnthropic(
+      job.imageUrl,
+      job.detail,
+      job.contextText,
+      sidecar.providerName,
+      sidecar.provider,
+      plan.settings,
+      abortSignal,
+      sidecar.config,
+    );
+  }
+  if (!plan.forwardSidecar) return { text: "", error: "OpenAI vision sidecar is unavailable" };
+  return describeImage(
+    job.imageUrl,
+    job.detail,
+    job.contextText,
+    plan.forwardSidecar.provider,
+    plan.forwardSidecar.headers,
+    plan.settings,
+    abortSignal,
+    recordSidecarOutcome,
+    plan.forwardSidecar.beforeDispatch,
+  );
 }
 
 /**
- * Decide whether the vision sidecar should pre-describe images for this request, returning the plan
- * if so. Active when: the routed model is in `provider.noVisionModels`, the request actually carries
- * an image, the sidecar isn't disabled, and the selected backend has usable auth. Returns undefined
- * otherwise (the caller strips images before sending to a text-only model).
+ * Replace every image part in the request with a gpt-described text part, so a text-only model can
+ * reason about it. Mutates `parsed.context.messages` in place; uses the message's own text as the
+ * description context. All images are described with bounded concurrency (not serially) so a
+ * multi-image turn doesn't pay the sum of per-image latencies. Failures degrade to a short marker.
  */
-export function planVisionSidecar(
-  config: OcxConfig,
-  provider: OcxProviderConfig,
-  modelId: string,
+export async function describeImagesInPlace(
   parsed: OcxParsedRequest,
-  openAiSidecar?: ResolvedOpenAiForwardSidecar,
-): VisionPlan | undefined {
-  if (!modelInList(provider.noVisionModels, modelId)) return undefined;
-  if (!messagesHaveImage(parsed)) return undefined;
-  const cfg = config.visionSidecar ?? {};
-  if (cfg.enabled === false) return undefined;
-  const anthropicSidecar = findAnthropicVisionProvider(config);
-  const backend = resolveVisionBackend(cfg.backend, anthropicSidecar);
-  const maxDescriptionsPerTurn = resolveMaxDescriptionsPerTurn(cfg.maxDescriptionsPerTurn);
-
-  if (backend === "routed") {
-    const routedModel = cfg.model;
-    if (!routedModel) return undefined; // no sensible default routed model — fail closed (caller strips)
-    return {
-      backend: "routed",
-      routedModel,
-      settings: {
-        model: routedModel,
-        reasoning: normalizeVisionReasoningForModel(routedModel, cfg.reasoning) ?? DEFAULT_REASONING,
-        timeoutMs: cfg.timeoutMs ?? DEFAULT_VISION_TIMEOUT_MS,
-      },
-      maxDescriptionsPerTurn,
-    };
+  plan: VisionPlan,
+  selectedForwardHeaders: Headers,
+  abortSignal?: AbortSignal,
+  recordSidecarOutcome?: SidecarOutcomeRecorder,
+  translatorBudget?: TranslatorBudget,
+): Promise<void> {
+  const jobs: ImageJob[] = [];
+  const targets: { msg: OcxMessage; parts: OcxContentPart[] }[] = [];
+  for (const msg of parsed.context.messages) {
+    if (!carriesImages(msg.role) || !Array.isArray(msg.content)) continue;
+    const parts = msg.content as OcxContentPart[];
+    if (!parts.some(p => p.type === "image")) continue;
+    const contextText = parts
+      .filter((p): p is OcxTextContent => p.type === "text")
+      .map(p => p.text)
+      .join(" ")
+      .slice(0, CONTEXT_MAX_CHARS);
+    for (const p of parts) {
+      if (p.type === "image") jobs.push({ imageUrl: p.imageUrl, detail: p.detail, contextText });
+    }
+    targets.push({ msg, parts });
+  }
+  if (jobs.length === 0) {
+    syncRawBodyImageDescriptions(parsed, []);
+    return;
   }
 
-  if (backend === "anthropic") {
-    if (!anthropicSidecar) return undefined;
-    const model = resolveEffectiveVisionModel(config, backend);
-    return {
-      backend,
-      anthropicSidecar,
-      settings: {
-        model,
-        reasoning: normalizeVisionReasoningForModel(model, cfg.reasoning) ?? DEFAULT_REASONING,
-        timeoutMs: resolveVisionTimeoutMs(cfg.timeoutMs),
-      },
-      maxDescriptionsPerTurn,
-    };
+  const inFlight = new Map<string, Promise<DescribeOutcome>>();
+  const executions: Array<() => Promise<void>> = [];
+  const outcomePromises: Array<Promise<DescribeOutcome>> = [];
+  let misses = 0;
+
+  for (const job of jobs) {
+    const identity = descriptionIdentity(job, plan);
+    const cached = identity.persistent ? descriptionCache.get(identity.key) : undefined;
+    if (cached !== undefined) {
+      outcomePromises.push(Promise.resolve({ text: cached }));
+      continue;
+    }
+
+    const existing = inFlight.get(identity.key);
+    if (existing) {
+      outcomePromises.push(existing);
+      continue;
+    }
+
+    if (misses >= plan.maxDescriptionsPerTurn) {
+      const capped = Promise.resolve<DescribeOutcome>({ text: "", error: "description cap reached for this turn" });
+      inFlight.set(identity.key, capped);
+      outcomePromises.push(capped);
+      continue;
+    }
+
+    misses += 1;
+    let resolveOutcome!: (outcome: DescribeOutcome) => void;
+    const pending = new Promise<DescribeOutcome>(resolve => { resolveOutcome = resolve; });
+    inFlight.set(identity.key, pending);
+    outcomePromises.push(pending);
+    executions.push(async () => {
+      let outcome: DescribeOutcome;
+      try {
+        outcome = await executeDescription(job, plan, selectedForwardHeaders, abortSignal, recordSidecarOutcome);
+      } catch (error) {
+        outcome = { text: "", error: error instanceof Error ? error.message : String(error) };
+      }
+      const successfulText = outcome.error ? "" : clamp(outcome.text.trim(), DESC_MAX_CHARS);
+      if (identity.persistent && successfulText) {
+        descriptionCache.set(identity.key, successfulText);
+        enforceAppOwnedMemoryBudget();
+      }
+      const resolvedOutcome = outcome.error ? outcome : { ...outcome, text: successfulText };
+      resolveOutcome(resolvedOutcome);
+    });
   }
 
-  const model = resolveEffectiveVisionModel(config, "openai");
-  if (!openAiSidecar) return undefined;
-  return {
-    backend,
-    forwardSidecar: openAiSidecar,
-    settings: {
-      model,
-      reasoning: normalizeVisionReasoningForModel(model, cfg.reasoning) ?? DEFAULT_REASONING,
-        timeoutMs: resolveVisionTimeoutMs(cfg.timeoutMs),
-    },
-    maxDescriptionsPerTurn,
-  };
+  await runBounded(executions, VISION_CONCURRENCY, execute => execute());
+  const outcomes = await Promise.all(outcomePromises);
+
+  let oi = 0;
+  const descriptions: string[] = [];
+  for (const { msg, parts } of targets) {
+    const newParts: OcxContentPart[] = [];
+    for (const p of parts) {
+      if (p.type !== "image") {
+        newParts.push(p);
+        continue;
+      }
+      const replacement = renderDescription(outcomes[oi++]);
+      descriptions.push(replacement.text);
+      const reservation = translatorBudget?.reserveTransient(
+        descriptionEncoder.encode(replacement.text).byteLength,
+        { kind: "request_copies" },
+      );
+      newParts.push(replacement);
+      reservation?.commitRetained();
+    }
+    msg.content = newParts;
+  }
+  syncRawBodyImageDescriptions(parsed, descriptions);
 }

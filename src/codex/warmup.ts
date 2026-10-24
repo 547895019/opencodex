@@ -315,12 +315,6 @@ export async function warmCodexAccount(options: CodexWarmupOptions): Promise<voi
         }
       }
     }
+    throw lastErr;
   }
-  // Every candidate model was rejected with 400. Surface each model's rejection so the
-  // message names what was tried instead of only the last fallback's upstream detail.
-  throw new CodexWarmupError(first400!.code, "Codex warmup was rejected", {
-    status: first400!.status,
-    cause: first400,
-    upstreamDetail: rejections.join("; ").slice(0, 512),
-  });
 }

@@ -170,10 +170,8 @@ async function sidecarVisionResponseSettings(config: OcxConfig): Promise<{
   const reasoning = normalizeVisionReasoningForModel(model, vs.reasoning) ?? "low";
   const models = await visionModelOptionsFor(config, anthropicSidecar);
   // Display-only grandfather: a persisted id stays selectable, but the write gate
-  // remains stricter and rejects a model that is positively proven blind. Routed
-  // backend models are arbitrary provider/model ids, so they never join the
-  // openai/anthropic catalog lists.
-  if (backend !== "routed" && !models.some(option => option.value === model)) {
+  // remains stricter and rejects a model that is positively proven blind.
+  if (!models.some(option => option.value === model)) {
     models.unshift({ value: model, label: model, backend });
   }
   return { model, reasoning, models };

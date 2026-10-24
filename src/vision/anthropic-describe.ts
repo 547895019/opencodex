@@ -179,11 +179,11 @@ export async function describeImageAnthropic(
     "Content-Type": "application/json",
     "anthropic-version": "2023-06-01",
     "Accept": "text/event-stream",
-    "User-Agent": getClaudeCodeUserAgent(),
+    "User-Agent": "@anthropic-ai/sdk/0.74.0",
     "Authorization": `Bearer ${token}`,
     "anthropic-beta": ANTHROPIC_OAUTH_BETA,
-    "x-app": "cli",
-    "X-Claude-Code-Session-Id": claudeCodeSessionId(),
+    ...CLAUDE_CODE_HEADERS,
+    "X-Claude-Code-Session-Id": claudeCodeSessionId(token),
     "x-client-request-id": crypto.randomUUID(),
   };
   if (provider.headers) Object.assign(headers, provider.headers);
@@ -191,25 +191,16 @@ export async function describeImageAnthropic(
   const content: unknown[] = [];
   if (contextText) content.push({ type: "text", text: `The user's request about this image: ${contextText}` });
   content.push(image.block);
-  const fingerprint = computeFingerprint(contextText, getOpenCodexVersion());
   const body = {
     model: settings.model,
     max_tokens: ANTHROPIC_VISION_MAX_TOKENS,
     ...sidecarThinkingOff(settings.model),
     system: [
-      { type: "text", text: getAttributionHeader(fingerprint) },
-      { type: "text", text: getClaudeCodeSystemPrefix({ isNonInteractive: false, hasAppendSystemPrompt: false }) },
+      { type: "text", text: CLAUDE_CODE_SYSTEM_INSTRUCTION },
       { type: "text", text: DESCRIBE_INSTRUCTION },
     ],
     messages: [{ role: "user", content }],
     stream: true,
-    metadata: {
-      user_id: JSON.stringify({
-        device_id: getOrCreateDeviceId(),
-        account_uuid: accountId ?? "",
-        session_id: claudeCodeSessionId(),
-      }),
-    },
   };
 
   // Anthropic image blocks have no detail field, but detail remains part of the cache identity.

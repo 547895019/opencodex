@@ -505,20 +505,6 @@ export function readConnectedClaudeContextWindows(path = DEFAULT_CATALOG_PATH): 
   } catch {
     return {};
   }
-  try {
-    const args = ["curl", "-s", "--noproxy", "*", "-m", "5"];
-    if (token) { args.push("-H", `x-opencodex-api-key: ${token}`); }
-    args.push(url);
-    const proc = Bun.spawnSync(args, { stdout: "pipe", stderr: "ignore" });
-    if (proc.exitCode === 0 && proc.stdout) {
-      const stdout = proc.stdout.toString();
-      if (stdout) return parseBody(JSON.parse(stdout));
-    }
-  } catch {
-    // fall through to warning
-  }
-  console.error("⚠ 모델 컨텍스트 정보를 불러오지 못했습니다 — 1M 자동 표시는 이번 실행에서 생략됩니다.");
-  return {};
 }
 
 export type ClaudeProxyEnsureDeps = {

@@ -420,7 +420,6 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
   const { parsed, selectedForwardHeaders, forwardProvider, hostedTool, settings, maxSearches, abortSignal, recordSidecarOutcome } = deps;
   const backend = deps.backend ?? "openai";
   const anthropicSidecar = deps.anthropicSidecar;
-  const ollamaSidecar = deps.ollamaSidecar;
   // Mutable: 429 key-failover (deps.on429) can swap in a rebuilt adapter mid-loop.
   let adapter = deps.adapter;
 
