@@ -55,222 +55,51 @@ export function getOpenCodexVersion(): string {
   return version;
 }
 
-/** Test-only: reset the resolved version cache. */
-export function resetClaudeCodeVersionForTests(): void {
-  resolvedClaudeCodeVersion = undefined;
-}
+// ── Antigravity IDE ──
+/** Pinned fallback Antigravity IDE language-server version (matches the bundled LS 2.5.5). */
+export const ANTIGRAVITY_IDE_VERSION = "2.5.5";
+const ANTIGRAVITY_IDE_CLIENT_NAME = "aidev_client";
+const ANTIGRAVITY_IDE_PLATFORM = "windows/amd64";
+
 
 /**
- * User-Agent matching Claude Code's first-party shape.
+ * Real Antigravity IDE User-Agent format, decompiled from 2.5.5 Go LS (`setHeaders` @ `0x1018fbe00`):
+ * `antigravity/ide/${version} (os_type=${osType}; arch=${arch}; aidev_client; auth_method=oauth)`
  *
- * The official client sends `claude-cli/<VERSION> (<USER_TYPE>, <ENTRYPOINT>...)`.
- * We keep the entrypoint generic (`cli`) because opencodex exposes the same proxy to
- * multiple clients. The `claude-cli` prefix is important for backend log filtering.
- */
-export function getClaudeCodeUserAgent(): string {
-  return `claude-cli/${getOpenCodexVersion()}`;
-}
-
-// ── Session id ──
-
-let CLAUDE_CODE_SESSION_ID: string | undefined;
-
-/**
- * Random UUIDv4 session id, generated once per process. Matches real Claude Code, which
- * creates one session id per CLI invocation (not per token or per request).
- */
-export function claudeCodeSessionId(): string {
-  if (!CLAUDE_CODE_SESSION_ID) {
-    CLAUDE_CODE_SESSION_ID = randomUUID();
-  }
-  return CLAUDE_CODE_SESSION_ID;
-}
-
-/** Test-only: reset the memoized session id. */
-export function resetClaudeCodeSessionIdForTests(): void {
-  CLAUDE_CODE_SESSION_ID = undefined;
-}
-
-// ── Fingerprint ──
-
-/** Hardcoded salt shared with the official Claude Code client. */
-export const FINGERPRINT_SALT = "59cf53e54c78";
-
-/** Memoized fingerprint result so a request's header and metadata stay in sync. */
-let memoizedFingerprint: { input: string; value: string } | undefined;
-
-/**
- * Extract text from the first user/developer message. Anthropic's fingerprint is
- * computed from the first user-visible text, regardless of whether it arrived as a
- * plain string or a content-part array.
- */
-export function extractFirstUserMessageText(messages: readonly OcxMessage[] | readonly unknown[]): string {
-  for (const msg of messages) {
-    if (!msg || typeof msg !== "object") continue;
-    const role = (msg as { role?: string }).role;
-    if (role !== "user" && role !== "developer") continue;
-    const content = (msg as OcxUserMessage).content;
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) {
-      const text = content.find((part): part is OcxTextContent =>
-        part && typeof part === "object" && (part as { type?: string }).type === "text" && typeof (part as { text?: string }).text === "string"
-      );
-      if (text) return text.text;
-    }
-  }
-  return "";
-}
-
-
-// ── Attribution header ──
-
-/**
- * Returns the `x-anthropic-billing-header` pseudo-header that real Claude Code injects
- * as the first system prompt text block.
+ * Token ordering from decompiled binary: `os_type` -> `arch` -> `aidev_client` -> `auth_method=oauth`.
  *
- * - `cc_version` embeds the first-party version and the per-request fingerprint.
- * - `cc_entrypoint` is fixed to `cli`.
- * - `cch=00000` is the native-client attestation placeholder; Bun would overwrite it.
- * - `cc_workload` is fixed to `interactive` (no cron/workload context in opencodex).
- */
-export function getAttributionHeader(fingerprint: string): string {
-  const version = `${getOpenCodexVersion()}.${fingerprint}`;
-  return `x-anthropic-billing-header: cc_version=${version}; cc_entrypoint=cli; cch=00000; cc_workload=interactive`;
-}
-
-/**
- * Computes the 3-character first-party fingerprint used in the attribution header.
- *
- * Algorithm (must stay in sync with Claude Code): SHA256(salt + msg[4] + msg[7] +
- * msg[20] + version).slice(0, 3), using "0" for missing characters.
- */
-export function computeFingerprint(messageText: string, version: string): string {
-  const input = fingerprintInput(messageText, version);
-  if (memoizedFingerprint?.input === input) return memoizedFingerprint.value;
-  const chars = [messageText[4] ?? "0", messageText[7] ?? "0", messageText[20] ?? "0"].join("");
-  const hashInput = `${FINGERPRINT_SALT}${chars}${version}`;
-  const value = createHash("sha256").update(hashInput).digest("hex").slice(0, 3);
-  memoizedFingerprint = { input, value };
-  return value;
-}
-
-function fingerprintInput(messageText: string, version: string): string {
-  return `${messageText}\0${version}`;
-}
-
-// ── CLI system prompt prefix ──
-
-const DEFAULT_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude.";
-const AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX =
-  "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
-const AGENT_SDK_PREFIX = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
-
-/**
- * Official Claude Code system prompt prefix.
- *
- * Interactive sessions get the canonical prefix. Non-interactive sessions get one of the
- * Agent SDK variants depending on whether an appended system prompt is present.
- */
-export function getClaudeCodeSystemPrefix(options: { isNonInteractive?: boolean; hasAppendSystemPrompt?: boolean } = {}): string {
-  if (options.isNonInteractive) {
-    return options.hasAppendSystemPrompt ? AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX : AGENT_SDK_PREFIX;
-  }
-  return DEFAULT_PREFIX;
-}
-
-// ── Device id ──
-
-const DEVICE_ID_FILE = "device-id";
-let memoizedDeviceId: string | undefined;
-
-function getConfigDir(): string {
-  const raw = process.env["OPENCODEX_HOME"]?.trim() || undefined;
-  return raw ? require("node:path").resolve(expandUserPath(raw)) : join(require("node:os").homedir(), ".opencodex");
-}
-
-function expandUserPath(value: string): string {
-  if (value.startsWith("~/")) return join(require("node:os").homedir(), value.slice(2));
-  return value;
-}
-
-/** Stable per-opencodex-installation device id persisted in the config dir. */
-export function getOrCreateDeviceId(): string {
-  if (memoizedDeviceId) return memoizedDeviceId;
-
-  const configDir = getConfigDir();
-  const path = join(configDir, DEVICE_ID_FILE);
-  try {
-    if (existsSync(path)) {
-      const id = readFileSync(path, "utf8").trim();
-      if (isValidUuid(id)) {
-        memoizedDeviceId = id;
-        return id;
-      }
-    }
-  } catch {
-    /* fall through to create */
-  }
-
-  const id = randomUUID();
-  try {
-    assertNotRealHomeUnderTest(configDir);
-    if (!existsSync(configDir)) mkdirSync(configDir, { recursive: true, mode: 0o700 });
-    const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-    writeFileSync(temp, `${id}\n`, { encoding: "utf8", mode: 0o600 });
-    renameSync(temp, path);
-  } catch {
-    /* If we cannot persist, still use the in-process id. */
-  }
-  memoizedDeviceId = id;
-  return id;
-}
-
-/** Test-only: reset the in-memory device id and optionally delete the persisted file. */
-export function resetDeviceIdForTests(removeFile = false): void {
-  memoizedDeviceId = undefined;
-  if (removeFile) {
-    try {
-      unlinkSync(join(getConfigDir(), DEVICE_ID_FILE));
-    } catch {
-      /* best-effort */
-    }
-  }
-}
-
-function isValidUuid(value: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
-}
-
-// ── Beta header value ──
-
-/** HTTP `anthropic-beta` value for Anthropic OAuth (Claude Pro/Max) requests. */
-export const CLAUDE_CODE_OAUTH_BETA = "oauth-2025-04-20";
-
-// ── Legacy exports (kept for importers that only need the value; do not use for headers) ──
-
-/**
- * @deprecated Hand-copied Stainless headers are no longer needed; the SDK injects its
- * own, and the official client only sends x-app, User-Agent, session id, and request id.
- */
-export const CLAUDE_CODE_HEADERS: Record<string, string> = {
-  "X-App": "cli",
-};
-
-// ── Antigravity CLI (unchanged) ──
-
-/** Match the installed Antigravity CLI used by the OAuth account. */
-export const ANTIGRAVITY_CLI_VERSION = "1.1.13";
-const ANTIGRAVITY_CLI_CLIENT_NAME = "aidev_client";
-const ANTIGRAVITY_CLI_PLATFORM = "linux/arm64";
-/** Secondary Google API client UA the Antigravity client library reports. */
-export const ANTIGRAVITY_GOOG_API_CLIENT_UA = "google-api-nodejs-client/10.3.0";
-
-/**
- * The real Antigravity CLI User-Agent, e.g.
- * `antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)`.
+ * Must be the IDE client family (`antigravity/ide/...`): Cloud Code Assist backend gates
+ * newer agent models (e.g. `gemini-3.7-flash`) by User-Agent and answers 404 NOT_FOUND to
+ * CLI-shaped UAs even with a valid OAuth token. Only `antigravity/ide/<ver>` unlocks them.
+ * The one exception is Gemini 4 Argon, which CCA serves ONLY to the CLI family; see
+ * `antigravityCliUserAgent`.
  * A `GOOGLE_ANTIGRAVITY_USER_AGENT` override (set by the caller) takes precedence upstream.
  */
-export function antigravityUserAgent(version = ANTIGRAVITY_CLI_VERSION): string {
+export function antigravityUserAgent(version = ANTIGRAVITY_IDE_VERSION, authMethod = "oauth"): string {
+  const ov = process.env.GOOGLE_ANTIGRAVITY_USER_AGENT?.trim();
+  if (ov) return ov;
+  const [osType, arch] = ANTIGRAVITY_IDE_PLATFORM.split("/");
+  return `antigravity/ide/${version} (os_type=${osType}; arch=${arch}; ${ANTIGRAVITY_IDE_CLIENT_NAME}; auth_method=${authMethod})`;
+}
+
+// ── Antigravity CLI ──
+/** Antigravity CLI version whose User-Agent CCA was verified to serve Gemini 4 Argon to. */
+export const ANTIGRAVITY_CLI_VERSION = "1.3.4";
+const ANTIGRAVITY_CLI_PLATFORM = "darwin/arm64";
+
+/**
+ * Antigravity CLI User-Agent:
+ * `antigravity/cli/${version} (os_type=${osType}; arch=${arch}; aidev_client; auth_method=oauth)`.
+ *
+ * Verified 2026-10-14 against live CCA: `gemini-4-argon-{low,medium,high}` answer only to this
+ * family and return 404 "Requested entity was not found" to the IDE UA above, while
+ * `gemini-3.7-flash-tiered` and `gemini-3.1-pro-low` 404 under this one. So it is used ONLY for
+ * Argon requests and for model discovery, never as a general replacement for the IDE UA.
+ *
+ * `GOOGLE_ANTIGRAVITY_USER_AGENT` deliberately does not apply here: that override names the IDE
+ * header, and letting it replace this one would re-lock Argon for anyone who set it.
+ */
+export function antigravityCliUserAgent(version = ANTIGRAVITY_CLI_VERSION, authMethod = "oauth"): string {
   const [osType, arch] = ANTIGRAVITY_CLI_PLATFORM.split("/");
-  return `antigravity/cli/${version} (${ANTIGRAVITY_CLI_CLIENT_NAME}; os_type=${osType}; arch=${arch})`;
+  return `antigravity/cli/${version} (os_type=${osType}; arch=${arch}; ${ANTIGRAVITY_IDE_CLIENT_NAME}; auth_method=${authMethod})`;
 }

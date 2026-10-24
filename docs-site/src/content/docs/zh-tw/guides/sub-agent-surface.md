@@ -6,7 +6,7 @@ description: 全域控制 Codex 在所有模型上生成和管理子代理的方
 opencodex 允許你為目錄中的所有模型選擇多代理協作介面。儀表板和 Models 頁面中的 **Sub-agent** 開關會全域控制這一設定。
 
 :::note
-在 v2 介面（`multi_agent_v2`）上，子代理**預設**繼承父會話的模型：`fork_turns` 預設為 `all`，而全量歷史 fork 會拒絕覆蓋。自 v2.7.2 起，opencodex 注入的指引會教模型如何打破繼承 —— 將 `fork_turns` 設為 `"none"`（或如 `"3"` 的部分 fork）的 `spawn_agent` 呼叫可以傳入 `model` / `reasoning_effort` 引數；即使公開的工具 schema 中看不到這些引數，Codex 執行環境也會解析並應用。已知傳輸限制：當**原生**父代理 spawn 一個路由到**非原生** provider 的子代理時，Codex 用戶端可能只以後端加密的 `encrypted_content` 傳送 `NEW_TASK` 載荷（[#92](https://github.com/lidge-jun/opencodex/issues/92)）。opencodex 不會把這種無法讀取的任務轉發給外部 provider：直接路由會回傳 HTTP 400 和錯誤碼 `unreadable_encrypted_agent_task`；組合路由則會跳過無法解密的目標，並在存在可用目標時選擇規範的原生 ChatGPT 目標。恢復方法：異構 provider 委派改用 v1、選擇原生 ChatGPT 子代理，或將任務重新作為明文 v2 `agent_message` 內容傳送。另有預設停用的實驗性 `agentTaskRecovery`；它會增加 ChatGPT 配額用量與延遲，且依賴非公開後端行為。
+在 v2 介面（`multi_agent_v2`）上，子代理**預設**繼承父會話的模型：`fork_turns` 預設為 `all`，而全量歷史 fork 會拒絕覆蓋。自 v2.7.2 起，opencodex 注入的指引會教模型如何打破繼承 —— 將 `fork_turns` 設為 `"none"`（或如 `"3"` 的部分 fork）的 `spawn_agent` 呼叫可以傳入 `model` / `reasoning_effort` 引數；即使公開的工具 schema 中看不到這些引數，Codex 執行環境也會解析並應用。已知傳輸限制：當**原生**父代理 spawn 一個路由到**非原生** provider 的子代理時，Codex 用戶端可能只以後端加密的 `encrypted_content` 傳送 `NEW_TASK` 載荷（[#92](https://github.com/lidge-jun/opencodex/issues/92)）。opencodex 不會把這種無法讀取的任務轉發給任意外部 provider：直接路由通常回傳 HTTP 400 和錯誤碼 `unreadable_encrypted_agent_task`，但以 `allowEncryptedV2AgentTasks: true` 明確信任的直接金鑰驗證 Responses 路由可以原樣接收；組合路由仍會跳過無法解密的目標，並在存在可用目標時選擇規範的原生 ChatGPT 目標。恢復方法：異構 provider 委派改用 v1、選擇原生 ChatGPT 子代理、使用明確信任的 Responses relay，或將任務重新作為明文 v2 `agent_message` 內容傳送。另有預設停用的實驗性 `agentTaskRecovery`；它會增加 ChatGPT 配額用量與延遲，且依賴非公開後端行為。
 :::
 
 ## What sub-agents are
@@ -21,7 +21,7 @@ opencodex 允許你為目錄中的所有模型選擇多代理協作介面。儀�
 | --- | --- | --- |
 | **v1** | `multi_agent_v1` | 使用經典的名稱空間代理工具，以及 `send_input` / `close_agent` / `resume_agent`。`spawn_agent` 的模型覆蓋可以在其他模型上生成子代理。 |
 | **base**（預設） | 上游固定值 | 恢復上游模型的固定值：gpt-5.6-sol 和 gpt-5.6-terra 使用 v2，gpt-5.6-luna 使用 v1；未固定的模型遵循 Codex 的 `multi_agent_v2` 功能開關。生成行為取決於該模型最終使用的介面。 |
-| **v2** | `multi_agent_v2` | 使用扁平的 `spawn_agent` 工具、併發會話，以及 `send_message` / `followup_task` / `wait_agent` / `interrupt_agent`。全量歷史 fork 時子代理繼承父模型；`fork_turns: "none"`（或部分 fork）時接受 `model` / `reasoning_effort` 覆蓋。如果原生→路由子代理只收到後端加密的任務內容，外部路由會回傳 `unreadable_encrypted_agent_task`；混合組合會優先選擇可解密的原生目標（[#92](https://github.com/lidge-jun/opencodex/issues/92)）。 |
+| **v2** | `multi_agent_v2` | 使用扁平的 `spawn_agent` 工具、併發會話，以及 `send_message` / `followup_task` / `wait_agent` / `interrupt_agent`。全量歷史 fork 時子代理繼承父模型；`fork_turns: "none"`（或部分 fork）時接受 `model` / `reasoning_effort` 覆蓋。如果原生→路由子代理只收到後端加密的任務內容，未明確信任的外部路由會回傳 `unreadable_encrypted_agent_task`；明確信任的直接金鑰驗證 Responses 路由可以原樣接收，而混合組合仍優先選擇可解密的原生目標（[#92](https://github.com/lidge-jun/opencodex/issues/92)）。 |
 
 ## 運作原理
 
@@ -29,9 +29,45 @@ opencodex 允許你為目錄中的所有模型選擇多代理協作介面。儀�
 
 - **v1 模式**：強制所有條目使用 `multi_agent_version = "v1"`，覆蓋上游固定值。
 - **base 模式**：恢復上游預設值。已固定的模型使用快照值；未固定的模型不寫入該欄位，交由 Codex 功能開關決定。
-- **v2 模式**：強制所有條目使用 `multi_agent_version = "v2"`，覆蓋上游固定值。
+- **v2 模式**：強制所有條目使用 `multi_agent_version = "v2"`，覆蓋上游固定值；但啟用 **讓 ChatGPT 保持 v1** 時例外：ChatGPT 原生條目維持 `"v1"`，路由/組合條目仍為 `"v2"`。
 
 無論是即時 `/v1/models` 目錄回應，還是磁碟目錄同步，這項覆蓋都會作為最後一步執行。因此，無論條目原本如何生成，新會話都會使用一致的模式。
+
+## `spawn_agent` 列出哪些模型
+
+Codex 在 `spawn_agent` 工具說明中最多列出五個模型，並由 Codex 自己挑選：它將選擇器中可見的目錄列依 `priority` 由小到大排序，取前五個。**Subagents** 頁面上的名冊（`subagentModels`）只能透過依名冊順序為其中的模型指定最低的 priority（沒有帳號選擇器時為 `0` 到 `4`）來影響這份清單，不會將清單限制在名冊之內。
+
+如果只設定一到四個模型，Codex 會依 priority 以接下來的列填滿其餘位置。這些列不是你選的，儀表板也不會顯示是哪些模型。實際是哪些列取決於目錄：
+
+| 目錄 | 填補其餘位置的列 |
+| --- | --- |
+| 沒有 Codex 帳號選擇器 | 其他路由的 `provider/model` 列。它們的 priority 都是 `5`，因此依 provider 名稱、再依模型 id 的字母順序排列。未設定的原生 GPT 列的 priority 不低於 `100` 加上已設定 id 的數量，因此排在後面。 |
+| 有 Codex 帳號選擇器 | 帳號限定的原生列（`<selector>/<native-model>`），緊接在已設定的列之後。未設定的路由列移到 priority `1005`，排在它們之後。 |
+
+例如，沒有帳號選擇器且名冊如下時：
+
+```json
+{ "subagentModels": ["xai/grok-4.5", "anthropic/claude-sonnet-5"] }
+```
+
+| 位置 | 模型 | Priority | 原因 |
+| ---: | --- | ---: | --- |
+| 1 | `xai/grok-4.5` | `0` | 名冊第一項 |
+| 2 | `anthropic/claude-sonnet-5` | `1` | 名冊第二項 |
+| 3 | `deepseek/deepseek-v4-flash` | `5` | 依字母順序第一個剩餘的路由列 |
+| 4 | `google/gemini-3-pro` | `5` | 下一個路由列 |
+| 5 | `moonshot/kimi-k3` | `5` | 下一個路由列 |
+| 6+ | `zai/glm-5.2`，接著是原生 GPT 列 | `5`，接著是 `102` | 不在前五之內 |
+
+名冊為空時，opencodex 不固定任何列，前五個依目錄原有的 priority 決定。
+
+被填補的位置與一般列出的模型相同，主代理可能會選用它們。這份清單也不是允許清單：主代理寫出確切名稱時，Codex 也接受前五之外的目錄模型。若要控制 Codex 列出的模型：
+
+- 設定五個模型。名冊滿了就沒有可填補的位置。
+- 對於永遠不想被提供的模型，將其停用，或不放進其 provider 的 `selectedModels`。已停用或未選取的模型會離開選擇器，不會填補位置。
+- `modelPickerOrder` 會改變 Codex 排序所用的 priority。只含路由列的清單會將列出的未設定列移到 `1000` 以上，因此未列出的路由列會先填補位置。包含裸原生 id 的清單會為整個選擇器排序（包括已設定的列）：列出的列排在前面，先於任何未列出的列佔用列出位置。參見 [Model ordering](/guides/model-ordering/)。
+
+在 v2 上，Codex 會在取前五個之前略過固定為 `"disabled"` 的列；其餘機制相同。opencodex 的 v2 指引名冊（`{{roster}}`）只列出位於前五之內的已設定名冊模型，因此填補的模型只會出現在 Codex 的工具說明中，不會出現在 opencodex 指引裡。Codex 在工作階段開始時讀取目錄，因此名冊的變更從新的工作階段開始生效。
 
 ## 委託模型與推理強度
 
@@ -61,7 +97,9 @@ opencodex 允許你為目錄中的所有模型選擇多代理協作介面。儀�
 內建指引只在偏好模型、合格名冊或 fallback 鏈解析成功時觸發。設定了 `injectionModel` 就足以渲染
 自訂提示詞；若裸值無法唯一解析，`{{model}}` 會展開為空字串。
 
-在 v1 上，opencodex 只在 `max` / `ultra` effort 注入上游風格的主動委派指引。v1 不會附加偏好模型、
+在 v1 上，opencodex 只在 `max` 或 `ultra` 推理強度下注入與 v2 建議預設相同的主動委派指引。
+僅改變委派的觸發條件：不再需要另外提出委派請求；使用者指示以及權限、任務範圍與協作工具規則仍然適用。
+v1 不會附加偏好模型、
 名冊、fallback 清單或自訂提示詞。
 
 預設關閉的 `syncCodexSubagentDefaults` 選項與指引無關。當 opencodex 擁有作用中的 Codex 路由時，
@@ -87,8 +125,9 @@ opencodex 仍可為了向後相容從 TOML 讀取舊版 `model_fallback` 列，�
 停用 provider 支撐、標記為不健康、在冷卻中、缺少可用 Pool 化 Codex 帳號，或超過設定配額閾值的
 候選。可用性探測會快取 `subagentModelFallbackPollMs`（預設 60 秒）。
 
-Fallback 不能讓不相容的加密任務變成可讀。當子任務是為 ChatGPT 加密時，即使外部模型在鏈中出現得
-更早，選擇也會限制在規範的原生 ChatGPT 目標。
+Fallback 不能讓不相容的加密任務變成可讀。當子任務是為 ChatGPT 加密時，即使其他外部模型在鏈中
+出現得更早，選擇也只會包含規範的原生 ChatGPT 目標，以及透過
+`allowEncryptedV2AgentTasks: true` 明確信任的直接金鑰驗證 Responses 路由。組合仍只使用規範的原生目標。
 
 ## 加密的 v2 任務傳輸
 
@@ -99,7 +138,7 @@ Codex 可能只以後端加密的 `encrypted_content` 傳送 v2 原生→路由�
 opencodex 會安全失敗，而不是轉發空或無法讀取的任務：
 
 - 直接的非原生路由回傳 HTTP 400，帶有 `error.code = "unreadable_encrypted_agent_task"`，且不會回顯
-  密文。
+  密文；但其金鑰驗證 Responses provider 透過 `allowEncryptedV2AgentTasks: true` 明確選擇加入時除外。
 - 組合只會為該任務考慮規範的原生 ChatGPT 目標，包括重試。若沒有可用目標，回傳相同的 400。
 - 可讀取的明文任務保持正常的路由與 fallback 行為。
 
@@ -117,7 +156,7 @@ opencodex 會安全失敗，而不是轉發空或無法讀取的任務：
 - **Dashboard** → 第一個狀態單元：選擇 **v1**、**base** 或 **v2**。
 - **Models** 頁面 → 使用頂部的分段控制元件。
 - 兩個頁面都有 **?** 按鈕，可開啟幫助彈窗並返回本文。
-- **Dashboard** → **子代理委託**：選擇首選模型和可選的推理強度。在 v2 上，注入的指引會要求以 `fork_turns: "none"` 生成，使模型覆蓋得以應用。如果原生→路由子代理只收到加密任務內容，請使用原生目標或 v1；僅外部目標的傳輸現在會明確回傳 `unreadable_encrypted_agent_task`（[#92](https://github.com/lidge-jun/opencodex/issues/92)）。
+- **Dashboard** → **子代理委託**：選擇首選模型和可選的推理強度。在 v2 上，注入的指引會要求以 `fork_turns: "none"` 生成，使模型覆蓋得以應用。如果原生→路由子代理只收到加密任務內容，請使用原生目標、v1，或明確信任的直接金鑰驗證 Responses relay；其他僅外部目標的傳輸會明確回傳 `unreadable_encrypted_agent_task`（[#92](https://github.com/lidge-jun/opencodex/issues/92)）。
 
 ### CLI
 
@@ -182,6 +221,10 @@ curl -X PUT http://localhost:10100/api/injection-model \
 它可能是 picker 隱藏、超出五個模型的顯示上限、不在目錄中，或固定為 v1。值為 `"v2"`、`null` 或缺
 少介面值的項目合格；真正的 `"v1"` 固定值不合格。
 
+### 為什麼 `spawn_agent` 列出了我沒有設定的模型？
+
+Codex 依 priority 從目錄填入最多五個列出位置。設定的模型少於五個時，接下來的列會佔用其餘位置。參見上文「`spawn_agent` 列出哪些模型」一節。
+
 ### 模式變更會影響執行中的工作階段嗎？
 
 不會。變更模式後請開啟新的 Codex 工作階段。若長時間執行的 App host 仍顯示過時的目錄狀態，請執行
@@ -212,7 +255,7 @@ opencodex 會將磁碟上的模型目錄與目前使用者擁有的每個 Codex 
 
 | 模型 | 線路上的 `max` | 選擇 `ultra` 後的線路值 |
 | --- | --- | --- |
-| gpt-5.5、gpt-5.4、gpt-5.4-mini | xhigh | xhigh（先轉為 max，再經 `nativeEffortClamp`） |
+| gpt-5.5 | xhigh | xhigh（先轉為 max，再經 `nativeEffortClamp`） |
 | gpt-5.6-sol、gpt-5.6-terra | max | max |
 | gpt-5.6-luna | max | 其精確上游階梯不提供該選項 |
 | 路由模型 | 由適配器對映或限制 | 先轉為 max，再由適配器對映或限制 |

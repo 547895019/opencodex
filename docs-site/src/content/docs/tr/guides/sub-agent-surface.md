@@ -36,7 +36,7 @@ alanını denetler:
 - **v1**, her modele `multi_agent_version = "v1"` damgalar.
 - **base**, yukarı akış sabitlemelerini geri yükler. Sabitlenmemiş girdiler
   yerel `multi_agent_v2` özellik bayrağını takip eder.
-- **v2**, her modele `multi_agent_version = "v2"` damgalar.
+- **v2**, her modele `multi_agent_version = "v2"` damgalar; ancak **ChatGPT'yi v1'de tut** etkinken bu kural dışıdır: ChatGPT yerel satırları `"v1"` kalır, yönlendirilen ve combo satırları `"v2"` kalır.
 
 opencodex bunu hem canlı `/v1/models` kataloğuna hem de diske senkronize edilen
 kataloğa son geçiş olarak uygular. Bir mod değişikliğinin yeni oluşturulan App,
@@ -46,6 +46,42 @@ Bir v2 kadrosu için uygunluğun üç durumu vardır: `"v2"` damgalı, açıkça
 olarak ayarlanmış veya `multi_agent_version` alanı olmayan bir girdi uygundur.
 Gerçek bir `"v1"` sabitlemesi hariç tutulur çünkü modelin diğer işbirliği
 yüzeyine ait olduğunu belirtir.
+
+## `spawn_agent` hangi modelleri sunar?
+
+Codex, `spawn_agent` araç açıklamasında en fazla beş model listeler ve bunları kendisi seçer: seçicide görünen katalog satırlarını `priority` değerine göre küçükten büyüğe sıralar ve ilk beşini alır. **Subagents** sayfasındaki kadro (`subagentModels`) bu listeyi yalnızca kendi modellerine kadro sırasıyla en düşük öncelikleri vererek etkiler (hesap seçicisi yoksa `0` ile `4` arası). Listeyi kadroyla sınırlamaz.
+
+Bir ile dört arasında model öne çıkarırsanız Codex kalan yuvaları önceliğe göre sonraki satırlarla doldurur. Bu satırları siz seçmediniz ve pano hangilerinin girdiğini göstermez. Hangi satırların gireceği kataloğa bağlıdır:
+
+| Katalog | Kalan yuvaları dolduran satırlar |
+| --- | --- |
+| Codex hesap seçicisi yok | Diğer yönlendirilmiş `provider/model` satırları. Hepsi `5` önceliğini paylaştığı için sağlayıcı adına, ardından model kimliğine göre alfabetik sırayla gelir. Öne çıkarılmamış yerel GPT satırlarının önceliği en az `100` artı öne çıkarılan kimlik sayısıdır; bu yüzden daha sonra gelirler. |
+| Codex hesap seçicisi var | Hesaba bağlı yerel satırlar (`<selector>/<native-model>`); öne çıkarılan satırların hemen ardından gelir. Öne çıkarılmamış yönlendirilmiş satırlar `1005` önceliğine taşınır ve onlardan sonra gelir. |
+
+Örneğin hesap seçicisi yokken ve kadro şöyleyken:
+
+```json
+{ "subagentModels": ["xai/grok-4.5", "anthropic/claude-sonnet-5"] }
+```
+
+| Yuva | Model | Öncelik | Neden |
+| ---: | --- | ---: | --- |
+| 1 | `xai/grok-4.5` | `0` | Kadronun ilk girdisi |
+| 2 | `anthropic/claude-sonnet-5` | `1` | Kadronun ikinci girdisi |
+| 3 | `deepseek/deepseek-v4-flash` | `5` | Alfabetik olarak kalan ilk yönlendirilmiş satır |
+| 4 | `google/gemini-3-pro` | `5` | Sonraki yönlendirilmiş satır |
+| 5 | `moonshot/kimi-k3` | `5` | Sonraki yönlendirilmiş satır |
+| 6+ | `zai/glm-5.2`, ardından yerel GPT satırları | `5`, ardından `102` | Beşin dışında |
+
+Kadro boşsa opencodex hiçbir satırı sabitlemez ve beş yuva kataloğun normal önceliklerine göre belirlenir.
+
+Doldurulan yuvalar sıradan sunumlardır; ana ajan bu modellerden birini seçebilir. Liste bir izin listesi de değildir: ana ajan tam adını verirse Codex beşin dışındaki bir katalog modelini de kabul eder. Codex'in sunduğu listeyi denetlemek için:
+
+- Beş model öne çıkarın. Kadro doluysa doldurulacak yuva kalmaz.
+- Hiç sunulmasını istemediğiniz bir modeli devre dışı bırakın ya da sağlayıcısının `selectedModels` listesine eklemeyin. Devre dışı ya da seçilmemiş bir model seçiciden çıkar ve yuva dolduramaz.
+- `modelPickerOrder`, Codex'in sıralamada kullandığı öncelikleri değiştirir. Yalnızca yönlendirilmiş satırlardan oluşan bir liste, listelenen öne çıkarılmamış satırları `1000` ve üzerine taşır; bu yüzden listelenmemiş yönlendirilmiş satırlar yuvaları önce doldurur. Yalın bir yerel kimlik içeren liste, öne çıkarılan satırlar dahil tüm seçiciyi sıralar: listelenen satırlar önce gelir ve listelenmemiş her satırdan önce sunulan yuvaları alır. Bkz. [Model ordering](/guides/model-ordering/).
+
+v2'de Codex beşi almadan önce `"disabled"` olarak sabitlenmiş satırları atlar; geri kalanı aynı şekilde çalışır. opencodex v2 yönlendirmesindeki kadro (`{{roster}}`) yalnızca beşin içindeki yapılandırılmış kadro modellerini adlandırır; dolgu modelleri Codex'in araç açıklamasında görünür, opencodex yönlendirmesinde hiç görünmez. Codex kataloğu oturum başlarken okur; bu yüzden kadro değişikliği yeni oturumlarda geçerli olur.
 
 ## Yetkilendirme modeli ve çaba
 
@@ -94,8 +130,9 @@ rehberlik yalnızca tercih edilen bir model, uygun kadro veya geri dönüş zinc
 istem oluşturmak için yeterlidir; yalın bir değer benzersiz şekilde
 çözümlenemezse `{{model}}` boş bir dizeye genişler.
 
-v1'de opencodex yalnızca `max` veya `ultra` çabada yukarı akış tarzı proaktif
-yetkilendirme rehberliğini enjekte eder. v1'de tercih edilen bir model, kadro,
+v1'de opencodex, yalnızca `max` veya `ultra` çaba düzeylerinde v2'nin önerilen ön ayarıyla aynı proaktif görev devri metnini enjekte eder.
+Yalnızca tetikleme koşulu değişir: ayrıca görev devri talep edilmesi gerekmez; kullanıcı talimatları, yetkiler, görev kapsamı ve iş birliği araçlarının kuralları geçerliliğini korur.
+v1'de tercih edilen bir model, kadro,
 geri dönüş listesi veya özel istem eklemez.
 
 Varsayılan olarak kapalı olan `syncCodexSubagentDefaults` seçeneği rehberlikten
@@ -133,8 +170,10 @@ probları `subagentModelFallbackPollMs` (varsayılan olarak 60 saniye) boyunca
 önbelleğe alınır.
 
 Geri dönüş, uyumsuz şifrelenmiş görevleri okunabilir kılmaz. Çocuk görevi
-ChatGPT için şifrelendiğinde, zincirde daha önce harici bir model görünse bile
-seçim kurallı yerel ChatGPT hedefleriyle sınırlandırılır.
+ChatGPT için şifrelendiğinde, zincirde daha önce başka bir harici model görünse
+bile seçim kurallı yerel ChatGPT hedefleriyle ve
+`allowEncryptedV2AgentTasks: true` kullanılarak açıkça güvenilen doğrudan anahtar kimlik doğrulamalı Responses
+rotalarıyla sınırlıdır. Kombolar yalnızca kurallı yerel hedefleri kullanmaya devam eder.
 
 ## Şifrelenmiş v2 görev teslimi
 
@@ -146,18 +185,19 @@ bilinen [#92 sınırlamasıdır](https://github.com/lidge-jun/opencodex/issues/9
 opencodex boş veya okunamayan bir görevi iletmek yerine güvenli bir şekilde
 başarısız olur:
 
-- Doğrudan yerel olmayan bir rota `error.code =
-  "unreadable_encrypted_agent_task"` ile HTTP 400 döndürür ve şifreli metni
-  yankılamaz.
+- Uygun olmayan doğrudan yerel olmayan bir rota `error.code =
+  "unreadable_encrypted_agent_task"` ile HTTP 400 döndürür ve şifreli metni yankılamaz.
+  `allowEncryptedV2AgentTasks: true` ile açıkça etkinleştirilen uygun bir doğrudan anahtar
+  kimlik doğrulamalı Responses sağlayıcısı bunun yerine opak şifreli metni alır ve bu hatayı atlar.
 - Bir kombo, yeniden denemeler de dahil olmak üzere bu görev için yalnızca
   kurallı yerel ChatGPT hedeflerini değerlendirir. Hiçbiri yoksa aynı 400
   hatasını döndürür.
 - Okunabilir bir düz metin görevi normal rota ve geri dönüş davranışını korur.
 
-Kurtarma seçenekleri, yerel bir ChatGPT çocuğu seçmek, komboya yerel bir ChatGPT
-hedefi eklemek, heterojen sağlayıcı yetkilendirmesi için v1 kullanmak veya
-arayanı denetlediğinizde görevi düz metin v2 `agent_message` içeriği olarak
-yeniden göndermektir.
+Kurtarma seçenekleri, yerel bir ChatGPT çocuğu seçmek, opak yükü tüketebilen doğrudan anahtar
+kimlik doğrulamalı bir Responses geçidine açıkça güvenmek, komboya yerel bir ChatGPT hedefi
+eklemek, heterojen sağlayıcı yetkilendirmesi için v1 kullanmak veya arayanı denetlediğinizde
+görevi düz metin v2 `agent_message` içeriği olarak yeniden göndermektir.
 
 Deneysel, varsayılan olarak devre dışı bırakılmış bir `agentTaskRecovery`
 seçeneği, `authMode: "forward"` ile kurallı `openai` sağlayıcısı tarafından
@@ -175,7 +215,7 @@ kurtarılan metni döndürdüğü için bayt bayt doğruluk garanti edilmez. Gen
 anahtarlı proxy arayanlarını reddeder ve herhangi bir arızada
 `unreadable_encrypted_agent_task`'i korur. Tam güven sınırı ve yapılandırma için
 [Ajan yapılandırması: Şifrelenmiş v2 görev
-kurtarma](/tr/reference/configuration/agents/#encrypted-v2-task-recovery)
+kurtarma](/tr/reference/configuration/agents/#şifrelenmiş-v2-görev-kurtarma)
 bölümüne bakın. Kombo yönlendirmesi değişmeden kalır ve şifrelenmiş görevler
 için yalnızca kurallı yerel ChatGPT hedeflerini değerlendirmeye devam eder.
 
@@ -210,7 +250,7 @@ kullanın:
 ocx agent status
 ocx agent injection set --model anthropic/claude-sonnet-5 --effort xhigh
 ocx agent subagents set gpt-5.6-sol,anthropic/claude-sonnet-5
-ocx agent fallback set gpt-5.4-mini,xai/grok-4.5 --poll-ms 60000
+ocx agent fallback set gpt-5.6-luna,xai/grok-4.5 --poll-ms 60000
 ocx agent effort set --subagent max
 ```
 
@@ -261,6 +301,10 @@ sayıya ayarlayan bir spawn kullanın.
 Seçicide gizlenmiş olabilir, beş modelli görüntüleme sınırının dışında olabilir,
 katalogda eksik olabilir veya v1'e sabitlenmiş olabilir. Bir `"v2"`, `null` veya
 bulunmayan arayüz değeri uygundur; gerçek bir `"v1"` sabitlemesi uygun değildir.
+
+### `spawn_agent` neden öne çıkarmadığım modelleri listeliyor?
+
+Codex sunduğu en fazla beş yuvayı katalogdan önceliğe göre doldurur. Beşten az model öne çıkardığınızda kalan yuvaları sonraki satırlar alır; yukarıdaki "`spawn_agent` hangi modelleri sunar?" bölümüne bakın.
 
 ### Mod değişiklikleri çalışan oturumları etkiler mi?
 
@@ -315,5 +359,3 @@ sabitler.
 
 Model bağlam sınırı alt ajan modundan bağımsızdır. Modeller sayfasında
 yapılandırın; yerel OpenAI modelleri gerçek bağlam pencerelerini korur.
-
-

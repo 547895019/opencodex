@@ -4,6 +4,7 @@ import * as os from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { recordOwnedConfigPath } from "../lib/config-ownership";
+import { assertNotRealHomeUnderTest } from "../lib/test-home-guard";
 import { getConfigDir } from "../config";
 import type { OAuthController, OAuthCredentials } from "./types";
 
@@ -107,6 +108,7 @@ function getDeviceId(): string {
     if ((e as { code?: string })?.code !== "ENOENT") throw e;
   }
   const id = randomUUID().replace(/-/g, "");
+  assertNotRealHomeUnderTest(getConfigDir());
   recordOwnedConfigPath(getConfigDir(), p);
   if (!existsSync(getConfigDir())) mkdirSync(getConfigDir(), { recursive: true });
   writeFileSync(p, id + "\n", { mode: 0o600 });
@@ -209,7 +211,15 @@ async function pollForToken(deviceCode: string, intervalMs: number, expiresInMs:
 
 export async function loginKimi(ctrl: OAuthController): Promise<OAuthCredentials> {
   const device = await requestDeviceAuthorization();
-  ctrl.onAuth?.({ url: device.verificationUriComplete, instructions: `Enter code: ${device.userCode}` });
+  // `deviceCode` carries the human-typed user code, matching the other device
+  // providers. It is also what tells the management login route this is a device
+  // flow, so a provider-supplied verification URI is no longer handed to a local
+  // browser spawn — the URL stays visible and copyable in every login surface.
+  ctrl.onAuth?.({
+    url: device.verificationUriComplete,
+    instructions: `Enter code: ${device.userCode}`,
+    deviceCode: device.userCode,
+  });
   return pollForToken(device.deviceCode, device.intervalMs, device.expiresInMs, ctrl.signal);
 }
 

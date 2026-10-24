@@ -27,11 +27,47 @@ description: Codex가 모든 모델에서 서브에이전트를 생성하고 관
 
 - **v1**은 모든 모델에 `multi_agent_version = "v1"`을 설정합니다.
 - **base**는 업스트림 핀을 복원합니다. 핀이 없는 항목은 기본 `multi_agent_v2` 기능 플래그를 따릅니다.
-- **v2**는 모든 모델에 `multi_agent_version = "v2"`를 설정합니다.
+- **v2**는 모든 모델에 `multi_agent_version = "v2"`를 설정합니다. 단 **ChatGPT를 v1로 유지**를 켜면 예외입니다: ChatGPT 네이티브 항목은 `"v1"`로 남고, 라우팅/콤보 항목은 `"v2"`가 됩니다.
 
 opencodex는 이 값을 Codex가 읽는 실시간 `/v1/models` 카탈로그와 디스크에 동기화된 카탈로그 모두에 마지막 단계로 적용합니다. 그래서 모드를 바꾸면 새로 만들어지는 App, CLI, TUI 세션에 일관되게 반영됩니다.
 
 v2 로스터의 경우 적합성은 세 가지 상태로 나뉩니다. `"v2"`로 표시된 항목, 명시적으로 `null`로 설정된 항목, 또는 `multi_agent_version` 필드가 없는 항목은 사용 가능합니다. 진짜 `"v1"` 핀은 해당 모델이 다른 협업 서피스에 속한다고 명시하므로 제외됩니다.
+
+## `spawn_agent`가 광고하는 모델
+
+Codex는 `spawn_agent` 도구 설명에 모델을 최대 5개까지 나열하며, 그 목록은 Codex가 직접 고릅니다. 선택기에 보이는 카탈로그 행을 `priority` 오름차순으로 정렬한 뒤 앞의 5개를 가져옵니다. **Subagents** 페이지의 로스터(`subagentModels`)는 로스터 순서대로 소속 모델에 가장 낮은 priority(계정 셀렉터가 없으면 `0`~`4`)를 주는 방식으로만 이 목록에 영향을 줍니다. 목록을 로스터로 제한하지는 않습니다.
+
+모델을 1~4개만 지정하면 Codex는 남은 칸을 priority 순으로 다음 행들로 채웁니다. 이 행들은 사용자가 고른 것이 아니며, 대시보드도 어떤 모델이 들어갔는지 보여 주지 않습니다. 어떤 행이 들어가는지는 카탈로그에 따라 다릅니다.
+
+| 카탈로그 | 남은 칸을 채우는 행 |
+| --- | --- |
+| Codex 계정 셀렉터 없음 | 나머지 라우팅 `provider/model` 행. 모두 priority `5`를 공유하므로 provider 이름, 그다음 모델 id의 알파벳 순서로 들어갑니다. 지정하지 않은 네이티브 GPT 행은 priority가 `100`에 지정한 id 수를 더한 값 이상이라 그 뒤에 옵니다. |
+| Codex 계정 셀렉터 있음 | 계정 지정 네이티브 행(`<selector>/<native-model>`). 지정한 행 바로 뒤에 옵니다. 지정하지 않은 라우팅 행은 priority `1005`로 옮겨져 그 뒤에 옵니다. |
+
+예를 들어 계정 셀렉터가 없고 로스터가 다음과 같으면:
+
+```json
+{ "subagentModels": ["xai/grok-4.5", "anthropic/claude-sonnet-5"] }
+```
+
+| 칸 | 모델 | Priority | 이유 |
+| ---: | --- | ---: | --- |
+| 1 | `xai/grok-4.5` | `0` | 로스터 첫 번째 항목 |
+| 2 | `anthropic/claude-sonnet-5` | `1` | 로스터 두 번째 항목 |
+| 3 | `deepseek/deepseek-v4-flash` | `5` | 알파벳 순으로 첫 번째인 남은 라우팅 행 |
+| 4 | `google/gemini-3-pro` | `5` | 다음 라우팅 행 |
+| 5 | `moonshot/kimi-k3` | `5` | 다음 라우팅 행 |
+| 6+ | `zai/glm-5.2`, 그다음 네이티브 GPT 행 | `5`, 그다음 `102` | 5개 밖 |
+
+로스터가 비어 있으면 opencodex는 아무것도 고정하지 않고, 5개는 카탈로그의 원래 priority를 따릅니다.
+
+채워진 칸도 일반 광고 항목이므로 메인 에이전트가 그 모델을 고를 수 있습니다. 이 목록은 허용 목록도 아닙니다. 메인 에이전트가 정확한 이름을 대면 Codex는 5개 밖의 카탈로그 모델도 받아들입니다. Codex가 광고하는 목록을 제어하려면:
+
+- 모델 5개를 지정하세요. 로스터가 가득 차면 채울 칸이 남지 않습니다.
+- 절대 제안되지 않았으면 하는 모델은 비활성화하거나 해당 provider의 `selectedModels`에서 빼세요. 비활성화되었거나 선택되지 않은 모델은 선택기에서 빠지므로 칸을 채울 수 없습니다.
+- `modelPickerOrder`는 Codex가 정렬에 쓰는 priority를 바꿉니다. 라우팅 행만 담은 목록은 나열된 미지정 행을 `1000` 이상으로 옮기므로, 나열되지 않은 라우팅 행이 먼저 칸을 채웁니다. bare 네이티브 id가 들어 있는 목록은 지정한 행까지 포함해 선택기 전체를 정렬합니다. 나열된 행이 앞에 오므로 나열되지 않은 어떤 행보다 먼저 광고 칸을 차지합니다. [Model ordering](/guides/model-ordering/)을 참고하세요.
+
+v2에서는 Codex가 5개를 고르기 전에 `"disabled"`로 고정된 행을 건너뜁니다. 그 밖에는 똑같이 동작합니다. opencodex v2 가이던스 로스터(`{{roster}}`)는 5개 안에 든, 설정된 로스터 모델만 나열합니다. 그래서 채워진 모델은 Codex 도구 설명에만 나타나고 opencodex 가이던스에는 나타나지 않습니다. Codex는 세션을 시작할 때 카탈로그를 읽으므로 로스터 변경은 새 세션부터 적용됩니다.
 
 ## 위임 모델과 추론 강도
 
@@ -56,7 +92,9 @@ v2 로스터의 경우 적합성은 세 가지 상태로 나뉩니다. `"v2"`로
 
 내장 v2 가이드는 700자 예산을 가집니다. 이 한도를 넘기면 opencodex는 핵심 스폰 지시를 자르는 대신 로스터를 먼저 제거합니다. 내장 가이드는 선호 모델, 적합한 로스터 또는 폴백 체인이 해석될 때만 발화합니다. 사용자 정의 프롬프트는 `injectionModel`만 설정되어 있어도 발화하며, 선택자가 없는 값을 하나로 해석할 수 없으면 `{{model}}`은 빈 문자열로 치환됩니다.
 
-v1에서는 opencodex가 `max` 또는 `ultra` 추론 강도에서만 업스트림 스타일의 능동 위임 가이드만 주입합니다. v1에는 선호 모델, 로스터, 폴백 목록, 사용자 정의 프롬프트를 추가하지 않습니다.
+v1에서는 opencodex가 `max` 또는 `ultra` 추론 강도에서만 v2 권장 프리셋과 같은 능동 위임 가이드를 주입합니다.
+별도의 위임 요청이 필요하지 않도록 시작 조건만 바꾸며, 사용자 지시와 권한·작업 범위·협업 도구 규칙은 계속 적용됩니다.
+v1에는 선호 모델, 로스터, 폴백 목록, 사용자 정의 프롬프트를 추가하지 않습니다.
 
 기본값이 꺼진 `syncCodexSubagentDefaults` 옵션은 가이드와 별개입니다. opencodex가 활성 Codex 라우팅을 소유하는 경우, 동기화나 재시작 시 선택한 값을 Codex TOML의 표식이 붙은 `[agents] default_subagent_model` 및 `default_subagent_reasoning_effort` 항목으로 쓸 수 있습니다. opencodex는 자신이 붙인 표식이 있는 필드만 갱신하거나 제거합니다. 대상 필드 중 하나라도 사용자 소유라면 부분 쓰기는 하지 않고 쌍을 그대로 둡니다. 애매한 TOML은 쓰기 없이 거부합니다. 외부 프로바이더 관리자와 사용자 소유 루트 라우팅도 여전히 최종 권한을 가집니다.
 
@@ -72,7 +110,7 @@ v1에서는 opencodex가 `max` 또는 `ultra` 추론 강도에서만 업스트�
 
 중복 모델 id는 첫 번째 출현을 유지한 채 제거합니다. 선택 과정에서 opencodex는 비활성화된 후보, 라우팅 불가 후보, 비활성화된 프로바이더가 받쳐주는 후보, unhealthy로 표시된 후보, cooldown 중인 후보, 사용할 수 있는 pooled Codex 계정이 없는 후보, 또는 설정된 quota 임계치를 넘는 후보를 건너뜁니다. 가용성 프로브는 기본값 60초인 `subagentModelFallbackPollMs` 동안 캐시됩니다.
 
-폴백이 호환되지 않는 암호화 작업을 읽을 수 있게 만들어 주지는 않습니다. 자식 작업이 ChatGPT용으로 암호화되어 있으면, 체인 앞쪽에 외부 모델이 있더라도 선택은 정규 네이티브 ChatGPT 대상만 허용됩니다.
+폴백이 호환되지 않는 암호화 작업을 읽을 수 있게 만들어 주지는 않습니다. 자식 작업이 ChatGPT용으로 암호화되어 있으면, 체인 앞쪽에 다른 외부 모델이 있더라도 정규 네이티브 ChatGPT 대상과 `allowEncryptedV2AgentTasks: true`로 명시적으로 신뢰한 직접 키 인증 Responses 라우트만 선택합니다. 콤보는 계속 정규 네이티브 대상만 사용합니다.
 
 ## 암호화된 v2 작업 전달
 
@@ -80,7 +118,7 @@ Codex는 v2 네이티브→라우팅 자식 작업을 백엔드 암호화된 `en
 
 opencodex는 읽을 수 없거나 빈 작업을 그대로 넘기지 않고 안전하게 실패합니다.
 
-- 비네이티브 직접 라우팅은 HTTP 400과 `error.code = "unreadable_encrypted_agent_task"`를 반환하며, 암호문을 에코하지 않습니다.
+- 비네이티브 직접 라우팅은 키 인증 Responses 프로바이더가 `allowEncryptedV2AgentTasks: true`로 명시적으로 허용한 경우가 아니면 HTTP 400과 `error.code = "unreadable_encrypted_agent_task"`를 반환하며, 암호문을 에코하지 않습니다.
 - 콤보는 해당 작업에 대해 재시도를 포함해 정규 네이티브 ChatGPT 대상만 고려합니다. 사용할 수 있는 대상이 없으면 같은 400 오류를 반환합니다.
 - 읽을 수 있는 평문 작업은 정상 라우트와 폴백 동작을 그대로 유지합니다.
 
@@ -115,7 +153,7 @@ ocx v2 threads 8
 ocx agent status
 ocx agent injection set --model anthropic/claude-sonnet-5 --effort xhigh
 ocx agent subagents set gpt-5.6-sol,anthropic/claude-sonnet-5
-ocx agent fallback set gpt-5.4-mini,xai/grok-4.5 --poll-ms 60000
+ocx agent fallback set gpt-5.6-luna,xai/grok-4.5 --poll-ms 60000
 ocx agent effort set --subagent max
 ```
 
@@ -158,6 +196,10 @@ curl -X PUT http://localhost:10100/api/injection-model \
 ### 왜 설정한 모델이 v2 로스터에서 빠지나요?
 
 선택기에서 숨겨져 있거나, 다섯 모델 표시 한도를 넘었거나, 카탈로그에 없거나, v1에 고정되어 있을 수 있습니다. `v2`, `null`, 또는 값이 없는 서피스 값은 사용할 수 있지만, 실제 `"v1"` 핀은 사용할 수 없습니다.
+
+### 지정하지 않은 모델이 왜 `spawn_agent` 목록에 보이나요?
+
+Codex는 광고하는 칸을 최대 5개까지 카탈로그에서 priority 순으로 채웁니다. 지정한 모델이 5개보다 적으면 다음 행들이 남은 칸을 차지합니다. 위의 "`spawn_agent`가 광고하는 모델" 절을 참고하세요.
 
 ### 모드를 바꾸면 실행 중인 세션에도 반영되나요?
 

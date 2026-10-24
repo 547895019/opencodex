@@ -1,19 +1,49 @@
 import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../types";
 import { modelInList, toolChoiceToolPredicate } from "../types";
+import { requiresVisionPreprocessing } from "../vision";
 import type { SidecarSettings } from "./executor";
+import type { CodexAuthPolicyConfig } from "../codex/auth-context";
+import { isCodexReserveRequestEligible } from "../codex/loopback-target";
+import type { DataPlaneAdmission } from "../server/auth-cors";
 import type { ResolvedOpenAiForwardSidecar } from "../providers/openai-sidecar";
-import { getAccountSet } from "../oauth/store";
+import { resolveSidecarAuth, resolveAnthropicHelperInstance, withAnthropicHelperRefusal } from "../sidecar/auth";
+import { validateXaiSearchOptions, type XaiSearchOptions } from "./xai-executor";
+import type { OcxWebSearchSidecarConfig } from "../types";
 import { DEFAULT_STALL_TIMEOUT_SEC } from "../stall-timeout";
 import { buildWebSearchTool, extractHostedWebSearch, WEB_SEARCH_TOOL_NAME } from "./synthetic-tool";
+import {
+  findAnthropicSidecarProvider,
+  findGeminiSidecarProvider,
+  findXaiSidecarProvider,
+  resolveSidecarBackend,
+  xaiSearchOptionsFromConfig,
+  type AnthropicSidecarProvider,
+  type WebSearchBackendId,
+} from "./sidecar-providers";
 
 export { runWithWebSearch } from "./loop";
 export { buildWebSearchTool, extractHostedWebSearch, WEB_SEARCH_TOOL_NAME };
 export { runAnthropicWebSearch, parseAnthropicSidecarSSE } from "./anthropic-executor";
-export { runOllamaWebSearch } from "./ollama-executor";
+export { runXaiWebSearch, parseXaiResponsesSSE, validateXaiSearchOptions, type XaiSearchOptions } from "./xai-executor";
+export { runGeminiWebSearch, mapCcaGroundedResponse } from "./gemini-executor";
+export { runExaWebSearch, mapExaSearchResponse } from "./exa-executor";
+export {
+  findAnthropicSidecarProvider,
+  findGeminiSidecarProvider,
+  findXaiSidecarProvider,
+  resolveSidecarBackend,
+  xaiSearchOptionsFromConfig,
+  type AnthropicSidecarProvider,
+  type WebSearchBackendId,
+};
 
 const DEFAULT_SIDECAR_MODEL = "gpt-5.6-luna";
 // Default Claude model for the anthropic-backed sidecar (used when cfg.model is unset).
 const DEFAULT_ANTHROPIC_SIDECAR_MODEL = "claude-sonnet-5";
+// Default Grok model for the xai-backed sidecar (probe-verified with hosted tools, devlog 003).
+const DEFAULT_XAI_SIDECAR_MODEL = "grok-4.6";
+// Default Gemini model for the gemini-backed sidecar (CCA grounding probe, devlog 002).
+const DEFAULT_GEMINI_SIDECAR_MODEL = "gemini-3.8-flash";
 // "low" is the lightest effort the ChatGPT backend allows with web_search ("minimal" is rejected:
 // "tools cannot be used with reasoning.effort 'minimal'") — keeps the sidecar fast/cheap.
 const DEFAULT_SIDECAR_REASONING = "low";
@@ -85,102 +115,21 @@ export function webSearchStallTimeoutSec(
   return Math.min(Number.MAX_VALUE, Math.ceil(largestUnitSec) + STALL_MARGIN_SEC);
 }
 
-/** A configured anthropic-adapter OAuth provider whose ACTIVE stored account is usable (not needs-reauth). */
-export interface AnthropicSidecarProvider {
-  providerName: string;
-  provider: OcxProviderConfig;
-}
-
-/**
- * A configured ollama provider resolved for the web-search sidecar. Unlike the openai/anthropic
- * backends, ollama has no model-internal search tool — the sidecar calls the standalone web_search
- * REST endpoint and then summarizes via a chat/responses completion on the SAME provider. So we need
- * the provider's baseUrl/adapter/apiKey, and the native model id comes from `cfg.model` (the GUI
- * stores the bare model id; no routeModel lookup is needed, mirroring the anthropic backend).
- *
- * Both `openai-chat` (→ /chat/completions) and `openai-responses` (→ /responses) adapters are
- * accepted: the ollama daemon's OpenAI-compatible surface speaks either, and users may run their main
- * model through the responses adapter. The executor branches the summarize wire format on adapter.
- * Ollama needs no credential for local web_search — the daemon signs requests to ollama cloud
- * internally — so "usable" just means "present, not disabled, and an OpenAI-compatible adapter".
- */
-export interface OllamaSidecarProvider {
-  providerName: string;
-  provider: OcxProviderConfig;
-}
-
-/**
- * First enabled anthropic-adapter OAuth provider whose ACTIVE account holds a usable credential — the
- * only path that can run web_search_20250305 without a ChatGPT forward provider. Presence is decided by
- * getAccountSet + the active account's `needsReauth` marker (audit F1: getCredential alone can pick a
- * terminally-invalid account); token refresh happens later at executor time.
- */
-export function findAnthropicSidecarProvider(config: OcxConfig): AnthropicSidecarProvider | undefined {
-  for (const [name, prov] of Object.entries(config.providers)) {
-    if (prov.disabled === true) continue;
-    if (prov.adapter !== "anthropic" || prov.authMode !== "oauth") continue;
-    const set = getAccountSet(name);
-    const active = set?.accounts.find(a => a.id === set.activeAccountId);
-    if (active && active.needsReauth !== true) return { providerName: name, provider: prov };
-  }
-  return undefined;
-}
-
-/**
- * Find the ollama provider for the sidecar by scanning config.providers (NOT routeModel): the GUI
- * stores the BARE model id, so routeModel would route `glm-5.2:cloud` to the default provider
- * (often "openai") — wrong. Instead we identify the ollama provider directly, by config key "ollama"
- * (the registry default id) or by an ollama host root (the local daemon on :11434, or ollama.com).
- * The web_search endpoint lives at the daemon's host root, so the baseUrl host is the principled
- * discriminator. Only OpenAI-compatible adapters qualify, since the executor summarizes via
- * /chat/completions or /responses.
- */
-export function findOllamaSidecarProvider(config: OcxConfig): OllamaSidecarProvider | undefined {
-  for (const [name, prov] of Object.entries(config.providers)) {
-    if (prov.disabled === true) continue;
-    if (prov.adapter !== "openai-chat" && prov.adapter !== "openai-responses") continue;
-    // Identify the ollama provider: by the conventional registry key, or by an ollama host root
-    // (local daemon on :11434, or ollama.com / *.ollama.com). Strip a trailing /v1 before parsing.
-    let host = "";
-    try {
-      const stripped = (prov.baseUrl ?? "").replace(/\/v1\/?$/, "").replace(/\/+$/, "");
-      host = stripped ? new URL(stripped).host.toLowerCase() : "";
-    } catch {
-      host = "";
-    }
-    const isOllamaHost =
-      host === "ollama.com" ||
-      host.endsWith(".ollama.com") ||
-      host === "localhost:11434" ||
-      host === "127.0.0.1:11434";
-    if (name === "ollama" || isOllamaHost) return { providerName: name, provider: prov };
-  }
-  return undefined;
-}
-
-/**
- * Precedence: explicit config wins; unset defaults to "openai" (ChatGPT forward path). The
- * anthropic backend (web_search_20250305) is only used when explicitly configured — auto-selecting
- * it from credential availability caused the sidecar to send incompatible models (e.g. gpt-5.6-luna)
- * to the Anthropic API. The ollama backend is likewise opt-in only.
- */
-export function resolveSidecarBackend(
-  explicit: "openai" | "anthropic" | "ollama" | undefined,
-): "openai" | "anthropic" | "ollama" {
-  if (explicit === "anthropic") return "anthropic";
-  if (explicit === "ollama") return "ollama";
-  return "openai";
-}
-
 export interface SidecarPlan {
-  /** Which executor runs the search. Anthropic/Ollama do not require a forward provider. */
-  backend: "openai" | "anthropic" | "ollama";
-  /** Present for the openai backend (ChatGPT forward path); undefined for anthropic/ollama. */
+  /** Which executor runs the search. Anthropic does not require a forward provider. */
+  backend: WebSearchBackendId;
+  /** Present for the openai backend (ChatGPT forward path); undefined for anthropic. */
   forwardSidecar?: ResolvedOpenAiForwardSidecar;
   /** Present for the anthropic backend (stored-OAuth /v1/messages path); undefined for openai/ollama. */
   anthropicSidecar?: AnthropicSidecarProvider;
-  /** Present for the ollama backend (local/hosted web_search + summarize); undefined for openai/anthropic. */
-  ollamaSidecar?: OllamaSidecarProvider;
+  /** Present for the xai backend (stored Grok OAuth /v1/responses path). */
+  xaiSidecar?: { providerName: string; provider: OcxProviderConfig };
+  /** Present for the gemini backend (Antigravity CCA grounding path). */
+  geminiSidecar?: { providerName: string; provider: OcxProviderConfig };
+  /** Opt-in x_search options for the xai backend (validated at the management layer and again in the executor). */
+  xaiSearchOptions?: XaiSearchOptions;
+  /** Presence marker for the exa backend — the API key itself never rides the plan. */
+  exaConfigured?: true;
   hostedTool: Record<string, unknown>;
   settings: SidecarSettings;
   maxSearches: number;
@@ -198,6 +147,7 @@ export function shouldResolveOpenAiWebSearchSidecar(
   isPassthrough: boolean,
 ): boolean {
   if (!parsed._webSearch || isPassthrough) return false;
+  if (!toolChoiceToolPredicate(parsed.options.toolChoice)(buildWebSearchTool())) return false;
   const cfg = config.webSearchSidecar ?? {};
   return cfg.enabled !== false && resolveSidecarBackend(cfg.backend) === "openai";
 }
@@ -215,6 +165,11 @@ export function planWebSearch(
   provider: OcxProviderConfig,
   modelId: string,
   openAiSidecar?: ResolvedOpenAiForwardSidecar,
+  options: {
+    admission?: Pick<DataPlaneAdmission, "source">;
+    codexAuthPolicy?: CodexAuthPolicyConfig;
+    providerName?: string;
+  } = {},
 ): SidecarPlan | undefined {
   if (!parsed._webSearch || isPassthrough) return undefined;
   if (!toolChoiceToolPredicate(parsed.options.toolChoice)(buildWebSearchTool())) return undefined;
@@ -224,8 +179,17 @@ export function planWebSearch(
   const routedModelStallTimeoutMs = resolveRoutedModelStallTimeoutMs(cfg.routedModelStallTimeoutMs);
   // Same `?? 200_000` default the server applies when threading connectTimeoutMs into the loop.
   const connectTimeoutMs = config.connectTimeoutMs ?? 200_000;
-  const anthropicSidecar = findAnthropicSidecarProvider(config);
+  // Shared auth state (#2188): presence only — backend PREFERENCE stays with
+  // resolveSidecarBackend's explicit-or-openai contract.
   const backend = resolveSidecarBackend(cfg.backend);
+  // Only the anthropic backend can be refused; an unavailable selected pool means no plan, so the
+  // main request takes the normal path instead of failing or borrowing another pool.
+  const auth = withAnthropicHelperRefusal("web-search", () => resolveSidecarAuth(config, resolveAnthropicHelperInstance(config,
+    { backendFamily: backend, anthropicInstance: cfg.anthropicInstance, parentProviderName: options.providerName })));
+  if (!auth) return undefined;
+  const anthropicSidecar = auth.isAnthropicAuth && auth.anthropicProviderName && auth.anthropicProvider
+    ? { providerName: auth.anthropicProviderName, provider: auth.anthropicProvider, config }
+    : undefined;
   const maxSearches = cfg.maxSearchesPerTurn ?? DEFAULT_MAX_SEARCHES;
   const stallTimeoutSec = webSearchStallTimeoutSec(
     config.stallTimeoutSec,
@@ -233,8 +197,9 @@ export function planWebSearch(
     routedModelStallTimeoutMs,
     timeoutMs,
   );
-  // The routed model being text-only means the search model must verbalize image results (either backend).
-  const describeImages = modelInList(provider.noVisionModels, modelId);
+  // A target proven unable to accept image input receives verbalized image results instead of
+  // search-result images. A genuinely unknown custom target keeps the established pass-through.
+  const describeImages = requiresVisionPreprocessing(config, provider, modelId, options.providerName);
   const reasoning = cfg.reasoning ?? DEFAULT_SIDECAR_REASONING;
   const streamRoutedModelOutput = cfg.streamRoutedModelOutput === true;
 
@@ -256,23 +221,54 @@ export function planWebSearch(
     };
   }
 
-  // Ollama backend: calls the ollama web_search REST endpoint (local daemon keyless, or hosted
-  // ollama.com with a bearer API key) and summarizes the results via the SAME ollama provider. The
-  // model is mandatory — there is no sensible default ollama model, so fail closed without one
-  // (mirrors the vision routed backend). The provider is found by scanning config.providers
-  // (findOllamaSidecarProvider), NOT routeModel: the GUI stores the BARE model id, so routeModel
-  // would mis-route it to the default provider. cfg.model is sent to ollama verbatim as the native
-  // model id (any "ollama/" prefix is stripped defensively).
-  if (backend === "ollama") {
-    const ollamaSidecar = findOllamaSidecarProvider(config);
-    if (!ollamaSidecar) return undefined;
-    const nativeModelId = stripProviderPrefix(cfg.model);
-    if (!nativeModelId) return undefined;
+  // xAI backend (L7): explicit-only, authenticated by the STORED Grok OAuth credential.
+  // Same fail-closed stance as anthropic — an explicit choice with no usable credential
+  // produces no plan instead of borrowing another login.
+  if (backend === "xai") {
+    const xaiSidecar = findXaiSidecarProvider(config);
+    if (!xaiSidecar) return undefined;
+    const xaiOptions = xaiSearchOptionsFromConfig(cfg);
+    if (validateXaiSearchOptions(xaiOptions)) return undefined;
     return {
-      backend: "ollama",
-      ollamaSidecar,
+      backend: "xai",
+      xaiSidecar,
+      xaiSearchOptions: xaiOptions,
       hostedTool: parsed._webSearch,
-      settings: { model: nativeModelId, reasoning, timeoutMs, describeImages },
+      settings: { model: cfg.model ?? DEFAULT_XAI_SIDECAR_MODEL, reasoning, timeoutMs, describeImages },
+      maxSearches,
+      routedModelStallTimeoutMs,
+      stallTimeoutSec,
+      streamRoutedModelOutput,
+    };
+  }
+
+  // Gemini backend (L8): explicit-only, authenticated by the stored Antigravity CCA
+  // OAuth credential; requires the discovered projectId. Fail-closed like the others.
+  if (backend === "gemini") {
+    const geminiSidecar = findGeminiSidecarProvider(config);
+    if (!geminiSidecar) return undefined;
+    return {
+      backend: "gemini",
+      geminiSidecar,
+      hostedTool: parsed._webSearch,
+      settings: { model: cfg.model ?? DEFAULT_GEMINI_SIDECAR_MODEL, reasoning, timeoutMs, describeImages },
+      maxSearches,
+      routedModelStallTimeoutMs,
+      stallTimeoutSec,
+      streamRoutedModelOutput,
+    };
+  }
+
+  // exa (L9): explicit-only, keyed by the operator-supplied exaApiKey. The KEY never
+  // rides the plan object — core.ts reads it from config at unpack time; the plan
+  // carries only a presence marker. Fail-closed without a key.
+  if (backend === "exa") {
+    if (!cfg.exaApiKey) return undefined;
+    return {
+      backend: "exa",
+      exaConfigured: true,
+      hostedTool: parsed._webSearch,
+      settings: { model: cfg.model ?? DEFAULT_SIDECAR_MODEL, reasoning, timeoutMs, describeImages },
       maxSearches,
       routedModelStallTimeoutMs,
       stallTimeoutSec,
@@ -286,7 +282,10 @@ export function planWebSearch(
     backend: "openai",
     forwardSidecar: openAiSidecar,
     hostedTool: parsed._webSearch,
-    settings: { model: cfg.model ?? DEFAULT_SIDECAR_MODEL, reasoning, timeoutMs, describeImages },
+    settings: {
+      model: cfg.model ?? DEFAULT_SIDECAR_MODEL, reasoning, timeoutMs, describeImages,
+      ...(isCodexReserveRequestEligible(options.codexAuthPolicy ?? config, options.admission) ? { reserveCompatibility: true } : {}),
+    },
     maxSearches,
     routedModelStallTimeoutMs,
     stallTimeoutSec,
