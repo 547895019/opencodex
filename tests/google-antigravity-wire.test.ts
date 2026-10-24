@@ -56,11 +56,11 @@ describe("antigravity CCA envelope", () => {
     expect(env.request.model).toBeUndefined();
     expect(env.request.safetySettings).toBeUndefined();
     expect(req.headers["Authorization"]).toBe("Bearer ya29.token");
-    expect(req.headers["User-Agent"]).toMatch(/^antigravity\/cli\/[\d.]+ \(aidev_client; os_type=\w+; arch=\w+\)$/);
+    expect(req.headers["User-Agent"]).toBe("antigravity/cli/1.1.13 (aidev_client; os_type=linux; arch=arm64)");
     // The literal "antigravity" giveaway UA must no longer be sent.
     expect(req.headers["User-Agent"]).not.toBe("antigravity");
-    // x-goog-api-client is NOT sent on runtime requests (CLIProxyAPI only uses it during onboarding).
-    expect(req.headers["x-goog-api-client"]).toBeUndefined();
+    // Match the official Antigravity client library fingerprint on runtime requests too.
+    expect(req.headers["x-goog-api-client"]).toBe("google-api-nodejs-client/10.3.0");
     // sessionId lives only at request.sessionId (no top-level / snake_case duplicate).
     expect(env.request.sessionId).toMatch(/^-/);
     expect(env.request.session_id).toBeUndefined();

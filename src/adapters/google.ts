@@ -19,6 +19,7 @@ import { fetchAntigravityWithRetry, fetchVertexWithRetry } from "./google-http";
 import { safeAntigravityHttpErrorMessage, safeVertexHttpErrorMessage } from "./google-errors";
 import { isVertexTruncatedTurn, vertexTruncationErrorMessage } from "./google-truncation";
 import { ANTIGRAVITY_REQUEST_UA, antigravitySessionId, isLikelyRealThoughtSignature, sanitizeAntigravityClaudeSignatures } from "./google-antigravity-wire";
+import { ANTIGRAVITY_GOOG_API_CLIENT_UA } from "./client-fingerprint";
 import { compileGoogleWireBody } from "./google-wire-compiler";
 import { identifyRoutedModel } from "./identity";
 import { antigravityUsesReplayCache, applyAntigravityReplay, clearAntigravityReplay, observeAntigravityReplay } from "./google-antigravity-replay";
@@ -459,6 +460,7 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           request,
         };
         headers["User-Agent"] = ANTIGRAVITY_REQUEST_UA;
+        headers["x-goog-api-client"] = ANTIGRAVITY_GOOG_API_CLIENT_UA;
         headers["Authorization"] = `Bearer ${token}`;
         return { url, method: "POST", headers, body: JSON.stringify(envelope) };
       }

@@ -258,10 +258,10 @@ export const CLAUDE_CODE_HEADERS: Record<string, string> = {
 
 // ── Antigravity CLI (unchanged) ──
 
-/** Pinned fallback Antigravity CLI version (real client fetches a manifest; we pin to avoid the network dependency). */
-export const ANTIGRAVITY_CLI_VERSION = "1.0.13";
+/** Match the installed Antigravity CLI used by the OAuth account. */
+export const ANTIGRAVITY_CLI_VERSION = "1.1.13";
 const ANTIGRAVITY_CLI_CLIENT_NAME = "aidev_client";
-const ANTIGRAVITY_CLI_PLATFORM = "darwin/arm64";
+const ANTIGRAVITY_CLI_PLATFORM = "linux/arm64";
 /** Secondary Google API client UA the Antigravity client library reports. */
 export const ANTIGRAVITY_GOOG_API_CLIENT_UA = "google-api-nodejs-client/10.3.0";
 
