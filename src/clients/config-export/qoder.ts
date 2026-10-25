@@ -80,13 +80,16 @@ export function buildQoderContribution(ctx: ExportContext): ManagedContribution 
     clientId: "qoder",
     fragments: [
       { path: ["providers", OPENCODE_PROVIDER_ID], value: doc.providers[OPENCODE_PROVIDER_ID] },
-      ...doc.modelConfigs.customModels.map(model => {
+      ...doc.modelConfigs.customModels.flatMap(model => {
         const selector = formatSelectorConjunction([
           { field: "provider", value: OPENCODE_PROVIDER_ID },
           { field: "model", value: model.model },
         ]);
-        if (selector === null) throw new Error("Qoder model ID cannot be represented by a managed array selector.");
-        return { path: ["modelConfigs", "customModels", selector], value: model };
+        // The selector grammar reserves `,` and `]`; a model id holding either cannot be
+        // addressed unambiguously. Ship that row without its model rule (same contract as
+        // droid/zcode-store) instead of failing the whole integrations status read.
+        if (selector === null) return [];
+        return [{ path: ["modelConfigs", "customModels", selector], value: model }];
       }),
     ],
   };
