@@ -1570,6 +1570,7 @@
     "responses-item-id-repair.test.ts": "responses",
     "responses-json-events.test.ts": "responses",
     "responses-legacy-dotted-tool-name-repair.test.ts": "responses",
+    "responses-unrepresentable-tool-name-repair.test.ts": "responses",
     "responses-muse-tool-name-alias.test.ts": "responses",
     "responses-muse-tool-choice.test.ts": "responses",
     "responses-native-main-refresh.test.ts": "responses",

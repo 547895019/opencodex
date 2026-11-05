@@ -1114,6 +1114,7 @@
   "responses-inbound-store-default.test.ts": "responses", "responses-item-id-repair.test.ts": "responses",
   "codex-0164-request-compat.test.ts": "responses",
   "responses-json-events.test.ts": "responses", "responses-legacy-dotted-tool-name-repair.test.ts": "responses",
+  "responses-unrepresentable-tool-name-repair.test.ts": "responses",
   "responses-muse-tool-name-alias.test.ts": "responses", "responses-muse-tool-choice.test.ts": "responses",
   "responses-native-main-refresh.test.ts": "responses", "responses-opaque-blob-recovery.test.ts": "responses", "responses-cold-opaque-recovery.test.ts": "responses",
   "responses-parser-agent-message.test.ts": "responses", "responses-parser-malformed-content.test.ts": "responses",

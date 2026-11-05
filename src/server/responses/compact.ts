@@ -28,6 +28,7 @@ import { FORWARD_HEADERS, sanitizeReasoningInputContent } from "../../adapters/o
 import { stripProviderInputItemMetadata } from "../../adapters/openai-responses/request-strips";
 import { expandPreviousResponseInput, previousResponseProviderState, rememberResponseState } from "../../responses/state";
 import { repairLegacyDottedToolCallNames } from "../../responses/legacy-dotted-tool-name-repair";
+import { repairUnrepresentableToolCallNames } from "../../responses/unrepresentable-tool-name-repair";
 import { NoEligiblePolicyCandidateError, routeCompactionModel } from "../../router";
 import { evidenceFromBody } from "../../routing/request-evidence";
 import {
@@ -950,7 +951,8 @@ export async function handleResponsesCompact(
     // call-name repair the adapter applies. A damaged item here refuses the compaction itself,
     // which is the request a long task depends on to keep going.
     // This branch is OpenAI-only and bypasses the adapter's Google replay projection (#7111).
-    const compactBody = repairLegacyDottedToolCallNames(
+    // The unrepresentable repair is applied outside, below, for the same stored-history reason.
+    const dottedRepairedBody = repairLegacyDottedToolCallNames(
       stripProviderInputItemMetadata(sanitizeReasoningInputContent(compactBodyRaw, {
         preserveRawReasoningContent: !isOpenAiOperatedResponsesDestination(compactProvider)
           && compactProvider.preserveResponsesReasoningContent === true,
@@ -959,6 +961,7 @@ export async function handleResponsesCompact(
         requirePlaintextReasoning: requireCompactPlaintextReasoning,
       })),
     ) as typeof compactBodyRaw;
+    const compactBody = repairUnrepresentableToolCallNames(dottedRepairedBody) as typeof compactBodyRaw;
     {
       const binding = conversationStateBindingFromAuth(authCtx, codexPoolAffinityKey(req.headers));
       if (binding) {

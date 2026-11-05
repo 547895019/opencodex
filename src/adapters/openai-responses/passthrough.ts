@@ -24,6 +24,7 @@ import { rewriteRoutedCustomToolsForUpstream, validateFinalCustomToolCompatibili
 import { rewriteRoutedToolSearchForUpstream } from "../../responses/tool-search-compat";
 import { rewriteRoutedNamespaceToolsForUpstream } from "../../responses/namespace-tool-compat";
 import { repairLegacyDottedToolCallNames } from "../../responses/legacy-dotted-tool-name-repair";
+import { repairUnrepresentableToolCallNames } from "../../responses/unrepresentable-tool-name-repair";
 import { preparePlaintextV2AgentMessages } from "../../responses/plaintext-v2-agent-messages";
 import { isMetaAiResponsesDestination, rewriteMuseToolNamesForUpstream } from "../../responses/muse-tool-name-alias";
 import { buildResponsesTransport } from "./transport";
@@ -313,6 +314,12 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
       // canonical-destination split below, because the reported failure was a side chat on a plain
       // OpenAI model inheriting history a routed provider had damaged.
       outBody = repairLegacyDottedToolCallNames(outBody);
+      // Same stored-history class as #5095, one stricter regex over: a name outside
+      // `^[a-zA-Z0-9_.-]+$` (tool names a degraded model stream once emitted) is refused by the
+      // destination on every later replay. Both repairs are no-ops on the other's shape — a
+      // dotted name is itself legal here, an unrepresentable one never starts with `default.` —
+      // so the order between them cannot matter.
+      outBody = repairUnrepresentableToolCallNames(outBody);
       // Shared HTTP/WS outbound projection, including concrete combo/fallback destinations.
       if (isOpenAiOperatedResponsesDestination(provider)) {
         outBody = stripProviderInputItemMetadata(outBody);
