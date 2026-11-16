@@ -322,7 +322,12 @@ describe("unicode property-escape pattern stripping", () => {
     expect(stripped.properties.field.type).toBe("string");
     expect(stripped.properties.field.description).toBe("keep me");
     expect(stripped.properties.collection.pattern).toBe("^(?!\\.\\.?(?:/|$))[A-Za-z0-9_\\-.~:@+]{1,200}$");
-    expect(stripped.properties.plain.pattern).toBe("^[a-z0-9_-]{1,64}$");
+    // The trailing unescaped dash is literal in Annex-B/Python but invalid under a strict
+    // Unicode-Sets grammar, so this is repaired, not dropped; the member set is unchanged.
+    expect(stripped.properties.plain.pattern).toBe("^[a-z0-9_\\-]{1,64}$");
+    expect(new RegExp(stripped.properties.plain.pattern).test("abc_123")).toBe(true);
+    expect(new RegExp(stripped.properties.plain.pattern).test("a-b_c")).toBe(true);
+    expect(new RegExp(stripped.properties.plain.pattern).test("has space")).toBe(false);
   });
 
   test("clones only affected paths across a broad schema", () => {
@@ -682,6 +687,108 @@ describe("unicode property-escape pattern stripping", () => {
     expect(wire.tools).toHaveLength(1);
     expect(wire.tools[0].function.parameters).toEqual(JSON.parse(original));
     expect(JSON.stringify(parameters)).toBe(original);
+  });
+
+});
+
+describe("Annex-B class-bracket pattern repair", () => {
+  // The dots workspace MCP server declares its task-model ids with this pattern; the unescaped
+  // class-internal `[` and trailing `-` are literal members for Annex-B/Python engines but
+  // OpenAI's strict schema validator answers 400 "is not a \"regex\"" to the whole request.
+  const dotsModelPattern = "^[A-Za-z0-9._[\\]-]*$";
+
+  test("repairs the Annex-B-only brackets and trailing dash a Unicode-Sets grammar rejects", () => {
+    const before = {
+      type: "string",
+      pattern: dotsModelPattern,
+      description: "Model id from the platform model-options list",
+    };
+    const out = stripUnicodePropertyPatterns(before) as typeof before;
+
+    expect(out.pattern).toBe("^[A-Za-z0-9._\\[\\]\\-]*$");
+    expect(out.description).toBe(before.description);
+    expect(before.pattern).toBe(dotsModelPattern);
+    // Identical member set under a lenient engine before and after.
+    for (const s of ["", "a.b_C-", "[1m]", "[]-x", "a/b", "has space"]) {
+      expect(new RegExp(out.pattern).test(s)).toBe(new RegExp(dotsModelPattern).test(s));
+    }
+  });
+
+  test("a Unicode-Sets-valid pattern with unescaped class brackets is never rewritten", () => {
+    // Nested classes are required v-syntax; escaping them would corrupt a working pattern.
+    const before = { type: "string", pattern: "[[a-f]g]" };
+    expect(stripUnicodePropertyPatterns(before)).toBe(before);
+  });
+
+  test("the first-position `]` member idioms are escaped", () => {
+    expect((stripUnicodePropertyPatterns({ type: "string", pattern: "[]x]" }) as { pattern: string }).pattern)
+      .toBe("[\\]x]");
+    expect((stripUnicodePropertyPatterns({ type: "string", pattern: "[^]x]" }) as { pattern: string }).pattern)
+      .toBe("[^\\]x]");
+  });
+
+  test("a trailing dash before the class close is escaped, a range dash is not", () => {
+    expect((stripUnicodePropertyPatterns({ type: "string", pattern: "[a-]" }) as { pattern: string }).pattern)
+      .toBe("[a\\-]");
+    const range = { type: "string", pattern: "[a-f]" };
+    expect(stripUnicodePropertyPatterns(range)).toBe(range);
+  });
+
+  test("a dash followed by an escape atom stays a range and passes fail-closed if v-invalid", () => {
+    // `[a-\[]` is out-of-order-range in every grammar, so the repair must not touch it.
+    const before = { type: "string", pattern: "[a-\\[]" };
+    expect(stripUnicodePropertyPatterns(before)).toBe(before);
+  });
+
+  test("composes with the NUL rewrite on a single pattern", () => {
+    expect((stripUnicodePropertyPatterns({ type: "string", pattern: "^[^\\0[\\]-]*$" }) as { pattern: string }).pattern)
+      .toBe("^[^\\x00\\[\\]\\-]*$");
+  });
+
+  test("a pattern-key inside a name bag is data, untouched", () => {
+    // A caller-chosen property literally named `pattern` maps a *value* schema; the keyword
+    // beneath it is still a keyword, but the name bag keys stay data.
+    const schema = { type: "string", pattern: "^[A-Za-z0-9._[\\]-]*$" };
+    const before = { properties: { pattern: schema }, $defs: { pattern: schema } };
+    const out = stripUnicodePropertyPatterns(before) as typeof before;
+    expect(out).not.toBe(before);
+    expect(out.properties.pattern.pattern).toBe("^[A-Za-z0-9._\\[\\]\\-]*$");
+    expect(out.$defs.pattern).toBe(schema); // $defs is a preserved subtree, reference intact
+  });
+
+  test("a repair that cannot reach Unicode-Sets validity leaves the original fail-closed", () => {
+    // Python-only constructs stay as-is, exactly as before this repair existed.
+    const before = { type: "string", pattern: "(?P<x>a)\\1" };
+    expect(stripUnicodePropertyPatterns(before)).toBe(before);
+  });
+
+  test("the chat wire carries the repaired schema for an MCP-style tool", () => {
+    const request = createOpenAIChatAdapter(provider()).buildRequest({
+      ...parsed(),
+      context: {
+        messages: [{ role: "user", content: "create a dot task", timestamp: 0 }],
+        tools: [{
+          name: "dots_create_task",
+          namespace: "mcp__dots",
+          description: "Create a task",
+          parameters: {
+            type: "object",
+            properties: {
+              title: { type: "string", description: "Short task title" },
+              model: { type: "string", pattern: dotsModelPattern, maxLength: 120 },
+            },
+            required: ["title"],
+          },
+        }],
+      },
+    });
+
+    const body = JSON.parse(request.body) as {
+      tools: Array<{ function: { parameters: { properties: Record<string, { pattern?: string; maxLength?: number }> } } }>;
+    };
+    const wire = body.tools[0].function.parameters.properties.model;
+    expect(wire.pattern).toBe("^[A-Za-z0-9._\\[\\]\\-]*$");
+    expect(wire.maxLength).toBe(120);
   });
 
 });

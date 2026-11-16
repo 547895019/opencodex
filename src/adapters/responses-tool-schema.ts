@@ -119,9 +119,111 @@ function rewriteNulEscapes(pattern: string): string {
 }
 
 /**
+ * True when the destination's strict pattern grammar (Unicode Sets mode) accepts the pattern.
+ * Escaping class-internal punctuation is a no-op for every engine that accepted the original,
+ * so this flag is used twice: never rewrite a pattern that is already accepted (v-authored
+ * nested classes depend on unescaped brackets and must not be touched), and only keep a
+ * rewrite the same grammar then accepts — otherwise the original passes through fail-closed.
+ */
+function isUnicodeSetsPattern(pattern: string): boolean {
+  try {
+    new RegExp(pattern, "v");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Escape the punctuation that Annex-B (and Python `re`) accept literally inside a character
+ * class but the strict Unicode-Sets grammar rejects. The live case: an MCP tool declaring
+ * `^[A-Za-z0-9._[\]-]*$` — the unescaped `[` and the trailing dash are literal members in
+ * Annex-B — made OpenAI's schema validator answer 400 "is not a \"regex\"" to every request
+ * carrying the tool. Each candidate is only rewritten at the class-internal position whose
+ * Annex-B reading is "member, not meta":
+ *
+ * - an unescaped inner `[` → `\[`;
+ * - a first-position unescaped `]` (the Annex-B `[]x]` / `[^]x]` idioms, where it is a member)
+ *   → `\]`; a later `]` still closes the class;
+ * - a dash that cannot be a range operator because the class closes right after it → `\-`
+ *   (the Unicode-Sets grammar refuses that trailing unescaped dash; `[a-]` and the dots case
+ *   `…\]-]` both need it). A dash with a following atom is a range operator in both grammars
+ *   and is left alone.
+ *
+ * A dash followed by an atom is a range operator in both grammars and is left alone;
+ * constructs where the two grammars genuinely disagree (`[a-b-c]`) stay here untouched and
+ * fall to the caller's fail-closed gate. Escape pairs are consumed whole, so `\]`, `\\` and
+ * `\x00` members are never candidates, and a dash followed by an escape atom (`a-\[`, a
+ * range) is likewise kept. Returns the input when nothing is a candidate, and the caller
+ * keeps only rewrites the strict grammar accepts.
+ */
+function repairLenientClassBrackets(pattern: string): string | undefined {
+  let out: string | undefined;
+  let copied = 0;
+  let inClass = false;
+  // Still inside the opener's `[^` prefix: the very first member slot, where Annex-B reads a
+  // `]` as a member. `^` only consumes that slot.
+  let firstSlot = false;
+  // Index of an in-class dash that may turn out to be a trailing literal before the closer;
+  // any other following atom makes it a range operator in both grammars and clears the index.
+  let dashIndex: number | undefined;
+  // An escape pair is one lexeme, so `\]`, `\\` and `\x00` are never candidates.
+  let escaped = false;
+
+  const commitEscape = (at: number, replacement: string): void => {
+    out = (out ?? "") + pattern.slice(copied, at) + replacement;
+    copied = at + 1;
+  };
+
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === "\\") {
+      escaped = true;
+      dashIndex = undefined;
+      continue;
+    }
+    if (!inClass) {
+      if (ch === "[") {
+        inClass = true;
+        firstSlot = true;
+        dashIndex = undefined;
+      }
+      continue;
+    }
+    if (firstSlot) {
+      if (ch === "^") continue;
+      if (ch === "]") {
+        commitEscape(i, "\\]");
+        firstSlot = false;
+        dashIndex = undefined;
+        continue;
+      }
+      firstSlot = false;
+    }
+    if (ch === "]") {
+      // The dash index survived every atom since, so it is the trailing literal Annex-B keeps.
+      if (dashIndex !== undefined) commitEscape(dashIndex, "\\-");
+      inClass = false;
+      dashIndex = undefined;
+      continue;
+    }
+    if (ch === "-") { dashIndex = i; continue; }
+    if (ch === "[") {
+      commitEscape(i, "\\[");
+      dashIndex = undefined;
+      continue;
+    }
+    dashIndex = undefined;
+  }
+  return out === undefined ? undefined : out + pattern.slice(copied);
+}
+
+/**
  * Remove unsupported Unicode property escapes from scalar `pattern` constraints in ordinary
- * positive schema positions, and spell `\0` as `\x00` (rewriteNulEscapes). This keeps built-in
- * Artifact tools usable on Python-re backends and on Meta's Responses API;
+ * positive schema positions, spell `\0` as `\x00` (rewriteNulEscapes), and repair Annex-B-only
+ * class brackets a strict Unicode-Sets grammar refuses (repairLenientClassBrackets). This keeps
+ * built-in Artifact tools usable on Python-re backends and on Meta's Responses API;
  * the omitted constraint is not enforced by this proxy and tools must validate their inputs.
  *
  * Regex-keyed objects are preserved. Removing a matcher can lose evaluated-property annotations
@@ -209,7 +311,15 @@ export function stripUnicodePropertyPatterns(node: unknown, inNameBag = false): 
         delete (cloneContainer(frame) as Record<string, unknown>)[key];
         continue;
       }
-      const rewritten = rewriteNulEscapes(value);
+      let rewritten = rewriteNulEscapes(value);
+      // Annex-B class-internal brackets a strict grammar rejects are repaired only when the
+      // repair itself is strictly parseable; otherwise the original stays (fail-closed, the
+      // same contract as the omission above). A pattern the strict grammar already accepts is
+      // never rewritten: its unescaped brackets may be required Unicode-Sets syntax.
+      if (!isUnicodeSetsPattern(rewritten)) {
+        const repaired = repairLenientClassBrackets(rewritten);
+        if (repaired !== undefined && isUnicodeSetsPattern(repaired)) rewritten = repaired;
+      }
       if (rewritten !== value) (cloneContainer(frame) as Record<string, unknown>)[key] = rewritten;
       continue;
     }
